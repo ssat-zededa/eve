@@ -50,7 +50,7 @@ message ZmetVifInfo {
  * Broadly there are two types
  * Info : information that is discovered/rarely changes
  * Metrics: information that gets updated periodically
- * Protobuf definitions in this file follow the convention. 
+ * Protobuf definitions in this file follow the convention.
  */
 enum ZInfoTypes {
   ZiNop = 0;
@@ -108,7 +108,13 @@ message ZInfoNetwork {
   // deprecated = 1;
   // deprecated = 2;
   string macAddr = 3;
-  string devName = 4; // From name in config
+
+  // devName - Must be set to SystemAdapter.Name
+  string devName = 4;
+  // alias - Must be set to SystemAdapter.alias
+  string alias = 40;
+
+
   repeated string IPAddrs = 5; // All IP addresses with /N for subnet
   repeated string defaultRouters = 6; // If DHCP assigned
   ZInfoDNS dns = 7; // If DHCP assigned
@@ -116,7 +122,10 @@ message ZInfoNetwork {
   GeoLoc location = 9;
   bool uplink = 10; // Uplink interface  // XXX rename to isMgmt
   ErrorInfo networkErr = 11; // For instance bad proxy config
-  string localName = 12; // eth0, eth1 etc.
+
+  // Ifname from PhysicalIo - eth0, eth1 etc
+  string localName = 12;
+
   ProxyStatus proxy = 13;
 }
 
@@ -190,9 +199,35 @@ enum DataSecAtRestStatus {
     DATASEC_AT_REST_ERROR = 4;    // Enabled, but encountered an error
 }
 
+message VaultInfo {
+    string name = 1;                //Name of the vault
+    DataSecAtRestStatus status = 2; //Status of the vault
+    ErrorInfo vaultErr = 3;         //Additional info in case of failure
+}
+
 message DataSecAtRest {
-    DataSecAtRestStatus status = 1; // Current status
-    string info = 2;                // Informational string augmenting status
+    DataSecAtRestStatus status = 1;   // Deprecated
+    string info = 2;                  // Deprecated
+    repeated VaultInfo vaultList = 3; // per-Vault Info
+}
+
+message ZInfoConfigItem {
+    string value = 1;
+    string error = 2;
+}
+
+message ZInfoConfigItemStatus {
+    map<string, ZInfoConfigItem> configItems = 1;
+    map<string, ZInfoConfigItem> unknownConfigItems = 2;
+}
+
+// ZInfoAppInstance - send a summary of App Instance so that controller knows
+// how many App Instances are still present on the device. Controller
+// can then use it to wait for an app to be fully deleted etc.
+message ZInfoAppInstance {
+    string uuid = 1;
+    string name = 2;
+    string domainName = 3;
 }
 
 // Base device info, as discovered by Xen (or OS on bare metal)
@@ -206,6 +241,9 @@ message ZInfoDevice {
 
   ZInfoManufacturer minfo = 11;
 
+  // OBSOLETE. The information will be provided by DevicePort instead.
+  // Newer versions will not fill in this information. Controller Needs
+  // to check check if this is empty - if yes, use the DevicePortStatus instead.
   repeated ZInfoNetwork network = 13;
   repeated ZioBundle assignableAdapters = 15;
   ZInfoDNS dns = 16; // What is used in resolv.conf
@@ -227,6 +265,9 @@ message ZInfoDevice {
   string HSMInfo = 27; //Information about HSM like TPM vendor, TEE type etc.
   string lastRebootStack = 28;
   DataSecAtRest dataSecAtRestInfo = 29; //Info about Data At Rest Security
+
+  ZInfoConfigItemStatus configItemStatus = 31;
+  repeated ZInfoAppInstance appInstances = 32;
 }
 
 // The current and fallback system adapter information
@@ -253,14 +294,24 @@ message DevicePort {
   // DhcpConfig
   uint32 dhcpType = 11;
   string subnet = 12;
+  // gateway - OBSOLETE - obsoleted by defaultRouters
   string gateway = 13;
+  // domainname - OBSOLETE - obsoleted by dns
   string domainname = 14;
   string ntpServer = 15;
+  // dnsServers - OBSOLETE - obsoleted by dns
   repeated string dnsServers = 16;
   string dhcpRangeLow = 17;
   string dhcpRangeHigh = 18;
 
   ProxyStatus proxy = 21;
+  string macAddr = 22;
+  repeated string IPAddrs = 23; // All IP addresses with /N for subnet
+  repeated string defaultRouters = 24; // If DHCP assigned
+  ZInfoDNS dns = 25; // If DHCP assigned
+  bool up = 26;      // operational up/down status.
+  GeoLoc location = 27;
+  ErrorInfo err = 29; // Any errors on the interface.
 }
 
 message ProxyStatus {
@@ -270,6 +321,8 @@ message ProxyStatus {
   bool networkProxyEnable = 4;
   string networkProxyURL = 5;
   string wpadURL = 6;
+  // XXX add? In config
+  // repeated bytes proxyCertPEM = 7;
 }
 
 message ProxyEntry {
@@ -442,6 +495,8 @@ message ZInfoNetworkInstance {
   google.protobuf.Timestamp upTimeStamp = 8;
   ZInfoSW softwareList = 9; 	// E.g., VPN version
 
+  string CurrentUplinkIntf = 10;  // current uplink interface in use by this NI
+  string CurrentUplinkAlias = 11; // user defined namestring alias to this CurrentUplinkIntf, for future
   uint32 bridgeNum = 20;
   string bridgeName = 21;
   string bridgeIPAddr = 22;

@@ -5,7 +5,6 @@ package zedagent
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"io/ioutil"
 	"mime"
@@ -21,6 +20,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
@@ -35,34 +35,33 @@ var flowlogAPI = "api/v1/edgedevice/flowlog"
 var serverName string
 var serverNameAndPort string
 
-const (
-	identityDirname = "/config"
-	serverFilename  = identityDirname + "/server"
-	uuidFileName    = identityDirname + "/uuid"
-)
-
-var globalConfig = types.GlobalConfigDefaults
-
 type getconfigContext struct {
-	zedagentCtx                 *zedagentContext // Cross link
-	ledManagerCount             int              // Current count
-	startTime                   time.Time
-	lastReceivedConfigFromCloud time.Time
-	readSavedConfig             bool
-	configTickerHandle          interface{}
-	metricsTickerHandle         interface{}
-	pubDevicePortConfig         *pubsub.Publication
-	pubPhysicalIOAdapters       *pubsub.Publication
-	devicePortConfig            types.DevicePortConfig
-	pubNetworkXObjectConfig     *pubsub.Publication
-	subAppInstanceStatus        *pubsub.Subscription
-	pubAppInstanceConfig        *pubsub.Publication
-	pubAppNetworkConfig         *pubsub.Publication
-	pubCertObjConfig            *pubsub.Publication
-	pubBaseOsConfig             *pubsub.Publication
-	pubDatastoreConfig          *pubsub.Publication
-	pubNetworkInstanceConfig    *pubsub.Publication
-	rebootFlag                  bool
+	zedagentCtx              *zedagentContext // Cross link
+	ledManagerCount          int              // Current count
+	configReceived           bool
+	configGetStatus          types.ConfigGetStatus
+	updateInprogress         bool
+	readSavedConfig          bool
+	configTickerHandle       interface{}
+	metricsTickerHandle      interface{}
+	pubDevicePortConfig      pubsub.Publication
+	pubPhysicalIOAdapters    pubsub.Publication
+	devicePortConfig         types.DevicePortConfig
+	pubNetworkXObjectConfig  pubsub.Publication
+	subAppInstanceStatus     pubsub.Subscription
+	subDomainMetric          pubsub.Subscription
+	subHostMemory            pubsub.Subscription
+	subNodeAgentStatus       pubsub.Subscription
+	pubZedAgentStatus        pubsub.Publication
+	pubAppInstanceConfig     pubsub.Publication
+	pubAppNetworkConfig      pubsub.Publication
+	pubCertObjConfig         pubsub.Publication
+	pubBaseOsConfig          pubsub.Publication
+	pubDatastoreConfig       pubsub.Publication
+	pubNetworkInstanceConfig pubsub.Publication
+	pubCipherContextConfig   pubsub.Publication
+	pubControllerCertConfig  pubsub.Publication
+	rebootFlag               bool
 }
 
 // tlsConfig is initialized once i.e. effectively a constant
@@ -77,33 +76,37 @@ var zcdevUUID uuid.UUID
 // Really a constant
 var nilUUID uuid.UUID
 
-func handleConfigInit() {
+func handleConfigInit(networkSendTimeout uint32) {
 
 	// get the server name
-	bytes, err := ioutil.ReadFile(serverFilename)
+	bytes, err := ioutil.ReadFile(types.ServerFileName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	serverNameAndPort = strings.TrimSpace(string(bytes))
 	serverName = strings.Split(serverNameAndPort, ":")[0]
 
-	tlsConfig, err := zedcloud.GetTlsConfig(serverName, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
+	v2api := false // XXX set
 	zedcloudCtx.DeviceNetworkStatus = deviceNetworkStatus
-	zedcloudCtx.TlsConfig = tlsConfig
 	zedcloudCtx.FailureFunc = zedcloud.ZedCloudFailure
 	zedcloudCtx.SuccessFunc = zedcloud.ZedCloudSuccess
 	zedcloudCtx.DevSerial = hardware.GetProductSerial()
 	zedcloudCtx.DevSoftSerial = hardware.GetSoftSerial()
-	zedcloudCtx.NetworkSendTimeout = globalConfig.NetworkSendTimeout
+	zedcloudCtx.NetworkSendTimeout = networkSendTimeout
+	zedcloudCtx.V2API = v2api
 	log.Infof("Configure Get Device Serial %s, Soft Serial %s\n", zedcloudCtx.DevSerial,
 		zedcloudCtx.DevSoftSerial)
 
-	b, err := ioutil.ReadFile(uuidFileName)
+	// XXX need to redo this since the root certificates can change
+	err = zedcloud.UpdateTLSConfig(&zedcloudCtx, serverName, nil)
 	if err != nil {
-		log.Fatal("ReadFile", err, uuidFileName)
+		log.Fatal(err)
+	}
+
+	b, err := ioutil.ReadFile(types.UUIDFileName)
+	if err != nil {
+		// XXX this can fail if agents have crashed
+		log.Fatal("ReadFile", err, types.UUIDFileName)
 	}
 	uuidStr := strings.TrimSpace(string(b))
 	devUUID, err = uuid.FromString(uuidStr)
@@ -117,17 +120,16 @@ func handleConfigInit() {
 
 // Run a periodic fetch of the config
 func configTimerTask(handleChannel chan interface{},
-	getconfigCtx *getconfigContext, updateInprogress bool) {
+	getconfigCtx *getconfigContext) {
 
 	configUrl := serverNameAndPort + "/" + configApi
-	getconfigCtx.startTime = time.Now()
-	getconfigCtx.lastReceivedConfigFromCloud = getconfigCtx.startTime
 	iteration := 0
-	ctx := getconfigCtx.zedagentCtx
 	getconfigCtx.rebootFlag = getLatestConfig(configUrl, iteration,
-		updateInprogress, getconfigCtx)
+		getconfigCtx)
+	publishZedAgentStatus(getconfigCtx)
 
-	interval := time.Duration(globalConfig.ConfigInterval) * time.Second
+	configInterval := getconfigCtx.zedagentCtx.globalConfig.ConfigInterval
+	interval := time.Duration(configInterval) * time.Second
 	max := float64(interval)
 	min := max * 0.3
 	ticker := flextimer.NewRangeTicker(time.Duration(min),
@@ -137,26 +139,25 @@ func configTimerTask(handleChannel chan interface{},
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
+	agentlog.StillRunning(agentName+"config", warningTime, errorTime)
 
 	for {
 		select {
 		case <-ticker.C:
-			start := agentlog.StartTime()
+			start := time.Now()
 			iteration += 1
-			// check whether the device is still in progress state
-			// once activated, it does not go back to the inprogress
-			// state
-			if updateInprogress {
-				updateInprogress = isBaseOsCurrentPartitionStateInProgress(ctx)
-			}
-			rebootFlag := getLatestConfig(configUrl, iteration,
-				updateInprogress, getconfigCtx)
+			rebootFlag := getLatestConfig(configUrl, iteration, getconfigCtx)
 			getconfigCtx.rebootFlag = getconfigCtx.rebootFlag || rebootFlag
-			agentlog.CheckMaxTime(agentName+"config", start)
+			pubsub.CheckMaxTimeTopic(agentName+"config", "getLastestConfig", start,
+				warningTime, errorTime)
+			publishZedAgentStatus(getconfigCtx)
 
 		case <-stillRunning.C:
+			if getconfigCtx.rebootFlag {
+				log.Infof("reboot flag set")
+			}
 		}
-		agentlog.StillRunning(agentName + "config")
+		agentlog.StillRunning(agentName+"config", warningTime, errorTime)
 	}
 }
 
@@ -167,14 +168,14 @@ func triggerGetConfig(tickerHandle interface{}) {
 
 // Called when globalConfig changes
 // Assumes the caller has verifier that the interval has changed
-func updateConfigTimer(tickerHandle interface{}) {
+func updateConfigTimer(configInterval uint32, tickerHandle interface{}) {
 
 	if tickerHandle == nil {
 		// Happens if we have a GlobalConfig setting in /persist/
 		log.Warnf("updateConfigTimer: no configTickerHandle yet")
 		return
 	}
-	interval := time.Duration(globalConfig.ConfigInterval) * time.Second
+	interval := time.Duration(configInterval) * time.Second
 	log.Infof("updateConfigTimer() change to %v\n", interval)
 	max := float64(interval)
 	min := max * 0.3
@@ -188,132 +189,95 @@ func updateConfigTimer(tickerHandle interface{}) {
 // until one succeeds in communicating with the cloud.
 // We use the iteration argument to start at a different point each time.
 // Returns a rebootFlag
-func getLatestConfig(url string, iteration int, updateInprogress bool,
+func getLatestConfig(url string, iteration int,
 	getconfigCtx *getconfigContext) bool {
 
-	log.Debugf("getLatestConfig(%s, %d, %v)\n", url, iteration,
-		updateInprogress)
-
-	// Did we exceed the time limits?
-	timePassed := time.Since(getconfigCtx.lastReceivedConfigFromCloud)
-
-	resetLimit := time.Second * time.Duration(globalConfig.ResetIfCloudGoneTime)
-	if timePassed > resetLimit {
-		errStr := fmt.Sprintf("Exceeded outage for cloud connectivity %d by %d seconds; rebooting\n",
-			resetLimit/time.Second,
-			(timePassed-resetLimit)/time.Second)
-		log.Errorf(errStr)
-		agentlog.RebootReason(errStr)
-		shutdownAppsGlobal(getconfigCtx.zedagentCtx)
-		execReboot(true)
-		return true
-	}
-	if updateInprogress {
-		fallbackLimit := time.Second * time.Duration(globalConfig.FallbackIfCloudGoneTime)
-		if timePassed > fallbackLimit {
-			errStr := fmt.Sprintf("Exceeded fallback outage for cloud connectivity %d by %d seconds; rebooting\n",
-				fallbackLimit/time.Second,
-				(timePassed-fallbackLimit)/time.Second)
-			log.Errorf(errStr)
-			agentlog.RebootReason(errStr)
-			shutdownAppsGlobal(getconfigCtx.zedagentCtx)
-			execReboot(true)
-			return true
-		}
-	}
+	log.Debugf("getLatestConfig(%s, %d)\n", url, iteration)
 
 	const return400 = false
-	resp, contents, rtf, err := zedcloud.SendOnAllIntf(zedcloudCtx, url, 0, nil, iteration, return400)
+	getconfigCtx.configGetStatus = types.ConfigGetFail
+	b, cr, err := generateConfigRequest()
+	if err != nil {
+		// XXX	fatal?
+		return false
+	}
+	buf := bytes.NewBuffer(b)
+	size := int64(proto.Size(cr))
+	resp, contents, rtf, err := zedcloud.SendOnAllIntf(zedcloudCtx, url, size, buf, iteration, return400)
 	if err != nil {
 		newCount := 2
 		if rtf {
 			log.Errorf("getLatestConfig remoteTemporaryFailure: %s", err)
 			newCount = 3 // Almost connected to controller!
 			// Don't treat as upgrade failure
-			if updateInprogress {
+			if getconfigCtx.updateInprogress {
 				log.Warnf("remoteTemporaryFailure don't fail update")
-				getconfigCtx.startTime = time.Now()
+				getconfigCtx.configGetStatus = types.ConfigGetTemporaryFail
 			}
 		} else {
 			log.Errorf("getLatestConfig failed: %s", err)
 		}
 		if getconfigCtx.ledManagerCount == 4 {
 			// Inform ledmanager about loss of config from cloud
-			types.UpdateLedManagerConfig(newCount)
+			utils.UpdateLedManagerConfig(newCount)
 			getconfigCtx.ledManagerCount = newCount
 		}
 		// If we didn't yet get a config, then look for a file
 		// XXX should we try a few times?
 		// XXX different policy if updateInProgress? No fallback for now
-		if !updateInprogress &&
-			!getconfigCtx.readSavedConfig &&
-			getconfigCtx.lastReceivedConfigFromCloud == getconfigCtx.startTime {
+		if !getconfigCtx.updateInprogress &&
+			!getconfigCtx.readSavedConfig && !getconfigCtx.configReceived {
 
-			config, err := readSavedProtoMessage(checkpointDirname+"/lastconfig", false)
+			config, err := readSavedProtoMessage(
+				getconfigCtx.zedagentCtx.globalConfig.StaleConfigTime,
+				checkpointDirname+"/lastconfig", false)
 			if err != nil {
 				log.Errorf("getconfig: %v\n", err)
 				return false
 			}
 			if config != nil {
-				log.Errorf("Using saved config %v\n", config)
+				log.Info("Using saved config")
 				getconfigCtx.readSavedConfig = true
+				getconfigCtx.configGetStatus = types.ConfigGetReadSaved
 				return inhaleDeviceConfig(config, getconfigCtx,
 					true)
 			}
 		}
 		return false
 	}
-	// now cloud connectivity is good, consider marking partition state as
-	// active if it was inprogress
-	// XXX down the road we want more diagnostics and validation
-	// before we do this.
-	if updateInprogress {
-		// Wait for a bit to detect an agent crash. Should run for
-		// at least N minutes to make sure we don't hit a watchdog.
-		timePassed := time.Since(getconfigCtx.startTime)
-		successLimit := time.Second *
-			time.Duration(globalConfig.MintimeUpdateSuccess)
-		ctx := getconfigCtx.zedagentCtx
-		curPart := getZbootCurrentPartition(ctx)
-		if timePassed < successLimit {
-			log.Infof("getLatestConfig, curPart %s inprogress waiting for %d seconds\n", curPart, (successLimit-timePassed)/time.Second)
-			ctx.remainingTestTime = successLimit - timePassed
-		} else {
-			initiateBaseOsZedCloudTestComplete(ctx)
-			ctx.remainingTestTime = 0
-		}
-		// Send updated remainingTestTime to zedcloud
-		ctx.TriggerDeviceInfo = true
-	}
 
 	if err := validateConfigMessage(url, resp); err != nil {
 		log.Errorln("validateConfigMessage: ", err)
 		// Inform ledmanager about cloud connectivity
-		types.UpdateLedManagerConfig(3)
+		utils.UpdateLedManagerConfig(3)
 		getconfigCtx.ledManagerCount = 3
 		return false
 	}
 
-	changed, config, err := readDeviceConfigProtoMessage(contents)
+	changed, config, err := readConfigResponseProtoMessage(resp, contents)
 	if err != nil {
-		log.Errorln("readDeviceConfigProtoMessage: ", err)
+		log.Errorln("readConfigResponseProtoMessage: ", err)
 		// Inform ledmanager about cloud connectivity
-		types.UpdateLedManagerConfig(3)
+		utils.UpdateLedManagerConfig(3)
 		getconfigCtx.ledManagerCount = 3
 		return false
 	}
 
 	// Inform ledmanager about config received from cloud
-	types.UpdateLedManagerConfig(4)
+	utils.UpdateLedManagerConfig(4)
 	getconfigCtx.ledManagerCount = 4
 
-	getconfigCtx.lastReceivedConfigFromCloud = time.Now()
-	writeReceivedProtoMessage(contents)
+	if !getconfigCtx.configReceived {
+		getconfigCtx.configReceived = true
+	}
+	getconfigCtx.configGetStatus = types.ConfigGetSuccess
 
 	if !changed {
 		log.Debugf("Configuration from zedcloud is unchanged\n")
 		return false
 	}
+	writeReceivedProtoMessage(contents)
+
 	return inhaleDeviceConfig(config, getconfigCtx, false)
 }
 
@@ -369,7 +333,8 @@ func writeProtoMessage(filename string, contents []byte) {
 
 // If the file exists then read the config
 // Ignore if if older than StaleConfigTime seconds
-func readSavedProtoMessage(filename string, force bool) (*zconfig.EdgeDevConfig, error) {
+func readSavedProtoMessage(staleConfigTime uint32,
+	filename string, force bool) (*zconfig.EdgeDevConfig, error) {
 	info, err := os.Stat(filename)
 	if err != nil {
 		if os.IsNotExist(err) && !force {
@@ -379,7 +344,7 @@ func readSavedProtoMessage(filename string, force bool) (*zconfig.EdgeDevConfig,
 		}
 	}
 	age := time.Since(info.ModTime())
-	staleLimit := time.Second * time.Duration(globalConfig.StaleConfigTime)
+	staleLimit := time.Second * time.Duration(staleConfigTime)
 	if !force && age > staleLimit {
 		errStr := fmt.Sprintf("savedProto too old: age %v limit %d\n",
 			age, staleLimit)
@@ -402,34 +367,61 @@ func readSavedProtoMessage(filename string, force bool) (*zconfig.EdgeDevConfig,
 	return config, nil
 }
 
-var prevConfigHash []byte
+// The most recent config hash we received. Starts empty
+var prevConfigHash string
 
-// Returns changed, config, error. The changed is based on a comparison of
-// the hash of the protobuf message.
-func readDeviceConfigProtoMessage(contents []byte) (bool, *zconfig.EdgeDevConfig, error) {
+func generateConfigRequest() ([]byte, *zconfig.ConfigRequest, error) {
+	log.Debugf("generateConfigRequest() sending hash %s", prevConfigHash)
+	configRequest := &zconfig.ConfigRequest{
+		ConfigHash: prevConfigHash,
+	}
+	b, err := proto.Marshal(configRequest)
+	if err != nil {
+		log.Errorln(err)
+		return nil, nil, err
+	}
+	return b, configRequest, nil
+}
 
-	var config = &zconfig.EdgeDevConfig{}
+// Returns changed, config, error. The changed is based the ConfigRequest vs
+// the ConfigResponse hash
+func readConfigResponseProtoMessage(resp *http.Response, contents []byte) (bool, *zconfig.EdgeDevConfig, error) {
 
-	// compute sha256 of the image and match it
-	// with the one in config file...
-	h := sha256.New()
-	h.Write(contents)
-	configHash := h.Sum(nil)
-	same := bytes.Equal(configHash, prevConfigHash)
-	prevConfigHash = configHash
-	log.Debugf("readDeviceConfigProtoMessage: same %v config sha % x vs. % x\n",
-		same, prevConfigHash, configHash)
-	err := proto.Unmarshal(contents, config)
+	if resp.StatusCode == http.StatusNotModified {
+		log.Debugf("StatusNotModified")
+		if len(contents) > 0 {
+			// XXX controller should omit full content
+			log.Infof("XXX StatusNotModified with len %d",
+				len(contents))
+		}
+		return false, nil, nil
+	}
+
+	var configResponse = &zconfig.ConfigResponse{}
+	err := proto.Unmarshal(contents, configResponse)
 	if err != nil {
 		log.Errorf("Unmarshalling failed: %v", err)
 		return false, nil, err
 	}
-	return !same, config, nil
+	hash := configResponse.GetConfigHash()
+	if hash == prevConfigHash {
+		log.Debugf("Same ConfigHash %s", hash)
+		if len(contents) > 0 {
+			// XXX controller should omit full content
+			log.Infof("XXX same hash %s with len %d",
+				hash, len(contents))
+		}
+		return false, nil, nil
+	}
+	log.Debugf("Change in ConfigHash from %s to %s", prevConfigHash, hash)
+	prevConfigHash = hash
+	config := configResponse.GetConfig()
+	return true, config, nil
 }
 
 // Returns a rebootFlag
 func inhaleDeviceConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigContext, usingSaved bool) bool {
-	log.Debugf("Inhaling config %v\n", config)
+	log.Debugf("Inhaling config")
 
 	// if they match return
 	var devId = &zconfig.UUIDandVersion{}
@@ -453,7 +445,7 @@ func inhaleDeviceConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigCo
 					zcdevUUID.String(), id.String())
 				zcdevUUID = id
 				ctx := getconfigCtx.zedagentCtx
-				ctx.TriggerDeviceInfo = true
+				triggerPublishDevInfo(ctx)
 			}
 
 		}
@@ -462,4 +454,16 @@ func inhaleDeviceConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigCo
 
 	// add new BaseOS/App instances; returns rebootFlag
 	return parseConfig(config, getconfigCtx, usingSaved)
+}
+
+func publishZedAgentStatus(getconfigCtx *getconfigContext) {
+	ctx := getconfigCtx.zedagentCtx
+	status := types.ZedAgentStatus{
+		Name:            agentName,
+		ConfigGetStatus: getconfigCtx.configGetStatus,
+		RebootCmd:       ctx.rebootCmd,
+		RebootReason:    ctx.currentRebootReason,
+	}
+	pub := getconfigCtx.pubZedAgentStatus
+	pub.Publish(agentName, status)
 }

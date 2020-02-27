@@ -8,6 +8,7 @@ package zedagent
 import (
 	"bytes"
 	"github.com/golang/protobuf/ptypes/timestamp"
+	"net"
 	"strings"
 	"time"
 
@@ -16,7 +17,6 @@ import (
 	"github.com/lf-edge/eve/api/go/flowlog"
 	zinfo "github.com/lf-edge/eve/api/go/info"   // XXX need to stop using
 	zmet "github.com/lf-edge/eve/api/go/metrics" // zinfo and zmet here
-	"github.com/lf-edge/eve/pkg/pillar/cast"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	log "github.com/sirupsen/logrus"
@@ -27,11 +27,7 @@ var flowIteration int
 func handleNetworkInstanceModify(ctxArg interface{}, key string, statusArg interface{}) {
 	log.Infof("handleNetworkInstanceStatusModify(%s)\n", key)
 	ctx := ctxArg.(*zedagentContext)
-	status := cast.CastNetworkInstanceStatus(statusArg)
-	if status.Key() != key {
-		log.Errorf("handleNetworkInstanceModify key/UUID mismatch %s vs %s; ignored %+v\n", key, status.Key(), status)
-		return
-	}
+	status := statusArg.(types.NetworkInstanceStatus)
 	if !status.ErrorTime.IsZero() {
 		log.Errorf("Received NetworkInstance error %s\n",
 			status.Error)
@@ -44,12 +40,7 @@ func handleNetworkInstanceDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	log.Infof("handleNetworkInstanceDelete(%s)\n", key)
-	status := cast.CastNetworkInstanceStatus(statusArg)
-	if status.Key() != key {
-		log.Errorf("handleNetworkInstanceDelete key/UUID mismatch %s vs %s; ignored %+v\n",
-			key, status.Key(), status)
-		return
-	}
+	status := statusArg.(types.NetworkInstanceStatus)
 	ctx := ctxArg.(*zedagentContext)
 	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, true)
 	log.Infof("handleNetworkInstanceDelete(%s) done\n", key)
@@ -268,26 +259,12 @@ func handleNetworkInstanceMetricsModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	log.Debugf("handleNetworkInstanceMetricsModify(%s)\n", key)
-	metrics := cast.CastNetworkInstanceMetrics(statusArg)
-	if metrics.Key() != key {
-		log.Errorf("handleNetworkInstanceMetricsModify key/UUID mismatch %s vs %s; ignored %+v\n",
-			key, metrics.Key(), metrics)
-		return
-	}
-	log.Debugf("handleNetworkInstanceMetricsModify(%s) done\n", key)
 }
 
 func handleNetworkInstanceMetricsDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	log.Infof("handleNetworkInstanceMetricsDelete(%s)\n", key)
-	metrics := cast.CastNetworkInstanceMetrics(statusArg)
-	if metrics.Key() != key {
-		log.Errorf("handleNetworkInstanceMetricsDelete key/UUID mismatch %s vs %s; ignored %+v\n",
-			key, metrics.Key(), metrics)
-		return
-	}
-	log.Infof("handleNetworkInstanceMetricsDelete(%s) done\n", key)
 }
 
 func createNetworkInstanceMetrics(ctx *zedagentContext, reportMetrics *zmet.ZMetricMsg) {
@@ -298,7 +275,7 @@ func createNetworkInstanceMetrics(ctx *zedagentContext, reportMetrics *zmet.ZMet
 		return
 	}
 	for _, met := range metlist {
-		metrics := cast.CastNetworkInstanceMetrics(met)
+		metrics := met.(types.NetworkInstanceMetrics)
 		metricInstance := protoEncodeNetworkInstanceMetricProto(metrics)
 		reportMetrics.Nm = append(reportMetrics.Nm, metricInstance)
 	}
@@ -734,12 +711,7 @@ func handleAppFlowMonitorModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	log.Infof("handleAppFlowMonitorModify(%s)\n", key)
-	flows := cast.CastFlowStatus(statusArg)
-	if flows.Key() != key {
-		log.Errorf("handleAppFlowMonitorModify key/UUID mismatch %s vs %s; ignored %+v\n",
-			key, flows.Key(), flows)
-		return
-	}
+	flows := statusArg.(types.IPFlow)
 
 	// encoding the flows with protobuf format
 	pflows := protoEncodeAppFlowMonitorProto(flows)
@@ -752,13 +724,44 @@ func handleAppFlowMonitorDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	log.Infof("handleAppFlowMonitorDelete(%s)\n", key)
-	flows := cast.CastFlowStatus(statusArg)
-	if flows.Key() != key {
-		log.Errorf("handleAppFlowMonitorDelete key/UUID mismatch %s vs %s; ignored %+v\n",
-			key, flows.Key(), flows)
-		return
+}
+
+func handleAppVifIPTrigModify(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	log.Infof("handleAppVifIPTrigModify(%s)\n", key)
+	ctx := ctxArg.(*zedagentContext)
+	trig := statusArg.(types.VifIPTrig)
+	findVifAndTrigAppInfoUpload(ctx, trig.MacAddr, trig.IPAddr)
+}
+
+func findVifAndTrigAppInfoUpload(ctx *zedagentContext, macAddr string, ipAddr net.IP) {
+	sub := ctx.getconfigCtx.subAppInstanceStatus
+	items := sub.GetAll()
+
+	for _, st := range items {
+		aiStatus := st.(types.AppInstanceStatus)
+		log.Debugf("findVifAndTrigAppInfoUpload: mac address %s match, ip %v, publish the info to cloud", macAddr, ipAddr)
+		uuidStr := aiStatus.Key()
+		aiStatusPtr := &aiStatus
+		if aiStatusPtr.MaybeUpdateAppIPAddr(macAddr, ipAddr.String()) {
+			log.Debugf("findVifAndTrigAppInfoUpload: underlay %v", aiStatusPtr.UnderlayNetworks)
+			PublishAppInfoToZedCloud(ctx, uuidStr, aiStatusPtr, ctx.assignableAdapters, ctx.iteration)
+			ctx.iteration++
+			break
+		}
 	}
-	log.Infof("handleAppFlowMonitorDelete(%s) done\n", key)
+}
+
+func aclActionToProtoAction(action string) flowlog.ACLAction {
+	switch action {
+	case "ACCEPT":
+		return flowlog.ACLAction_ActionAccept
+	case "DROP":
+		return flowlog.ACLAction_ActionDrop
+	default:
+		return flowlog.ACLAction_ActionUnknown
+	}
 }
 
 func protoEncodeAppFlowMonitorProto(ipflow types.IPFlow) *flowlog.FlowMessage {
@@ -789,7 +792,7 @@ func protoEncodeAppFlowMonitorProto(ipflow types.IPFlow) *flowlog.FlowMessage {
 
 		prec.Inbound = rec.Inbound
 		prec.AclId = rec.ACLID
-		prec.Action = rec.Action
+		prec.Action = aclActionToProtoAction(rec.Action)
 		// prec.AclName =
 		pStart := new(timestamp.Timestamp)
 		pStart = timeNanoToProto(rec.StartTime)

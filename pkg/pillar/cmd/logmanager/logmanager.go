@@ -8,22 +8,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/google/go-cmp/cmp"
-	"github.com/lf-edge/eve/api/go/logs"
-	"github.com/lf-edge/eve/pkg/pillar/agentlog"
-	"github.com/lf-edge/eve/pkg/pillar/cast"
-	"github.com/lf-edge/eve/pkg/pillar/flextimer"
-	"github.com/lf-edge/eve/pkg/pillar/hardware"
-	"github.com/lf-edge/eve/pkg/pillar/pidfile"
-	"github.com/lf-edge/eve/pkg/pillar/pubsub"
-	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/watch"
-	"github.com/lf-edge/eve/pkg/pillar/zboot"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
-	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
 	"os"
@@ -32,19 +16,38 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve/api/go/logs"
+	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
+	"github.com/lf-edge/eve/pkg/pillar/flextimer"
+	"github.com/lf-edge/eve/pkg/pillar/hardware"
+	"github.com/lf-edge/eve/pkg/pillar/pidfile"
+	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+	pubsublegacy "github.com/lf-edge/eve/pkg/pillar/pubsub/legacy"
+	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/watch"
+	"github.com/lf-edge/eve/pkg/pillar/zboot"
+	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
+	"github.com/satori/go.uuid"
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/mcuadros/go-syslog.v2"
 )
 
 const (
 	agentName        = "logmanager"
-	identityDirname  = "/config"
-	serverFilename   = identityDirname + "/server"
-	uuidFileName     = identityDirname + "/uuid"
-	xenLogDirname    = "/var/log/xen"
+	commonLogdir     = types.PersistDir + "/log"
 	lastSentDirname  = "lastlogsent"  // Directory in /persist/
 	lastDeferDirname = "lastlogdefer" // Directory in /persist/
-	logsApi          = "api/v1/edgedevice/logs"
+	logsAPI          = "api/v1/edgedevice/logs"
 	logMaxMessages   = 100
 	logMaxBytes      = 32768 // Approximate - no headers counted
+	// Time limits for event loop handlers
+	errorTime   = 3 * time.Minute
+	warningTime = 40 * time.Second
 )
 
 var (
@@ -53,10 +56,11 @@ var (
 	debug               bool
 	debugOverride       bool // From command line arg
 	serverName          string
-	logsUrl             string
+	logsURL             string
 	zedcloudCtx         zedcloud.ZedCloudContext
 
 	globalDeferInprogress bool
+	eveVersion            = readEveVersion("/etc/eve-release")
 )
 
 // global stuff
@@ -64,12 +68,13 @@ type logDirModifyHandler func(ctx interface{}, logFileName string, source string
 type logDirDeleteHandler func(ctx interface{}, logFileName string, source string)
 
 type logmanagerContext struct {
-	subGlobalConfig *pubsub.Subscription
+	subGlobalConfig pubsub.Subscription
 	globalConfig    *types.GlobalConfig
-	subDomainStatus *pubsub.Subscription
+	subDomainStatus pubsub.Subscription
+	GCInitialized   bool
 }
 
-// Set from Makefile
+// Version is set from Makefile
 var Version = "No version specified"
 
 // Based on the proto file
@@ -78,6 +83,8 @@ type logEntry struct {
 	source    string // basename of filename?
 	iid       string // XXX e.g. PID - where do we get it from?
 	content   string // One line
+	filename  string // file name that generated the logmsg
+	function  string // function name that generated the log msg
 	timestamp time.Time
 }
 
@@ -108,11 +115,12 @@ type imageLoggerContext struct {
 	logfileReaders []imageLogfileReader
 }
 
-// Context for handleDNSModify
+// DNSContext holds context for handleDNSModify
 type DNSContext struct {
 	usableAddressCount     int
-	subDeviceNetworkStatus *pubsub.Subscription
+	subDeviceNetworkStatus pubsub.Subscription
 	doDeferred             bool
+	zedcloudCtx            *zedcloud.ZedCloudContext
 }
 
 type zedcloudLogs struct {
@@ -122,7 +130,8 @@ type zedcloudLogs struct {
 	LastSuccess  time.Time
 }
 
-func Run() {
+// Run is an entry point into running logmanager
+func Run(ps *pubsub.PubSub) {
 	defaultLogdirname := agentlog.GetCurrentLogdir()
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug")
@@ -148,41 +157,37 @@ func Run() {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
 		return
 	}
-	logf, err := agentlog.InitWithDirText(agentName, "/persist/log",
+	logf, err := agentlog.InitWithDirText(agentName, commonLogdir,
 		curpart)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer logf.Close()
 
-	// Note that LISP needs a separate directory since it moves
-	// old content to a subdir when it (re)starts
-	lispLogDirName := fmt.Sprintf("%s/%s", logDirName, "lisp")
 	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
 		log.Fatal(err)
 	}
 	log.Infof("Starting %s watching %s\n", agentName, logDirName)
-	log.Infof("watching %s\n", lispLogDirName)
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
-	agentlog.StillRunning(agentName)
+	agentlog.StillRunning(agentName, warningTime, errorTime)
 
 	// Make sure we have the last sent directory
-	dirname := fmt.Sprintf("/persist/%s", lastSentDirname)
+	dirname := fmt.Sprintf("%s/%s", types.PersistDir, lastSentDirname)
 	if _, err := os.Stat(dirname); err != nil {
 		if err := os.MkdirAll(dirname, 0700); err != nil {
 			log.Fatal(err)
 		}
 	}
-	dirname = fmt.Sprintf("/persist/%s", lastDeferDirname)
+	dirname = fmt.Sprintf("%s/%s", types.PersistDir, lastDeferDirname)
 	if _, err := os.Stat(dirname); err != nil {
 		if err := os.MkdirAll(dirname, 0700); err != nil {
 			log.Fatal(err)
 		}
 	}
 	cms := zedcloud.GetCloudMetrics() // Need type of data
-	pub, err := pubsub.Publish(agentName, cms)
+	pub, err := pubsublegacy.Publish(agentName, cms)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -191,24 +196,32 @@ func Run() {
 		globalConfig: &types.GlobalConfigDefaults,
 	}
 	// Look for global config such as log levels
-	subGlobalConfig, err := pubsub.Subscribe("", types.GlobalConfig{},
-		false, &logmanagerCtx)
+	subGlobalConfig, err := pubsublegacy.Subscribe("", types.GlobalConfig{},
+		false, &logmanagerCtx, &pubsub.SubscriptionOptions{
+			CreateHandler: handleGlobalConfigModify,
+			ModifyHandler: handleGlobalConfigModify,
+			DeleteHandler: handleGlobalConfigDelete,
+			WarningTime:   warningTime,
+			ErrorTime:     errorTime,
+		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	subGlobalConfig.ModifyHandler = handleGlobalConfigModify
-	subGlobalConfig.DeleteHandler = handleGlobalConfigDelete
 	logmanagerCtx.subGlobalConfig = subGlobalConfig
 	subGlobalConfig.Activate()
 
 	// Get DomainStatus from domainmgr
-	subDomainStatus, err := pubsub.Subscribe("domainmgr",
-		types.DomainStatus{}, false, &logmanagerCtx)
+	subDomainStatus, err := pubsublegacy.Subscribe("domainmgr",
+		types.DomainStatus{}, false, &logmanagerCtx, &pubsub.SubscriptionOptions{
+			CreateHandler: handleDomainStatusModify,
+			ModifyHandler: handleDomainStatusModify,
+			DeleteHandler: handleDomainStatusDelete,
+			WarningTime:   warningTime,
+			ErrorTime:     errorTime,
+		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	subDomainStatus.ModifyHandler = handleDomainStatusModify
-	subDomainStatus.DeleteHandler = handleDomainStatusDelete
 	logmanagerCtx.subDomainStatus = subDomainStatus
 	subDomainStatus.Activate()
 
@@ -216,28 +229,40 @@ func Run() {
 	DNSctx := DNSContext{}
 	DNSctx.usableAddressCount = types.CountLocalAddrAnyNoLinkLocal(*deviceNetworkStatus)
 
-	subDeviceNetworkStatus, err := pubsub.Subscribe("nim",
-		types.DeviceNetworkStatus{}, false, &DNSctx)
+	subDeviceNetworkStatus, err := pubsublegacy.Subscribe("nim",
+		types.DeviceNetworkStatus{}, false, &DNSctx, &pubsub.SubscriptionOptions{
+			CreateHandler: handleDNSModify,
+			ModifyHandler: handleDNSModify,
+			DeleteHandler: handleDNSDelete,
+			WarningTime:   warningTime,
+			ErrorTime:     errorTime,
+		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	subDeviceNetworkStatus.ModifyHandler = handleDNSModify
-	subDeviceNetworkStatus.DeleteHandler = handleDNSDelete
 	DNSctx.subDeviceNetworkStatus = subDeviceNetworkStatus
 	subDeviceNetworkStatus.Activate()
+
+	// Pick up debug aka log level before we start real work
+	for !logmanagerCtx.GCInitialized {
+		log.Infof("waiting for GCInitialized")
+		select {
+		case change := <-subGlobalConfig.MsgChan():
+			subGlobalConfig.ProcessChange(change)
+		case <-stillRunning.C:
+		}
+		agentlog.StillRunning(agentName, warningTime, errorTime)
+	}
+	log.Infof("processed GlobalConfig")
 
 	log.Infof("Waiting until we have some management ports with usable addresses\n")
 	for DNSctx.usableAddressCount == 0 && !force {
 		select {
-		case change := <-subGlobalConfig.C:
-			start := agentlog.StartTime()
+		case change := <-subGlobalConfig.MsgChan():
 			subGlobalConfig.ProcessChange(change)
-			agentlog.CheckMaxTime(agentName, start)
 
-		case change := <-subDeviceNetworkStatus.C:
-			start := agentlog.StartTime()
+		case change := <-subDeviceNetworkStatus.MsgChan():
 			subDeviceNetworkStatus.ProcessChange(change)
-			agentlog.CheckMaxTime(agentName, start)
 
 		// This wait can take an unbounded time since we wait for IP
 		// addresses. Punch StillRunning
@@ -250,7 +275,7 @@ func Run() {
 		if hangFlag {
 			log.Infof("Requested to not touch to cause watchdog")
 		} else {
-			agentlog.StillRunning(agentName)
+			agentlog.StillRunning(agentName, warningTime, errorTime)
 		}
 	}
 	log.Infof("Have %d management ports with usable addresses\n",
@@ -261,7 +286,7 @@ func Run() {
 	DNSctx.doDeferred = true
 
 	//Get servername, set logUrl, get device id and initialize zedcloudCtx
-	sendCtxInit(&logmanagerCtx)
+	sendCtxInit(&logmanagerCtx, &DNSctx)
 
 	// Publish send metrics for zedagent every 10 seconds
 	interval := time.Duration(10 * time.Second)
@@ -273,14 +298,13 @@ func Run() {
 	currentPartition := zboot.GetCurrentPartition()
 	loggerChan := make(chan logEntry)
 	ctx := loggerContext{logChan: loggerChan, image: currentPartition}
-	xenCtx := imageLoggerContext{}
 	lastSent := readLast(lastSentDirname, currentPartition)
 	lastSentStr, _ := lastSent.MarshalText()
 	log.Debugf("Current partition logs were last sent at %s\n",
 		string(lastSentStr))
 
 	// Start sender of log events
-	go processEvents(currentPartition, lastSent, loggerChan)
+	go processEvents(currentPartition, lastSent, loggerChan, eveVersion)
 
 	// If we have a logdir from a failed update, then set that up
 	// as well.
@@ -303,7 +327,7 @@ func Run() {
 		log.Debugf("Other partition logs were last sent at %s\n",
 			string(lastSentStr))
 
-		go processEvents(otherPartition, lastSent, otherLoggerChan)
+		go processEvents(otherPartition, lastSent, otherLoggerChan, eveVersion)
 
 		go watch.WatchStatus(otherLogDirname, false, otherLogDirChanges)
 		otherCtx = loggerContext{logChan: otherLoggerChan,
@@ -313,55 +337,50 @@ func Run() {
 	logDirChanges := make(chan string)
 	go watch.WatchStatus(logDirName, false, logDirChanges)
 
-	lispLogDirChanges := make(chan string)
-	go watch.WatchStatus(lispLogDirName, false, lispLogDirChanges)
-
-	xenLogDirChanges := make(chan string)
-	go watch.WatchStatus(xenLogDirname, false, xenLogDirChanges)
-
 	// Run these dir -> event as goroutines since they will block
 	// when there is backpressure
 	// XXX state sharing with HandleDeferred?
 	go handleLogDir(logDirChanges, logDirName, &ctx)
 	go handleLogDir(otherLogDirChanges, otherLogDirname, &otherCtx)
-	go handleLogDir(lispLogDirChanges, lispLogDirName, &ctx)
-	go handleXenLogDir(xenLogDirChanges, xenLogDirname, &xenCtx)
+
+	go parseAndSendSyslogEntries(&ctx)
 
 	for {
 		select {
-		case change := <-subGlobalConfig.C:
-			start := agentlog.StartTime()
+		case change := <-subGlobalConfig.MsgChan():
 			subGlobalConfig.ProcessChange(change)
-			agentlog.CheckMaxTime(agentName, start)
 
-		case change := <-subDomainStatus.C:
-			start := agentlog.StartTime()
+		case change := <-subDomainStatus.MsgChan():
 			subDomainStatus.ProcessChange(change)
-			agentlog.CheckMaxTime(agentName, start)
 
-		case change := <-subDeviceNetworkStatus.C:
-			start := agentlog.StartTime()
+		case change := <-subDeviceNetworkStatus.MsgChan():
 			subDeviceNetworkStatus.ProcessChange(change)
-			agentlog.CheckMaxTime(agentName, start)
 
 		case <-publishTimer.C:
-			start := agentlog.StartTime()
+			start := time.Now()
 			log.Debugln("publishTimer at", time.Now())
 			err := pub.Publish("global", zedcloud.GetCloudMetrics())
 			if err != nil {
 				log.Errorln(err)
 			}
-			agentlog.CheckMaxTime(agentName, start)
+			pubsub.CheckMaxTimeTopic(agentName, "publishTimer", start,
+				warningTime, errorTime)
 
 		case change := <-deferredChan:
-			start := agentlog.StartTime()
+			_, err := devicenetwork.VerifyDeviceNetworkStatus(*deviceNetworkStatus, 1, 15)
+			if err != nil {
+				log.Infof("logmanager(Run): log message processing still in deferred state")
+				continue
+			}
+			start := time.Now()
 			done := zedcloud.HandleDeferred(change, 1*time.Second)
 			dbg.FreeOSMemory()
 			globalDeferInprogress = !done
 			if globalDeferInprogress {
 				log.Warnf("logmanager: globalDeferInprogress")
 			}
-			agentlog.CheckMaxTime(agentName, start)
+			pubsub.CheckMaxTimeTopic(agentName, "deferredChan", start,
+				warningTime, errorTime)
 
 		case <-stillRunning.C:
 			// Fault injection
@@ -372,8 +391,40 @@ func Run() {
 		if hangFlag {
 			log.Infof("Requested to not touch to cause watchdog")
 		} else {
-			agentlog.StillRunning(agentName)
+			agentlog.StillRunning(agentName, warningTime, errorTime)
 		}
+	}
+}
+
+func parseAndSendSyslogEntries(ctx *loggerContext) {
+	logChannel := make(syslog.LogPartsChannel)
+	handler := syslog.NewChannelHandler(logChannel)
+	server := syslog.NewServer()
+	server.SetFormat(syslog.RFC3164)
+	server.SetHandler(handler)
+	server.ListenTCP("localhost:5140")
+	server.Boot()
+	for logParts := range logChannel {
+		logInfo, ok := agentlog.ParseLoginfo(logParts["content"].(string))
+		if !ok {
+			continue
+		}
+		level := parseLogLevel(logInfo.Level)
+		if dropEvent(logInfo.Source, level) {
+			log.Debugf("Dropping source %s level %v\n",
+				logInfo.Source, level)
+			continue
+		}
+		timestamp := logParts["timestamp"].(time.Time)
+		logMsg := logEntry{
+			source:    logInfo.Source,
+			content:   timestamp.String() + ": " + logParts["content"].(string),
+			severity:  logInfo.Level,
+			timestamp: timestamp,
+			function:  logInfo.Function,
+			filename:  logInfo.Filename,
+		}
+		ctx.logChan <- logMsg
 	}
 }
 
@@ -383,27 +434,16 @@ func handleLogDir(logDirChanges chan string, logDirName string,
 	for {
 		select {
 		case change := <-logDirChanges:
-			HandleLogDirEvent(change, logDirName, ctx,
+			handleLogDirEvent(change, logDirName, ctx,
 				handleLogDirModify, handleLogDirDelete)
 		}
 	}
 }
 
-func handleXenLogDir(logDirChanges chan string, logDirName string,
-	ctx *imageLoggerContext) {
-
-	for {
-		select {
-		case change := <-logDirChanges:
-			HandleLogDirEvent(change, logDirName, ctx,
-				handleXenLogDirModify, handleXenLogDirDelete)
-		}
-	}
-}
-
+// Handles both create and modify events
 func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 
-	status := cast.CastDeviceNetworkStatus(statusArg)
+	status := statusArg.(types.DeviceNetworkStatus)
 	ctx := ctxArg.(*DNSContext)
 	if key != "global" {
 		log.Infof("handleDNSModify: ignoring %s\n", key)
@@ -425,6 +465,11 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 		if globalDeferInprogress {
 			log.Warnf("handleDNSModify: globalDeferInprogress")
 		}
+	}
+
+	// update proxy certs if configured
+	if ctx.zedcloudCtx != nil && ctx.zedcloudCtx.V2API {
+		zedcloud.UpdateTLSProxyCerts(ctx.zedcloudCtx)
 	}
 	log.Infof("handleDNSModify done for %s; %d usable\n",
 		key, newAddrCount)
@@ -448,7 +493,7 @@ func handleDNSDelete(ctxArg interface{}, key string, statusArg interface{}) {
 // This runs as a separate go routine sending out data
 // Compares and drops events which have already been sent to the cloud
 func processEvents(image string, prevLastSent time.Time,
-	logChan <-chan logEntry) {
+	logChan <-chan logEntry, eveVersion string) {
 
 	log.Infof("processEvents(%s, %s)\n", image, prevLastSent.String())
 
@@ -468,9 +513,15 @@ func processEvents(image string, prevLastSent time.Time,
 		// but if the condition persists it will be set in a bit
 		if deferInprogress {
 			log.Warnf("processEvents(%s) deferInprogress", image)
-			time.Sleep(2 * time.Minute)
+			time.Sleep(30 * time.Second)
 			if globalDeferInprogress {
 				log.Warnf("processEvents(%s) globalDeferInprogress",
+					image)
+				continue
+			}
+			_, err := devicenetwork.VerifyDeviceNetworkStatus(*deviceNetworkStatus, 1, 15)
+			if err != nil {
+				log.Infof("processEvents:(%s) log message processing still in deferred state",
 					image)
 				continue
 			}
@@ -489,7 +540,7 @@ func processEvents(image string, prevLastSent time.Time,
 					return
 				}
 				sent = sendProtoStrForLogs(reportLogs, image,
-					iteration)
+					iteration, eveVersion)
 				if sent {
 					recordLast(lastSentDirname, image)
 				} else {
@@ -501,7 +552,7 @@ func processEvents(image string, prevLastSent time.Time,
 				dropped++
 				break
 			}
-			HandleLogEvent(event, reportLogs, messageCount)
+			handleLogEvent(event, reportLogs, messageCount)
 			messageCount++
 			// Bytes before appending this one
 			byteCount := proto.Size(reportLogs)
@@ -515,9 +566,9 @@ func processEvents(image string, prevLastSent time.Time,
 			log.Debugf("processEvents(%s): sending at messageCount %d, byteCount %d\n",
 				image, messageCount, byteCount)
 			sent = sendProtoStrForLogs(reportLogs, image,
-				iteration)
+				iteration, eveVersion)
 			messageCount = 0
-			iteration += 1
+			iteration++
 			if sent {
 				recordLast(lastSentDirname, image)
 			} else {
@@ -534,9 +585,9 @@ func processEvents(image string, prevLastSent time.Time,
 				dropped, messageCount,
 				proto.Size(reportLogs))
 			sent := sendProtoStrForLogs(reportLogs, image,
-				iteration)
+				iteration, eveVersion)
 			messageCount = 0
-			iteration += 1
+			iteration++
 			if sent {
 				recordLast(lastSentDirname, image)
 			} else {
@@ -550,7 +601,7 @@ func processEvents(image string, prevLastSent time.Time,
 // Touch/create a file to keep track of when things where sent before a reboot
 func recordLast(dirname string, image string) {
 	log.Debugf("recordLast(%s, %s)\n", dirname, image)
-	filename := fmt.Sprintf("/persist/%s/%s", dirname, image)
+	filename := fmt.Sprintf("%s/%s/%s", types.PersistDir, dirname, image)
 	_, err := os.Stat(filename)
 	if err != nil {
 		file, err := os.Create(filename)
@@ -574,7 +625,7 @@ func recordLast(dirname string, image string) {
 }
 
 func readLast(dirname string, image string) time.Time {
-	filename := fmt.Sprintf("/persist/%s/%s", dirname, image)
+	filename := fmt.Sprintf("%s/%s/%s", types.PersistDir, dirname, image)
 	st, err := os.Stat(filename)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -585,46 +636,54 @@ func readLast(dirname string, image string) time.Time {
 	return st.ModTime()
 }
 
-var msgIdCounter = 1
+var msgIDCounter = 1
 var iteration = 0
 
-func HandleLogEvent(event logEntry, reportLogs *logs.LogBundle, counter int) {
-	// Assign a unique msgId for each message
-	msgId := msgIdCounter
-	msgIdCounter += 1
+func handleLogEvent(event logEntry, reportLogs *logs.LogBundle, counter int) {
+	// Assign a unique msgID for each message
+	msgID := msgIDCounter
+	msgIDCounter++
 	log.Debugf("Read event from %s time %v id %d: %s\n",
-		event.source, event.timestamp, msgId, event.content)
+		event.source, event.timestamp, msgID, event.content)
 	// Have to discard if too large since service doesn't
 	// handle above 64k; we limit payload at 32k
 	strLen := len(event.content)
 	if strLen > logMaxBytes {
-		log.Errorf("HandleLogEvent: dropping source %s %d bytes: %s\n",
+		log.Errorf("handleLogEvent: dropping source %s %d bytes: %s\n",
 			event.source, strLen, event.content)
 		return
 	}
 
 	logDetails := &logs.LogEntry{}
-	logDetails.Content = event.content
+	logDetails.Content = strings.Map(func(r rune) rune {
+		if r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, event.content)
 	logDetails.Severity = event.severity
 	logDetails.Timestamp, _ = ptypes.TimestampProto(event.timestamp)
 	logDetails.Source = event.source
 	logDetails.Iid = event.iid
-	logDetails.Msgid = uint64(msgId)
+	logDetails.Msgid = uint64(msgID)
+	logDetails.Filename = event.filename
+	logDetails.Function = event.function
 	oldLen := int64(proto.Size(reportLogs))
 	reportLogs.Log = append(reportLogs.Log, logDetails)
 	newLen := int64(proto.Size(reportLogs))
 	if newLen > logMaxBytes {
-		log.Warnf("HandleLogEvent: source %s from %d to %d bytes: %s\n",
+		log.Warnf("handleLogEvent: source %s from %d to %d bytes: %s\n",
 			event.source, oldLen, newLen, event.content)
 	}
 }
 
 // Returns true if a message was successfully sent
 func sendProtoStrForLogs(reportLogs *logs.LogBundle, image string,
-	iteration int) bool {
+	iteration int, eveVersion string) bool {
 	reportLogs.Timestamp = ptypes.TimestampNow()
 	reportLogs.DevID = *proto.String(devUUID.String())
 	reportLogs.Image = image
+	reportLogs.EveVersion = eveVersion
 
 	log.Debugln("sendProtoStrForLogs called...", iteration)
 	data, err := proto.Marshal(reportLogs)
@@ -649,12 +708,12 @@ func sendProtoStrForLogs(reportLogs *logs.LogBundle, image string,
 	if zedcloud.HasDeferred(image) {
 		log.Infof("SendProtoStrForLogs queued after existing for %s\n",
 			image)
-		zedcloud.AddDeferred(image, buf, size, logsUrl, zedcloudCtx,
+		zedcloud.AddDeferred(image, buf, size, logsURL, zedcloudCtx,
 			return400)
 		reportLogs.Log = []*logs.LogEntry{}
 		return false
 	}
-	resp, _, _, err := zedcloud.SendOnAllIntf(zedcloudCtx, logsUrl,
+	resp, _, _, err := zedcloud.SendOnAllIntf(zedcloudCtx, logsURL,
 		size, buf, iteration, return400)
 	// XXX We seem to still get large or bad messages which are rejected
 	// by the server. Ignore them to make sure we can log subsequent ones.
@@ -662,7 +721,7 @@ func sendProtoStrForLogs(reportLogs *logs.LogBundle, image string,
 	// this one?
 	if resp != nil && resp.StatusCode == 400 {
 		log.Errorf("Failed sending %d bytes image %s to %s; code 400; ignored error\n",
-			size, image, logsUrl)
+			size, image, logsURL)
 		reportLogs.Log = []*logs.LogEntry{}
 		return true
 	}
@@ -677,19 +736,19 @@ func sendProtoStrForLogs(reportLogs *logs.LogBundle, image string,
 		if buf == nil {
 			log.Fatal("sendProtoStrForLogs malloc error:")
 		}
-		zedcloud.AddDeferred(image, buf, size, logsUrl, zedcloudCtx,
+		zedcloud.AddDeferred(image, buf, size, logsURL, zedcloudCtx,
 			return400)
 		reportLogs.Log = []*logs.LogEntry{}
 		return false
 	}
-	log.Debugf("Sent %d bytes image %s to %s\n", size, image, logsUrl)
+	log.Debugf("Sent %d bytes image %s to %s\n", size, image, logsURL)
 	reportLogs.Log = []*logs.LogEntry{}
 	return true
 }
 
-func sendCtxInit(ctx *logmanagerContext) {
+func sendCtxInit(ctx *logmanagerContext, dnsCtx *DNSContext) {
 	//get server name
-	bytes, err := ioutil.ReadFile(serverFilename)
+	bytes, err := ioutil.ReadFile(types.ServerFileName)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -698,29 +757,33 @@ func sendCtxInit(ctx *logmanagerContext) {
 	serverName = strings.Split(serverName, ":")[0]
 
 	//set log url
-	logsUrl = serverNameAndPort + "/" + logsApi
+	logsURL = serverNameAndPort + "/" + logsAPI
 
-	tlsConfig, err := zedcloud.GetTlsConfig(serverName, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
+	v2api := false // XXX set
 	zedcloudCtx.DeviceNetworkStatus = deviceNetworkStatus
-	zedcloudCtx.TlsConfig = tlsConfig
 	zedcloudCtx.FailureFunc = zedcloud.ZedCloudFailure
 	zedcloudCtx.SuccessFunc = zedcloud.ZedCloudSuccess
 	zedcloudCtx.NetworkSendTimeout = ctx.globalConfig.NetworkSendTimeout
+	zedcloudCtx.V2API = v2api
 
 	// get the edge box serial number
 	zedcloudCtx.DevSerial = hardware.GetProductSerial()
 	zedcloudCtx.DevSoftSerial = hardware.GetSoftSerial()
+	dnsCtx.zedcloudCtx = &zedcloudCtx
 	log.Infof("Log Get Device Serial %s, Soft Serial %s\n", zedcloudCtx.DevSerial,
 		zedcloudCtx.DevSoftSerial)
 
+	// XXX need to redo this since the root certificates can change when DeviceNetworkStatus changes
+	err = zedcloud.UpdateTLSConfig(&zedcloudCtx, serverName, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// In case we run early, wait for UUID file to appear
 	for {
-		b, err := ioutil.ReadFile(uuidFileName)
+		b, err := ioutil.ReadFile(types.UUIDFileName)
 		if err != nil {
-			log.Errorln("ReadFile", err, uuidFileName)
+			log.Errorln("ReadFile", err, types.UUIDFileName)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -737,7 +800,7 @@ func sendCtxInit(ctx *logmanagerContext) {
 	log.Infof("Read UUID %s\n", devUUID)
 }
 
-func HandleLogDirEvent(change string, logDirName string, ctx interface{},
+func handleLogDirEvent(change string, logDirName string, ctx interface{},
 	handleLogDirModifyFunc logDirModifyHandler,
 	handleLogDirDeleteFunc logDirDeleteHandler) {
 
@@ -761,94 +824,6 @@ func HandleLogDirEvent(change string, logDirName string, ctx interface{},
 			operation)
 	}
 	handleLogDirModifyFunc(ctx, logFilePath, source)
-}
-
-func handleXenLogDirModify(context interface{},
-	filename string, source string) {
-
-	if strings.Compare(source, "hypervisor") == 0 {
-		log.Debugln("Ignoring hypervisor log while sending domU log")
-		return
-	}
-	ctx := context.(*imageLoggerContext)
-	for i, r := range ctx.logfileReaders {
-		if r.filename == filename {
-			readLineToEvent(&ctx.logfileReaders[i].logfileReader,
-				r.logChan)
-			return
-		}
-	}
-	// Look for guest-domainName.log and look it up to find app UUID
-	// change source to app UUID
-	if strings.HasPrefix(source, "guest-") {
-		domainName := strings.TrimPrefix(source, "guest-")
-		uuidStr := lookupDomainName(domainName)
-		if uuidStr != "" {
-			log.Infof("Changing %s to %s\n", source, uuidStr)
-			source = uuidStr
-		} else {
-			log.Infof("DomainName %s not found\n", domainName)
-		}
-	}
-	createXenLogger(ctx, filename, source)
-}
-
-func createXenLogger(ctx *imageLoggerContext, filename string, source string) {
-
-	log.Infof("createXenLogger: add %s, source %s\n", filename, source)
-
-	fileDesc, err := os.Open(filename)
-	if err != nil {
-		log.Errorf("Log file ignored due to %s\n", err)
-		return
-	}
-	// Start reading from the file with a reader.
-	reader := bufio.NewReader(fileDesc)
-	if reader == nil {
-		log.Errorf("Log file ignored due to %s\n", err)
-		return
-	}
-
-	r0 := logfileReader{filename: filename,
-		source:   source,
-		fileDesc: fileDesc,
-		reader:   reader,
-	}
-	r := imageLogfileReader{logfileReader: r0,
-		image:   source,
-		logChan: make(chan logEntry),
-	}
-
-	lastSent := readLast(lastSentDirname, source)
-	lastSentStr, _ := lastSent.MarshalText()
-	log.Debugf("createXenLogger: source %s last sent at %s\n",
-		source, string(lastSentStr))
-
-	// process associated channel
-	go processEvents(source, lastSent, r.logChan)
-
-	// Write start event to ensure log is not empty
-	now := time.Now()
-	nowStr, _ := now.MarshalText()
-	line := fmt.Sprintf("%s logmanager starting to log %s\n",
-		nowStr, r.source)
-	r.logChan <- logEntry{source: r.source, content: line,
-		timestamp: now}
-	// read initial entries until EOF
-	readLineToEvent(&r.logfileReader, r.logChan)
-	ctx.logfileReaders = append(ctx.logfileReaders, r)
-}
-
-func handleXenLogDirDelete(context interface{},
-	filename string, source string) {
-	ctx := context.(*imageLoggerContext)
-
-	log.Infof("handleLogDirDelete: delete %s, source %s\n", filename, source)
-	for _, logger := range ctx.logfileReaders {
-		if logger.logfileReader.filename == filename {
-			// XXX:FIXME, delete the entry
-		}
-	}
 }
 
 func handleLogDirModify(context interface{}, filename string, source string) {
@@ -954,11 +929,7 @@ func readLineToEvent(r *logfileReader, logChan chan<- logEntry) {
 			} else {
 				lastTime = timestamp
 			}
-			level, err := log.ParseLevel(loginfo.Level)
-			if err != nil {
-				log.Errorf("ParseLevel failed: %s\n", err)
-				level = log.DebugLevel
-			}
+			level := parseLogLevel(loginfo.Level)
 			if dropEvent(r.source, level) {
 				log.Debugf("Dropping source %s level %v\n",
 					r.source, level)
@@ -966,10 +937,16 @@ func readLineToEvent(r *logfileReader, logChan chan<- logEntry) {
 			}
 			// XXX set iid to PID? From where?
 			// We add time to front of msg.
-			logChan <- logEntry{source: r.source,
+			logSource := r.source
+			if loginfo.Source != "" {
+				logSource = loginfo.Source
+			}
+			logChan <- logEntry{source: logSource,
 				content:   loginfo.Time + ": " + loginfo.Msg,
 				severity:  loginfo.Level,
 				timestamp: timestamp,
+				function:  loginfo.Function,
+				filename:  loginfo.Filename,
 			}
 			lastLevel = int(level)
 		} else {
@@ -1016,6 +993,7 @@ func logReader(logFile string, source string, logChan chan<- logEntry) {
 	log.Infof("logReader done for %s\n", logFile)
 }
 
+// Handles both create and modify events
 func handleGlobalConfigModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
@@ -1025,12 +1003,13 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigModify for %s\n", key)
-	status := cast.CastGlobalConfig(statusArg)
+	status := statusArg.(types.GlobalConfig)
 	var gcp *types.GlobalConfig
 	debug, gcp = agentlog.HandleGlobalConfigNoDefault(ctx.subGlobalConfig,
 		agentName, debugOverride)
 	if gcp != nil {
 		ctx.globalConfig = gcp
+		ctx.GCInitialized = true
 	}
 	foundAgents := make(map[string]bool)
 	if status.DefaultRemoteLogLevel != "" {
@@ -1124,4 +1103,37 @@ func dropEvent(source string, level log.Level) bool {
 		return level > l
 	}
 	return false
+}
+
+func parseLogLevel(logLevel string) log.Level {
+	level, err := log.ParseLevel(logLevel)
+	if err != nil {
+		// XXX Some of the log sources send logs with
+		// severity set to err, emerg & notice.
+		// Logrus log level parse does not recognize the above severities.
+		// Map err, emerg to error and notice to info.
+		if logLevel == "err" || logLevel == "emerg" {
+			level = log.ErrorLevel
+		} else if logLevel == "notice" {
+			level = log.InfoLevel
+		} else {
+			log.Errorf("ParseLevel failed: %s, defaulting log level to Info\n", err)
+			level = log.InfoLevel
+		}
+	}
+	return level
+}
+
+func readEveVersion(fileName string) string {
+	version, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		log.Errorf("readEveVersion: Error reading EVE version from file %s", fileName)
+		return "Unknown"
+	}
+	versionStr := string(version)
+	versionStr = strings.TrimSpace(versionStr)
+	if versionStr == "" {
+		return "Unknown"
+	}
+	return versionStr
 }

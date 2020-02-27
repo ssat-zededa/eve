@@ -143,7 +143,7 @@ func IoBundleFromPhyAdapter(phyAdapter PhysicalIOAdapter) *IoBundle {
 	// XXX - We should really change IoType to type zconfig.PhyIoType
 	ib := IoBundle{}
 	ib.Type = IoType(phyAdapter.Ptype)
-	ib.Name = phyAdapter.Phylabel
+	ib.Name = phyAdapter.Phylabel // XXX should rename the field in ib to be Phylabel
 	ib.Logicallabel = phyAdapter.Logicallabel
 	ib.AssignmentGroup = phyAdapter.Assigngrp
 	ib.Ifname = phyAdapter.Phyaddr.Ifname
@@ -179,6 +179,19 @@ func (ioType IoType) IsNet() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// AddOrUpdateIoBundle - Add an Io bundle to AA. If the bundle already exists,
+//  it just updates it.
+func (aa *AssignableAdapters) AddOrUpdateIoBundle(ib IoBundle) {
+	curIbPtr := aa.LookupIoBundle(ib.Name)
+	if curIbPtr == nil {
+		log.Infof("handleIBCreate(%d %s %s) New Bundle",
+			ib.Type, ib.Name, ib.AssignmentGroup)
+		aa.IoBundleList = append(aa.IoBundleList, ib)
+	} else {
+		*curIbPtr = ib
 	}
 }
 

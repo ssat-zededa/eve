@@ -21,11 +21,12 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/api/go/register"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
-	"github.com/lf-edge/eve/pkg/pillar/cast"
+	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
@@ -35,6 +36,10 @@ const (
 	agentName   = "zedclient"
 	maxDelay    = time.Second * 600 // 10 minutes
 	uuidMaxWait = time.Second * 60  // 1 minute
+	// Time limits for event loop handlers
+	errorTime   = 3 * time.Minute
+	warningTime = 40 * time.Second
+	return400   = false
 )
 
 // Really a constant
@@ -43,9 +48,9 @@ var nilUUID uuid.UUID
 // Set from Makefile
 var Version = "No version specified"
 
-// Assumes the config files are in identityDirname, which is /config
+// Assumes the config files are in IdentityDirname, which is /config
 // by default. The files are
-//  root-certificate.pem	Fixed? Written if redirected. factory-root-cert?
+//  root-certificate.pem	Root CA cert(s) for object signing
 //  server			Fixed? Written if redirected. factory-root-cert?
 //  onboard.cert.pem, onboard.key.pem	Per device onboarding certificate/key
 //  		   		for selfRegister operation
@@ -60,21 +65,24 @@ var Version = "No version specified"
 //
 
 type clientContext struct {
-	subDeviceNetworkStatus *pubsub.Subscription
+	subDeviceNetworkStatus pubsub.Subscription
 	deviceNetworkStatus    *types.DeviceNetworkStatus
 	usableAddressCount     int
-	subGlobalConfig        *pubsub.Subscription
+	subGlobalConfig        pubsub.Subscription
 	globalConfig           *types.GlobalConfig
+	zedcloudCtx            *zedcloud.ZedCloudContext
 }
 
-var debug = false
-var debugOverride bool // From command line arg
+var (
+	debug             = false
+	debugOverride     bool // From command line arg
+	serverNameAndPort string
+)
 
-func Run() { //nolint:gocyclo
+func Run(ps *pubsub.PubSub) { //nolint:gocyclo
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
 	curpartPtr := flag.String("c", "", "Current partition")
-	dirPtr := flag.String("D", "/config", "Directory with certs etc")
 	stdoutPtr := flag.Bool("s", false, "Use stdout")
 	noPidPtr := flag.Bool("p", false, "Do not check for running client")
 	maxRetriesPtr := flag.Int("r", 0, "Max retries")
@@ -89,7 +97,6 @@ func Run() { //nolint:gocyclo
 		log.SetLevel(log.InfoLevel)
 	}
 	curpart := *curpartPtr
-	identityDirname := *dirPtr
 	useStdout := *stdoutPtr
 	noPidFlag := *noPidPtr
 	maxRetries := *maxRetriesPtr
@@ -105,8 +112,12 @@ func Run() { //nolint:gocyclo
 	}
 	defer logf.Close()
 	if useStdout {
-		multi := io.MultiWriter(logf, os.Stdout)
-		log.SetOutput(multi)
+		if logf == nil {
+			log.SetOutput(os.Stdout)
+		} else {
+			multi := io.MultiWriter(logf, os.Stdout)
+			log.SetOutput(multi)
+		}
 	}
 	if !noPidFlag {
 		if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
@@ -124,27 +135,25 @@ func Run() { //nolint:gocyclo
 		} else {
 			log.Errorf("Unknown arg %s\n", op)
 			log.Fatal("Usage: " + os.Args[0] +
-				"[-o] [-d <identityDirname> [<operations>...]]")
+				"[-o] [<operations>...]")
 		}
 	}
 
-	onboardCertName := identityDirname + "/onboard.cert.pem"
-	onboardKeyName := identityDirname + "/onboard.key.pem"
-	deviceCertName := identityDirname + "/device.cert.pem"
-	serverFileName := identityDirname + "/server"
-	uuidFileName := identityDirname + "/uuid"
-	hardwaremodelFileName := identityDirname + "/hardwaremodel"
-	enterpriseFileName := identityDirname + "/enterprise"
-	nameFileName := identityDirname + "/name"
+	hardwaremodelFileName := types.IdentityDirname + "/hardwaremodel"
+	enterpriseFileName := types.IdentityDirname + "/enterprise"
+	nameFileName := types.IdentityDirname + "/name"
 
 	cms := zedcloud.GetCloudMetrics() // Need type of data
-	pub, err := pubsub.Publish(agentName, cms)
+	pub, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: cms,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	var oldUUID uuid.UUID
-	b, err := ioutil.ReadFile(uuidFileName)
+	b, err := ioutil.ReadFile(types.UUIDFileName)
 	if err == nil {
 		uuidStr := strings.TrimSpace(string(b))
 		oldUUID, err = uuid.FromString(uuidStr)
@@ -161,88 +170,74 @@ func Run() { //nolint:gocyclo
 	}
 
 	// Look for global config such as log levels
-	subGlobalConfig, err := pubsub.Subscribe("", types.GlobalConfig{},
-		false, &clientCtx)
+	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		CreateHandler: handleGlobalConfigModify,
+		ModifyHandler: handleGlobalConfigModify,
+		DeleteHandler: handleGlobalConfigDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+		TopicImpl:     types.GlobalConfig{},
+		Ctx:           &clientCtx,
+	})
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	subGlobalConfig.ModifyHandler = handleGlobalConfigModify
-	subGlobalConfig.DeleteHandler = handleGlobalConfigDelete
 	clientCtx.subGlobalConfig = subGlobalConfig
 	subGlobalConfig.Activate()
 
-	subDeviceNetworkStatus, err := pubsub.Subscribe("nim",
-		types.DeviceNetworkStatus{}, false, &clientCtx)
+	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		CreateHandler: handleDNSModify,
+		ModifyHandler: handleDNSModify,
+		DeleteHandler: handleDNSDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+		AgentName:     "nim",
+		TopicImpl:     types.DeviceNetworkStatus{},
+		Ctx:           &clientCtx,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	subDeviceNetworkStatus.ModifyHandler = handleDNSModify
-	subDeviceNetworkStatus.DeleteHandler = handleDNSDelete
 	clientCtx.subDeviceNetworkStatus = subDeviceNetworkStatus
 	subDeviceNetworkStatus.Activate()
 
-	// Wait for a usable IP address.
-	// After 5 seconds we check; if we already have a UUID we proceed.
-	// Otherwise we start connecting to zedcloud whether or not we
-	// have any IP addresses.
-	t1 := time.NewTimer(5 * time.Second)
-	done := clientCtx.usableAddressCount != 0
-
-	for !done {
-		log.Infof("Waiting for usableAddressCount %d and done %v\n",
-			clientCtx.usableAddressCount, done)
-		select {
-		case change := <-subGlobalConfig.C:
-			subGlobalConfig.ProcessChange(change)
-
-		case change := <-subDeviceNetworkStatus.C:
-			subDeviceNetworkStatus.ProcessChange(change)
-			done = clientCtx.usableAddressCount != 0
-
-		case <-t1.C:
-			done = true
-			// If we already know a uuid we can skip
-			// This might not set hardwaremodel when upgrading
-			// an onboarded system without /config/hardwaremodel.
-			// Unlikely to have a network outage during that
-			// upgrade *and* require an override.
-			if clientCtx.usableAddressCount == 0 &&
-				operations["getUuid"] && oldUUID != nilUUID {
-
-				log.Infof("Already have a UUID %s; declaring success\n",
-					oldUUID.String())
-				// Likely zero metrics
-				err := pub.Publish("global", zedcloud.GetCloudMetrics())
-				if err != nil {
-					log.Errorln(err)
-				}
-				return
-			}
-		}
-	}
-	log.Infof("Got for deviceNetworkConfig: %d addresses\n",
-		clientCtx.usableAddressCount)
-
+	// XXX set propertly
+	v2api := false
 	zedcloudCtx := zedcloud.ZedCloudContext{
 		DeviceNetworkStatus: clientCtx.deviceNetworkStatus,
 		FailureFunc:         zedcloud.ZedCloudFailure,
 		SuccessFunc:         zedcloud.ZedCloudSuccess,
 		NetworkSendTimeout:  clientCtx.globalConfig.NetworkSendTimeout,
+		V2API:               v2api,
 	}
 
-	// Get device serail number
+	// Get device serial number
 	zedcloudCtx.DevSerial = hardware.GetProductSerial()
 	zedcloudCtx.DevSoftSerial = hardware.GetSoftSerial()
+	clientCtx.zedcloudCtx = &zedcloudCtx
 	log.Infof("Client Get Device Serial %s, Soft Serial %s\n", zedcloudCtx.DevSerial,
 		zedcloudCtx.DevSoftSerial)
 
-	server, err := ioutil.ReadFile(serverFileName)
+	// Run a periodic timer so we always update StillRunning
+	stillRunning := time.NewTicker(25 * time.Second)
+	agentlog.StillRunning(agentName, warningTime, errorTime)
+
+	// Wait for a usable IP address.
+	// After 5 seconds we check; if we already have a UUID we proceed.
+	// That ensures that we will start zedagent and it will check
+	// the cloudGoneTime if we are doing an imake update.
+	t1 := time.NewTimer(5 * time.Second)
+
+	ticker := flextimer.NewExpTicker(time.Second, maxDelay, 0.0)
+
+	// XXX redo in ticker case to handle change to servername?
+	server, err := ioutil.ReadFile(types.ServerFileName)
 	if err != nil {
 		log.Fatal(err)
 	}
-	serverNameAndPort := strings.TrimSpace(string(server))
+	serverNameAndPort = strings.TrimSpace(string(server))
 	serverName := strings.Split(serverNameAndPort, ":")[0]
-	const return400 = false
 
 	var onboardCert tls.Certificate
 	var deviceCertPem []byte
@@ -250,16 +245,18 @@ func Run() { //nolint:gocyclo
 
 	if operations["selfRegister"] {
 		var err error
-		onboardCert, err = tls.LoadX509KeyPair(onboardCertName, onboardKeyName)
+		onboardCert, err = tls.LoadX509KeyPair(types.OnboardCertName,
+			types.OnboardKeyName)
 		if err != nil {
 			log.Fatal(err)
 		}
-		onboardTLSConfig, err = zedcloud.GetTlsConfig(serverName, &onboardCert)
+		onboardTLSConfig, err = zedcloud.GetTlsConfig(zedcloudCtx.DeviceNetworkStatus,
+			serverName, &onboardCert, &zedcloudCtx)
 		if err != nil {
 			log.Fatal(err)
 		}
 		// Load device text cert for upload
-		deviceCertPem, err = ioutil.ReadFile(deviceCertName)
+		deviceCertPem, err = ioutil.ReadFile(types.DeviceCertName)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -270,238 +267,88 @@ func Run() { //nolint:gocyclo
 	if err != nil {
 		log.Fatal(err)
 	}
-	tlsConfig, err := zedcloud.GetTlsConfig(serverName, &deviceCert)
+	tlsConfig, err := zedcloud.GetTlsConfig(zedcloudCtx.DeviceNetworkStatus,
+		serverName, &deviceCert, &zedcloudCtx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Post something without a return type.
-	// Returns true when done; false when retry
-	myPost := func(tlsConfig *tls.Config, retryCount int, requrl string, reqlen int64, b *bytes.Buffer) bool {
-
-		zedcloudCtx.TlsConfig = tlsConfig
-		resp, contents, rtf, err := zedcloud.SendOnAllIntf(zedcloudCtx,
-			requrl, reqlen, b, retryCount, return400)
-		if err != nil {
-			if rtf {
-				log.Errorf("remoteTemporaryFailure %s", err)
-			} else {
-				log.Errorln(err)
-			}
-			return false
-		}
-
-		if !zedcloudCtx.NoLedManager {
-			// Inform ledmanager about cloud connectivity
-			types.UpdateLedManagerConfig(3)
-		}
-		switch resp.StatusCode {
-		case http.StatusOK:
-			if !zedcloudCtx.NoLedManager {
-				// Inform ledmanager about existence in cloud
-				types.UpdateLedManagerConfig(4)
-			}
-			log.Infof("%s StatusOK\n", requrl)
-		case http.StatusCreated:
-			if !zedcloudCtx.NoLedManager {
-				// Inform ledmanager about existence in cloud
-				types.UpdateLedManagerConfig(4)
-			}
-			log.Infof("%s StatusCreated\n", requrl)
-		case http.StatusConflict:
-			if !zedcloudCtx.NoLedManager {
-				// Inform ledmanager about brokenness
-				types.UpdateLedManagerConfig(10)
-			}
-			log.Errorf("%s StatusConflict\n", requrl)
-			// Retry until fixed
-			log.Errorf("%s\n", string(contents))
-			return false
-		case http.StatusNotModified: // XXX from zedcloud
-			if !zedcloudCtx.NoLedManager {
-				// Inform ledmanager about brokenness
-				types.UpdateLedManagerConfig(10)
-			}
-			log.Errorf("%s StatusNotModified\n", requrl)
-			// Retry until fixed
-			log.Errorf("%s\n", string(contents))
-			return false
-		default:
-			log.Errorf("%s statuscode %d %s\n",
-				requrl, resp.StatusCode,
-				http.StatusText(resp.StatusCode))
-			log.Errorf("%s\n", string(contents))
-			return false
-		}
-
-		contentType := resp.Header.Get("Content-Type")
-		if contentType == "" {
-			log.Errorf("%s no content-type\n", requrl)
-			return false
-		}
-		mimeType, _, err := mime.ParseMediaType(contentType)
-		if err != nil {
-			log.Errorf("%s ParseMediaType failed %v\n", requrl, err)
-			return false
-		}
-		switch mimeType {
-		case "application/x-proto-binary", "application/json", "text/plain":
-			log.Debugf("Received reply %s\n", string(contents))
-		default:
-			log.Errorln("Incorrect Content-Type " + mimeType)
-			return false
-		}
-		return true
-	}
-
-	// Returns true when done; false when retry
-	selfRegister := func(tlsConfig *tls.Config, retryCount int) bool {
-		// XXX add option to get this from a file in /config + override
-		// logic
-		productSerial := hardware.GetProductSerial()
-		productSerial = strings.TrimSpace(productSerial)
-		softSerial := hardware.GetSoftSerial()
-		softSerial = strings.TrimSpace(softSerial)
-		log.Infof("ProductSerial %s, SoftwareSerial %s\n", productSerial, softSerial)
-
-		registerCreate := &register.ZRegisterMsg{
-			PemCert:    []byte(base64.StdEncoding.EncodeToString(deviceCertPem)),
-			Serial:     productSerial,
-			SoftSerial: softSerial,
-		}
-		b, err := proto.Marshal(registerCreate)
-		if err != nil {
-			log.Errorln(err)
-			return false
-		}
-		return myPost(tlsConfig, retryCount,
-			serverNameAndPort+"/api/v1/edgedevice/register",
-			int64(len(b)), bytes.NewBuffer(b))
-	}
-
-	// Get something
-	// Returns true when done; false when retry.
-	// Returns the response when done. Caller can not use resp.Body but
-	// can use the contents []byte
-	myGet := func(tlsConfig *tls.Config, requrl string, retryCount int) (bool, *http.Response, []byte) {
-
-		zedcloudCtx.TlsConfig = tlsConfig
-		resp, contents, rtf, err := zedcloud.SendOnAllIntf(zedcloudCtx,
-			requrl, 0, nil, retryCount, return400)
-		if err != nil {
-			if rtf {
-				log.Errorf("remoteTemporaryFailure %s", err)
-			} else {
-				log.Errorln(err)
-			}
-			return false, nil, nil
-		}
-
-		switch resp.StatusCode {
-		case http.StatusOK:
-			log.Infof("%s StatusOK\n", requrl)
-			return true, resp, contents
-		default:
-			log.Errorf("%s statuscode %d %s\n",
-				requrl, resp.StatusCode,
-				http.StatusText(resp.StatusCode))
-			log.Errorf("Received %s\n", string(contents))
-			return false, nil, nil
-		}
-	}
-
-	doGetUUID := func(retryCount int) (bool, uuid.UUID, string, string, string) {
-		var resp *http.Response
-		var contents []byte
-
-		requrl := serverNameAndPort + "/api/v1/edgedevice/config"
-		done, resp, contents = myGet(tlsConfig, requrl, retryCount)
-		if !done {
-			return false, nilUUID, "", "", ""
-		}
-		var err error
-		devUUID, hardwaremodel, enterprise, name, err := parseConfig(requrl, resp, contents)
-		if err == nil {
-			// Inform ledmanager about config received from cloud
-			if !zedcloudCtx.NoLedManager {
-				types.UpdateLedManagerConfig(4)
-			}
-			return true, devUUID, hardwaremodel, enterprise, name
-		}
-		// Keep on trying until it parses
-		log.Errorf("Failed parsing uuid: %s\n", err)
-		return false, nilUUID, "", "", ""
-	}
-
+	done := false
 	var devUUID uuid.UUID
 	var hardwaremodel string
 	var enterprise string
 	var name string
+	gotUUID := false
+	retryCount := 0
+	for !done {
+		log.Infof("Waiting for usableAddressCount %d and done %v\n",
+			clientCtx.usableAddressCount, done)
+		select {
+		case change := <-subGlobalConfig.MsgChan():
+			subGlobalConfig.ProcessChange(change)
 
-	if operations["selfRegister"] {
-		retryCount := 0
-		done := false
-		var delay time.Duration
-		for !done {
-			time.Sleep(delay)
-			done = selfRegister(onboardTLSConfig, retryCount)
-			if done {
-				continue
+		case change := <-subDeviceNetworkStatus.MsgChan():
+			subDeviceNetworkStatus.ProcessChange(change)
+
+		case <-ticker.C:
+			if clientCtx.usableAddressCount == 0 {
+				log.Infof("ticker and no usableAddressCount")
+				// XXX keep exponential unchanged?
+				break
 			}
-			retryCount += 1
-			if maxRetries != 0 && retryCount > maxRetries {
-				log.Errorf("Exceeded %d retries for selfRegister\n",
-					maxRetries)
-				os.Exit(1)
-			}
-			delay = 2 * (delay + time.Second)
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-			log.Infof("Retrying selfRegister in %d seconds\n",
-				delay/time.Second)
-			if operations["getUuid"] {
-				// Check if getUUid succeeds
-				done, devUUID, hardwaremodel, enterprise, name = doGetUUID(retryCount)
-				if done {
-					log.Infof("getUUID succeeded; selfRegister no longer needed")
+			// XXX server/tls setup from above to capture change
+			// to server file?
+			if operations["selfRegister"] {
+				done = selfRegister(zedcloudCtx, onboardTLSConfig, deviceCertPem, retryCount)
+				if !done && operations["getUuid"] {
+					// Check if getUUid succeeds
+					done, devUUID, hardwaremodel, enterprise, name = doGetUUID(zedcloudCtx, tlsConfig, retryCount)
+					if done {
+						log.Infof("getUUID succeeded; selfRegister no longer needed")
+						gotUUID = true
+					}
 				}
 			}
-		}
-	}
-
-	if operations["getUuid"] {
-		retryCount := 0
-		done := false
-		var delay time.Duration
-		for !done {
-			done, devUUID, hardwaremodel, enterprise, name = doGetUUID(retryCount)
-			if done {
-				break
+			if !gotUUID && operations["getUuid"] {
+				done, devUUID, hardwaremodel, enterprise, name = doGetUUID(zedcloudCtx, tlsConfig, retryCount)
+				if done {
+					log.Infof("getUUID succeeded; selfRegister no longer needed")
+					gotUUID = true
+				}
+				if oldUUID != nilUUID && retryCount > 2 {
+					log.Infof("Sticking with old UUID\n")
+					devUUID = oldUUID
+					done = true
+					break
+				}
 			}
-			if oldUUID != nilUUID && retryCount > 2 {
-				log.Infof("Sticking with old UUID\n")
-				devUUID = oldUUID
-				done = true
-				break
-			}
-
-			retryCount += 1
+			retryCount++
 			if maxRetries != 0 && retryCount > maxRetries {
-				log.Errorf("Exceeded %d retries for getUuid\n",
+				log.Errorf("Exceeded %d retries",
 					maxRetries)
 				os.Exit(1)
 			}
-			delay = 2 * (delay + time.Second)
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-			log.Infof("Retrying config in %d seconds\n",
-				delay/time.Second)
-			time.Sleep(delay)
 
+		case <-t1.C:
+			// If we already know a uuid we can skip
+			// This might not set hardwaremodel when upgrading
+			// an onboarded system without /config/hardwaremodel.
+			// Unlikely to have a network outage during that
+			// upgrade *and* require an override.
+			if clientCtx.usableAddressCount == 0 &&
+				operations["getUuid"] && oldUUID != nilUUID {
+
+				log.Infof("Already have a UUID %s; declaring success\n",
+					oldUUID.String())
+				done = true
+			}
+
+		case <-stillRunning.C:
 		}
+		agentlog.StillRunning(agentName, warningTime, errorTime)
 	}
+
+	// Post loop code
 	if devUUID != nilUUID {
 		doWrite := true
 		if oldUUID != nilUUID {
@@ -519,9 +366,9 @@ func Run() { //nolint:gocyclo
 
 		if doWrite {
 			b := []byte(fmt.Sprintf("%s\n", devUUID))
-			err = ioutil.WriteFile(uuidFileName, b, 0644)
+			err = ioutil.WriteFile(types.UUIDFileName, b, 0644)
 			if err != nil {
-				log.Fatal("WriteFile", err, uuidFileName)
+				log.Fatal("WriteFile", err, types.UUIDFileName)
 			}
 			log.Debugf("Wrote UUID %s\n", devUUID)
 		}
@@ -573,6 +420,153 @@ func Run() { //nolint:gocyclo
 	}
 }
 
+// Post something without a return type.
+// Returns true when done; false when retry
+func myPost(zedcloudCtx zedcloud.ZedCloudContext, tlsConfig *tls.Config,
+	requrl string, retryCount int, reqlen int64, b *bytes.Buffer) (bool, *http.Response, []byte) {
+
+	zedcloudCtx.TlsConfig = tlsConfig
+	resp, contents, rtf, err := zedcloud.SendOnAllIntf(zedcloudCtx,
+		requrl, reqlen, b, retryCount, return400)
+	if err != nil {
+		if rtf {
+			log.Errorf("remoteTemporaryFailure %s", err)
+		} else {
+			log.Errorln(err)
+		}
+		return false, resp, contents
+	}
+
+	if !zedcloudCtx.NoLedManager {
+		// Inform ledmanager about cloud connectivity
+		utils.UpdateLedManagerConfig(3)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if !zedcloudCtx.NoLedManager {
+			// Inform ledmanager about existence in cloud
+			utils.UpdateLedManagerConfig(4)
+		}
+		log.Infof("%s StatusOK\n", requrl)
+	case http.StatusCreated:
+		if !zedcloudCtx.NoLedManager {
+			// Inform ledmanager about existence in cloud
+			utils.UpdateLedManagerConfig(4)
+		}
+		log.Infof("%s StatusCreated\n", requrl)
+	case http.StatusConflict:
+		if !zedcloudCtx.NoLedManager {
+			// Inform ledmanager about brokenness
+			utils.UpdateLedManagerConfig(10)
+		}
+		log.Errorf("%s StatusConflict\n", requrl)
+		// Retry until fixed
+		log.Errorf("%s\n", string(contents))
+		return false, resp, contents
+	case http.StatusNotModified:
+		// Caller needs to handle
+		return false, resp, contents
+	default:
+		log.Errorf("%s statuscode %d %s\n",
+			requrl, resp.StatusCode,
+			http.StatusText(resp.StatusCode))
+		log.Errorf("%s\n", string(contents))
+		return false, resp, contents
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		log.Errorf("%s no content-type\n", requrl)
+		return false, resp, contents
+	}
+	mimeType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		log.Errorf("%s ParseMediaType failed %v\n", requrl, err)
+		return false, resp, contents
+	}
+	switch mimeType {
+	case "application/x-proto-binary", "application/json", "text/plain":
+		log.Debugf("Received reply %s\n", string(contents))
+	default:
+		log.Errorln("Incorrect Content-Type " + mimeType)
+		return false, resp, contents
+	}
+	return true, resp, contents
+}
+
+// Returns true when done; false when retry
+func selfRegister(zedcloudCtx zedcloud.ZedCloudContext, tlsConfig *tls.Config, deviceCertPem []byte, retryCount int) bool {
+	// XXX add option to get this from a file in /config + override
+	// logic
+	productSerial := hardware.GetProductSerial()
+	productSerial = strings.TrimSpace(productSerial)
+	softSerial := hardware.GetSoftSerial()
+	softSerial = strings.TrimSpace(softSerial)
+	log.Infof("ProductSerial %s, SoftwareSerial %s\n", productSerial, softSerial)
+
+	registerCreate := &register.ZRegisterMsg{
+		PemCert:    []byte(base64.StdEncoding.EncodeToString(deviceCertPem)),
+		Serial:     productSerial,
+		SoftSerial: softSerial,
+	}
+	b, err := proto.Marshal(registerCreate)
+	if err != nil {
+		log.Errorln(err)
+		return false
+	}
+	requrl := serverNameAndPort + "/api/v1/edgedevice/register"
+	done, resp, contents := myPost(zedcloudCtx, tlsConfig,
+		requrl, retryCount,
+		int64(len(b)), bytes.NewBuffer(b))
+	if resp != nil && resp.StatusCode == http.StatusNotModified {
+		if !zedcloudCtx.NoLedManager {
+			// Inform ledmanager about brokenness
+			utils.UpdateLedManagerConfig(10)
+		}
+		log.Errorf("%s StatusNotModified\n", requrl)
+		// Retry until fixed
+		log.Errorf("%s\n", string(contents))
+		done = false
+	}
+	return done
+}
+
+func doGetUUID(zedcloudCtx zedcloud.ZedCloudContext, tlsConfig *tls.Config,
+	retryCount int) (bool, uuid.UUID, string, string, string) {
+
+	var resp *http.Response
+	var contents []byte
+
+	requrl := serverNameAndPort + "/api/v1/edgedevice/config"
+	b, err := generateConfigRequest()
+	if err != nil {
+		log.Errorln(err)
+		return false, nilUUID, "", "", ""
+	}
+	var done bool
+	done, resp, contents = myPost(zedcloudCtx, tlsConfig, requrl, retryCount,
+		int64(len(b)), bytes.NewBuffer(b))
+	if resp != nil && resp.StatusCode == http.StatusNotModified {
+		// Acceptable response for a ConfigRequest POST
+		done = true
+	}
+	if !done {
+		return false, nilUUID, "", "", ""
+	}
+	devUUID, hardwaremodel, enterprise, name, err := parseConfig(requrl, resp, contents)
+	if err == nil {
+		// Inform ledmanager about config received from cloud
+		if !zedcloudCtx.NoLedManager {
+			utils.UpdateLedManagerConfig(4)
+		}
+		return true, devUUID, hardwaremodel, enterprise, name
+	}
+	// Keep on trying until it parses
+	log.Errorf("Failed parsing uuid: %s\n", err)
+	return false, nilUUID, "", "", ""
+}
+
+// Handles both create and modify events
 func handleGlobalConfigModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
@@ -606,9 +600,10 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 	log.Infof("handleGlobalConfigDelete done for %s\n", key)
 }
 
+// Handles both create and modify events
 func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 
-	status := cast.CastDeviceNetworkStatus(statusArg)
+	status := statusArg.(types.DeviceNetworkStatus)
 	ctx := ctxArg.(*clientContext)
 	if key != "global" {
 		log.Infof("handleDNSModify: ignoring %s\n", key)
@@ -629,6 +624,11 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 			ctx.usableAddressCount, newAddrCount)
 		// ledmanager subscribes to DeviceNetworkStatus to see changes
 		ctx.usableAddressCount = newAddrCount
+	}
+
+	// update proxy certs if configured
+	if ctx.zedcloudCtx != nil && ctx.zedcloudCtx.V2API {
+		zedcloud.UpdateTLSProxyCerts(ctx.zedcloudCtx)
 	}
 	log.Infof("handleDNSModify done for %s\n", key)
 }

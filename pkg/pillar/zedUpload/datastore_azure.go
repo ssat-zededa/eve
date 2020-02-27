@@ -5,10 +5,12 @@ package zedUpload
 
 import (
 	"fmt"
-	azure "github.com/lf-edge/eve/pkg/pillar/zedUpload/azureutil"
 	"net"
 	"net/http"
 	"net/url"
+
+	azure "github.com/lf-edge/eve/pkg/pillar/zedUpload/azureutil"
+
 	//	"strings"
 	"time"
 )
@@ -16,6 +18,7 @@ import (
 func (ep *AzureTransportMethod) Action(req *DronaRequest) error {
 	var err error
 	var size int
+	var loc string
 	var list []string
 	var contentLength int64
 	var remoteFileMD5 string
@@ -24,7 +27,8 @@ func (ep *AzureTransportMethod) Action(req *DronaRequest) error {
 	case SyncOpDownload:
 		err = ep.processAzureDownload(req)
 	case SyncOpUpload:
-		err = ep.processAzureUpload(req)
+		loc, err = ep.processAzureUpload(req)
+		req.objloc = loc
 	case SyncOpDelete:
 		err = ep.processAzureBlobDelete(req)
 	case SyncOpList:
@@ -53,13 +57,15 @@ func (ep *AzureTransportMethod) Close() error {
 	return nil
 }
 
-// use the specific ip as source address for this connection
-func (ep *AzureTransportMethod) WithSrcIpSelection(localAddr net.IP) error {
+// WithSrcIPSelection use the specific ip as source address for this connection
+func (ep *AzureTransportMethod) WithSrcIPSelection(localAddr net.IP) error {
 	ep.hClient = httpClientSrcIP(localAddr, nil)
 	return nil
 }
 
-func (ep *AzureTransportMethod) WithSrcIpAndProxySelection(localAddr net.IP,
+// WithSrcIPAndProxySelection use the specific ip as source address for this
+// connection and connect via the provided proxy URL
+func (ep *AzureTransportMethod) WithSrcIPAndProxySelection(localAddr net.IP,
 	proxy *url.URL) error {
 	ep.hClient = httpClientSrcIP(localAddr, proxy)
 	return nil
@@ -75,13 +81,13 @@ func (ep *AzureTransportMethod) WithLogging(onoff bool) error {
 }
 
 // File upload to Azure Blob Datastore
-func (ep *AzureTransportMethod) processAzureUpload(req *DronaRequest) error {
+func (ep *AzureTransportMethod) processAzureUpload(req *DronaRequest) (string, error) {
 	file := req.name
-	err := azure.UploadAzureBlob(ep.acName, ep.acKey, ep.container, file, req.objloc, ep.hClient)
+	loc, err := azure.UploadAzureBlob(ep.acName, ep.acKey, ep.container, file, req.objloc, ep.hClient)
 	if err != nil {
-		return err
+		return loc, err
 	}
-	return nil
+	return loc, nil
 }
 
 // File download from Azure Blob Datastore

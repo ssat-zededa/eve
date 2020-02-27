@@ -4,11 +4,11 @@
 package types
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -156,6 +156,19 @@ type DevicePortConfig struct {
 
 type DevicePortConfigVersion uint32
 
+// GetPortByIfName - DevicePortConfig Methord to Get Port structure by IfName
+func (portConfig *DevicePortConfig) GetPortByIfName(
+	u string) (NetworkPortConfig, error) {
+	var port NetworkPortConfig
+	for _, port = range portConfig.Ports {
+		if u == port.IfName {
+			return port, nil
+		}
+	}
+	err := fmt.Errorf("DevicePortConfig can't find port %s", u)
+	return port, err
+}
+
 // When new fields and/or new semantics are added to DevicePortConfig a new
 // version value is added here.
 const (
@@ -163,6 +176,7 @@ const (
 	DPCIsMgmt                          // Require IsMgmt to be set for management ports
 )
 
+// DoSanitize -
 func (portConfig *DevicePortConfig) DoSanitize(
 	sanitizeTimePriority bool,
 	sanitizeKey bool, key string,
@@ -172,8 +186,8 @@ func (portConfig *DevicePortConfig) DoSanitize(
 		zeroTime := time.Time{}
 		if portConfig.TimePriority == zeroTime {
 			// If we can stat the file use its modify time
-			filename := fmt.Sprintf("/var/tmp/zededa/DevicePortConfig/%s.json",
-				key)
+			filename := fmt.Sprintf("%s/DevicePortConfig/%s.json",
+				TmpDirname, key)
 			fi, err := os.Stat(filename)
 			if err == nil {
 				portConfig.TimePriority = fi.ModTime()
@@ -205,9 +219,55 @@ func (portConfig *DevicePortConfig) DoSanitize(
 	}
 }
 
-// Return false if recent failure (less than 60 seconds ago)
+// CountMgmtPorts returns the number of management ports
+// Exclude any broken ones with Dhcp = DT_NONE
+func (portConfig *DevicePortConfig) CountMgmtPorts() int {
+
+	count := 0
+	for _, port := range portConfig.Ports {
+		if port.IsMgmt && port.Dhcp != DT_NONE {
+			count++
+		}
+	}
+	return count
+}
+
+// Equal compares two DevicePortConfig but skips things that are
+// more of status such as the timestamps and the ParseError
+// XXX Compare Version or not?
+// We compare the Ports in array order.
+func (portConfig *DevicePortConfig) Equal(portConfig2 *DevicePortConfig) bool {
+
+	if portConfig.Key != portConfig2.Key {
+		return false
+	}
+	if len(portConfig.Ports) != len(portConfig2.Ports) {
+		return false
+	}
+	for i, p1 := range portConfig.Ports {
+		p2 := portConfig2.Ports[i]
+		if p1.IfName != p2.IfName ||
+			p1.Name != p2.Name ||
+			p1.IsMgmt != p2.IsMgmt ||
+			p1.Free != p2.Free {
+			return false
+		}
+		if !reflect.DeepEqual(p1.DhcpConfig, p2.DhcpConfig) ||
+			!reflect.DeepEqual(p1.ProxyConfig, p2.ProxyConfig) ||
+			!reflect.DeepEqual(p1.WirelessCfg, p2.WirelessCfg) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsDPCTestable - Return false if recent failure (less than 60 seconds ago)
+// Also returns false if it isn't usable
 func (portConfig DevicePortConfig) IsDPCTestable() bool {
 
+	if !portConfig.IsDPCUsable() {
+		return false
+	}
 	if portConfig.LastFailed.IsZero() {
 		return true
 	}
@@ -219,14 +279,24 @@ func (portConfig DevicePortConfig) IsDPCTestable() bool {
 	return (timeDiff > 60)
 }
 
+// IsDPCUntested - returns true if this is something we might want to test now.
+// Checks if it is Usable since there is no point in testing unusable things.
 func (portConfig DevicePortConfig) IsDPCUntested() bool {
-	if portConfig.LastFailed.IsZero() && portConfig.LastSucceeded.IsZero() {
+	if portConfig.LastFailed.IsZero() && portConfig.LastSucceeded.IsZero() &&
+		portConfig.IsDPCUsable() {
 		return true
 	}
 	return false
 }
 
-// Check if the last results for the DPC was Success
+// IsDPCUsable - checks whether something is invalid; no management IP
+// addresses means it isn't usable hence we return false if none.
+func (portConfig DevicePortConfig) IsDPCUsable() bool {
+	mgmtCount := portConfig.CountMgmtPorts()
+	return mgmtCount > 0
+}
+
+// WasDPCWorking - Check if the last results for the DPC was Success
 func (portConfig DevicePortConfig) WasDPCWorking() bool {
 
 	if portConfig.LastSucceeded.IsZero() {
@@ -251,6 +321,27 @@ const (
 	NPT_LAST = 255
 )
 
+// WifiKeySchemeType - types of key management
+type WifiKeySchemeType uint8
+
+// Key Scheme type
+const (
+	KeySchemeNone WifiKeySchemeType = iota // enum for key scheme
+	KeySchemeWpaPsk
+	KeySchemeWpaEap
+	KeySchemeOther
+)
+
+// WirelessType - types of wireless media
+type WirelessType uint8
+
+// enum wireless type
+const (
+	WirelessTypeNone WirelessType = iota // enum for wireless type
+	WirelessTypeCellular
+	WirelessTypeWifi
+)
+
 type ProxyEntry struct {
 	Type   NetworkProxyType
 	Server string
@@ -263,9 +354,10 @@ type ProxyConfig struct {
 	Pacfile    string
 	// If Enable is set we use WPAD. If the URL is not set we try
 	// the various DNS suffixes until we can download a wpad.dat file
-	NetworkProxyEnable bool   // Enable WPAD
-	NetworkProxyURL    string // Complete URL i.e., with /wpad.dat
-	WpadURL            string // The URL determined from DNS
+	NetworkProxyEnable bool     // Enable WPAD
+	NetworkProxyURL    string   // Complete URL i.e., with /wpad.dat
+	WpadURL            string   // The URL determined from DNS
+	ProxyCertPEM       [][]byte // List of certs which will be added to TLS trust
 }
 
 type DhcpConfig struct {
@@ -277,6 +369,37 @@ type DhcpConfig struct {
 	DnsServers []net.IP // If not set we use Gateway as DNS server
 }
 
+// WifiConfig - Wifi structure
+type WifiConfig struct {
+	SSID      string            // wifi SSID
+	KeyScheme WifiKeySchemeType // such as WPA-PSK, WPA-EAP
+
+	// XXX: to be deprecated, use CipherBlock instead
+	Identity string // identity or username for WPA-EAP
+
+	// XXX: to be deprecated, use CipherBlock instead
+	Password string // string of pass phrase or password hash
+	Priority int32
+
+	// CipherBlock, for encrypted credentials
+	CipherBlock
+}
+
+// CellConfig - Cellular part of the configure
+type CellConfig struct {
+	APN string // LTE APN
+}
+
+// WirelessConfig - wireless structure
+type WirelessConfig struct {
+	WType    WirelessType // Wireless Type
+	Cellular []CellConfig // LTE APN
+	Wifi     []WifiConfig // Wifi Config params
+}
+
+// NetworkPortConfig has the configuration and some status like ParseErrors
+// for one IfName.
+// Note that if fields are added the Equal function needs to be updated.
 type NetworkPortConfig struct {
 	IfName string
 	Name   string // New logical name set by controller/model
@@ -284,6 +407,10 @@ type NetworkPortConfig struct {
 	Free   bool   // Higher priority to talk to controller since no cost
 	DhcpConfig
 	ProxyConfig
+	WirelessCfg WirelessConfig
+	// Errrors from the parser go here and get reflects in NetworkPortStatus
+	ParseError     string
+	ParseErrorTime time.Time
 }
 
 type NetworkPortStatus struct {
@@ -431,13 +558,47 @@ func CountLocalIPv4AddrAnyNoLinkLocal(globalStatus DeviceNetworkStatus) int {
 	return count
 }
 
-// CountDNSServers returns the number of DNS servers
-func CountDNSServers(globalStatus DeviceNetworkStatus) int {
+// CountDNSServers returns the number of DNS servers; for port if set
+func CountDNSServers(globalStatus DeviceNetworkStatus, port string) int {
+
+	var ifname string
+	if port != "" {
+		ifname = AdapterToIfName(&globalStatus, port)
+	} else {
+		ifname = port
+	}
 	count := 0
 	for _, us := range globalStatus.Ports {
+		if us.IfName != ifname && ifname != "" {
+			continue
+		}
 		count += len(us.DnsServers)
 	}
 	return count
+}
+
+// GetDNSServers returns all, or the ones on one interface if port is set
+func GetDNSServers(globalStatus DeviceNetworkStatus, port string) []net.IP {
+
+	var ifname string
+	if port != "" {
+		ifname = AdapterToIfName(&globalStatus, port)
+	} else {
+		ifname = port
+	}
+	var servers []net.IP
+	for _, us := range globalStatus.Ports {
+		if !us.IsMgmt {
+			continue
+		}
+		if ifname != "" && ifname != us.IfName {
+			continue
+		}
+		for _, server := range us.DnsServers {
+			servers = append(servers, server)
+		}
+	}
+	return servers
 }
 
 // Return number of local IP addresses for all the management ports with given name
@@ -782,6 +943,55 @@ const (
 	MST_LAST = 255
 )
 
+// CurrIntfStatusType - enum for probe current uplink intf UP/Down status
+type CurrIntfStatusType uint8
+
+// CurrentIntf status
+const (
+	CurrIntfNone CurrIntfStatusType = iota
+	CurrIntfDown
+	CurrIntfUP
+)
+
+// ServerProbe - remote probe info configured from the cloud
+type ServerProbe struct {
+	ServerURL     string // include method,host,paths
+	ServerIP      net.IP
+	ProbeInterval uint32 // probe frequence in seconds
+}
+
+// ProbeInfo - per phyical port probing info
+type ProbeInfo struct {
+	IfName    string
+	IsPresent bool // for GC purpose
+	TransDown bool // local up long time, transition to down
+	// local nexthop probe state
+	GatewayUP  bool // local nexthop is in UP state
+	LocalAddr  net.IP
+	NhAddr     net.IP
+	IsFree     bool
+	FailedCnt  uint32 // continuous ping fail count, reset when ping success
+	SuccessCnt uint32 // continous ping success count, reset when ping fail
+
+	// remote host probe state
+	RemoteHostUP    bool   // remote host is in UP state
+	FailedProbeCnt  uint32 // continuous remote ping fail count, reset when ping success
+	SuccessProbeCnt uint32 // continuous remote ping success count, reset when ping fail
+	AveLatency      int64  // average delay in msec
+}
+
+// NetworkInstanceProbeStatus - probe status per network instance
+type NetworkInstanceProbeStatus struct {
+	PConfig           ServerProbe          // user configuration for remote server
+	NeedIntfUpdate    bool                 // flag to indicate the CurrentUpLinkIntf status has changed
+	PrevUplinkIntf    string               // previously used uplink interface
+	CurrentUplinkIntf string               // decided by local/remote probing
+	ProgUplinkIntf    string               // Currently programmed uplink interface for app traffic
+	CurrIntfUP        CurrIntfStatusType   // the current picked interface can be up or down
+	TriggerCnt        uint32               // number of times Uplink change triggered
+	PInfo             map[string]ProbeInfo // per physical port eth0, eth1 probing state
+}
+
 type MapServer struct {
 	ServiceType MapServerType
 	NameOrIp    string
@@ -860,6 +1070,7 @@ type UnderlayNetworkConfig struct {
 	Name       string           // From proto message
 	AppMacAddr net.HardwareAddr // If set use it for vif
 	AppIPAddr  net.IP           // If set use DHCP to assign to app
+	IntfOrder  int32            // XXX need to get from API
 
 	// Error
 	//	If there is a parsing error and this uLNetwork config cannot be
@@ -912,6 +1123,10 @@ type NetworkXObjectConfig struct {
 	DhcpRange       IpRange
 	DnsNameToIPList []DnsNameToIP // Used for DNS and ACL ipset
 	Proxy           *ProxyConfig
+	WirelessCfg     WirelessConfig
+	// Any errrors from the parser
+	Error     string
+	ErrorTime time.Time
 }
 
 type IpRange struct {
@@ -1018,8 +1233,32 @@ type NetworkInstanceMetrics struct {
 	DisplayName    string
 	Type           NetworkInstanceType
 	NetworkMetrics NetworkMetrics
+	ProbeMetrics   ProbeMetrics
 	VpnMetrics     *VpnMetrics
 	LispMetrics    *LispMetrics
+}
+
+// ProbeMetrics - NI probe metrics
+type ProbeMetrics struct {
+	CurrUplinkIntf  string             // the uplink interface probing picks
+	RemoteEndpoint  string             // remote either URL or IP address
+	LocalPingIntvl  uint32             // local ping interval in seconds
+	RemotePingIntvl uint32             // remote probing interval in seconds
+	UplinkNumber    uint32             // number of possible uplink interfaces
+	IntfProbeStats  []ProbeIntfMetrics // per dom0 intf uplink probing metrics
+}
+
+// ProbeIntfMetrics - per dom0 network uplink interface probing
+type ProbeIntfMetrics struct {
+	IntfName        string // dom0 uplink interface name
+	NexthopGw       net.IP // interface local ping nexthop address
+	GatewayUP       bool   // Is local gateway in UP status
+	RmoteStatusUP   bool   // Is remote endpoint in UP status
+	GatewayUPCnt    uint32 // local ping UP count
+	GatewayDownCnt  uint32 // local ping DOWN count
+	RemoteUPCnt     uint32 // remote probe UP count
+	RemoteDownCnt   uint32 // remote probe DOWN count
+	LatencyToRemote uint32 // probe latency to remote in msec
 }
 
 func (metrics NetworkInstanceMetrics) Key() string {
@@ -1055,21 +1294,6 @@ type NetworkMetric struct {
 	RxAclDrops          uint64 // For implicit deny/drop at end
 	TxAclRateLimitDrops uint64 // For all rate limited rules
 	RxAclRateLimitDrops uint64 // For all rate limited rules
-}
-
-// XXX this works but ugly as ...
-// Alternative seems to be a deep walk with type assertions in order
-// to produce the map of map of map with the correct type.
-func CastNetworkMetrics(in interface{}) NetworkMetrics {
-	b, err := json.Marshal(in)
-	if err != nil {
-		log.Fatal(err, "json Marshal in CastNetworkMetrics")
-	}
-	var output NetworkMetrics
-	if err := json.Unmarshal(b, &output); err != nil {
-		log.Fatal(err, "json Unmarshal in CastNetworkMetrics")
-	}
-	return output
 }
 
 type NetworkInstanceType int32
@@ -1172,6 +1396,8 @@ type NetworkInstanceStatus struct {
 	VpnStatus      *VpnStatus
 	LispInfoStatus *LispInfoStatus
 	LispMetrics    *LispMetrics
+
+	NetworkInstanceProbeStatus
 }
 
 type VifNameMac struct {
@@ -1659,4 +1885,15 @@ type IPFlow struct {
 // Key :
 func (flows IPFlow) Key() string {
 	return flows.Scope.UUID.String() + flows.Scope.NetUUID.String() + flows.Scope.Sequence
+}
+
+// VifIPTrig - structure contains Mac Address
+type VifIPTrig struct {
+	MacAddr string
+	IPAddr  net.IP
+}
+
+// Key - VifIPTrig key function
+func (vifIP VifIPTrig) Key() string {
+	return vifIP.MacAddr
 }

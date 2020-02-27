@@ -8,7 +8,6 @@ package devicenetwork
 
 import (
 	"fmt"
-	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	log "github.com/sirupsen/logrus"
 	"io/ioutil"
@@ -92,8 +91,7 @@ func doDhcpClientActivate(nuc types.NetworkPortConfig) bool {
 			time.Sleep(10 * time.Second)
 		}
 		log.Infof("dhcpcd %s not running", nuc.IfName)
-		extras := []string{"-f", "/dhcpcd.conf", "--nobackground",
-			"-d", "--noipv4ll"}
+		extras := []string{"-f", "/dhcpcd.conf", "--noipv4ll", "-b", "-t", "0"}
 		if nuc.Gateway != nil && nuc.Gateway.String() == "0.0.0.0" {
 			extras = append(extras, "--nogateway")
 		}
@@ -140,7 +138,7 @@ func doDhcpClientActivate(nuc types.NetworkPortConfig) bool {
 		log.Infof("dhcpcd %s not running", nuc.IfName)
 		args := []string{fmt.Sprintf("ip_address=%s", nuc.AddrSubnet)}
 
-		extras := []string{"-f", "/dhcpcd.conf", "--nobackground", "-d"}
+		extras := []string{"-f", "/dhcpcd.conf", "-b", "-t", "0"}
 		if nuc.Gateway == nil || nuc.Gateway.String() == "0.0.0.0" {
 			extras = append(extras, "--nogateway")
 		} else if nuc.Gateway.String() != "" {
@@ -167,11 +165,22 @@ func doDhcpClientActivate(nuc types.NetworkPortConfig) bool {
 			log.Errorf("doDhcpClientActivate: request failed for %s\n",
 				nuc.IfName)
 		}
+		// Wait for a bit then give up
+		waitCount := 0
+		failed := false
 		for !dhcpcdExists(nuc.IfName) {
 			log.Warnf("dhcpcd %s not yet running", nuc.IfName)
+			waitCount++
+			if waitCount >= 3 {
+				log.Errorf("dhcpcd %s not yet running", nuc.IfName)
+				failed = true
+				break
+			}
 			time.Sleep(10 * time.Second)
 		}
-		log.Infof("dhcpcd %s is running", nuc.IfName)
+		if !failed {
+			log.Infof("dhcpcd %s is running", nuc.IfName)
+		}
 	default:
 		log.Errorf("doDhcpClientActivate: unsupported dhcp %v\n",
 			nuc.Dhcp)
@@ -210,21 +219,20 @@ func doDhcpClientInactivate(nuc types.NetworkPortConfig) {
 	}
 }
 
-func dhcpcdCmd(op string, extras []string, ifname string, dolog bool) bool {
-	name := "dhcpcd"
+func dhcpcdCmd(op string, extras []string, ifname string, background bool) bool {
+	name := "/sbin/dhcpcd"
 	args := append([]string{op}, extras...)
 	args = append(args, ifname)
-	if dolog {
-		logFilename := fmt.Sprintf("dhcpcd.%s", ifname)
-		logf, err := agentlog.InitChild(logFilename)
-		if err != nil {
-			log.Fatalf("agentlog dhcpcdCmd failed: %s\n", err)
-		}
+	if background {
 		cmd := exec.Command(name, args...)
-		cmd.Stdout = logf
-		cmd.Stderr = logf
+
 		log.Infof("Background command %s %v\n", name, args)
-		go cmd.Run()
+		go func() {
+			if err := cmd.Run(); err != nil {
+				log.Errorf("%s %v: failed: %s",
+					name, args, err)
+			}
+		}()
 	} else {
 		log.Infof("Calling command %s %v\n", name, args)
 		out, err := exec.Command(name, args...).CombinedOutput()

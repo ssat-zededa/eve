@@ -1,14 +1,14 @@
 # Design and implementation of Edge Virtualization Engine
 
 1. [Introduction](#introduction)
-2. [Edge Containers](#edge-containers)
-3. [Security](#security)
-4. [EVE Controller](#eve-controller)
-5. [Runtime Configuration](#runtime-configuration)
-6. [Installing EVE on Edge Nodes](#installing-eve-on-edge-nodes)
-7. [Runtime Lifecycle](#runtime-lifecycle)
-8. [Building EVE](#building-eve)
-9. [EVE Internals](#eve-internals)
+1. [Edge Containers](#edge-containers)
+1. [Security](#security)
+1. [EVE Controller](#eve-controller)
+1. [Runtime Configuration](#runtime-configuration)
+1. [Installing EVE on Edge Nodes](#installing-eve-on-edge-nodes)
+1. [Runtime Lifecycle](#runtime-lifecycle)
+1. [Building EVE](#building-eve)
+1. [EVE Internals](#eve-internals)
 
 ## Introduction
 
@@ -79,6 +79,8 @@ Docker has [OCI Containers](https://www.opencontainers.org) - EVE has Edge Conta
 You can read a detailed specification of [Edge Containers](ECOS.md) and you should
 expect them to be available for broad Linux Foundation adoption once we are ready
 for formal submission of a self-contained specification.
+
+The ECO installation and initialization process is available [here](./ECO-INIT.md).
 
 ## Security
 
@@ -181,7 +183,7 @@ object to EVE:
 Both methods start with obtaining a set of files (see the note below on how we
 are working towards making it a single file) and either putting them into the
 EVE configuration partition on the installation media (see [EVE Installation](#installing-eve-on-edge-nodes)
-for details) or using [mkusb.sh](../pkg/pillar/scripts/mkusb.sh) script to format
+for details) or using [tools/makeusbconf.sh](../tools/makeusbconf.sh) script to format
 removable media.
 
 It must be noted that currently we are still not quite there with out-of-band
@@ -213,7 +215,7 @@ Or to give a more specific example, here's how you can allow ssh access to
 the device for debugging issues:
 
 ```bash
-zcli device update myqemu --config="debug.enable.ssh:`cat .ssh/id_rsa.pub`"
+zcli edge-node update myqemu --config="debug.enable.ssh:`cat .ssh/id_rsa.pub`"
 ```
 
 Most of the runtime configuration properties apply to an entire running EVE
@@ -262,6 +264,18 @@ the ARM platforms that reserve a few of the GPT entries to host things like
 firmware. Finally, it must be said that EVE doesn't support legacy partitioning
 schemes (such as MBR).
 
+CONFIG partition is read-only from the standpoint of EVE itself, but it can be
+written to under [certain debug and recovery scenarios](CONFIG.md). This stands
+in contrast with EFI System partition that, while technically read-write, has
+absolutely no reason of ever being written to past initial installation process.
+
+P3 is a scratch space. Unlike CONFIG and EFI System partition, P3 can be wiped out
+and re-created without affecting much of edge node behaviour. The content of CONFIG
+and EFI System has to be preserved at all costs. Corrupting those parititions will
+result in an edge node that needs to be re-installed (technically IMGA and IMGB
+should be protected as well, but since they are always treated as read-only corrupting
+them is much harder).
+
 EVE's root filesystem is hosted in both IMGA and IMGB partitions. This allows
 a running EVE instance to safely update itself. If you want to know more about
 how this process works read [baseimage update](BASEIMAGE-UPDATE.md) documentation.
@@ -286,9 +300,14 @@ of EVE on an Edge Node and as a result it is kept extremely simple. The only
 role that a GRUB trampoline [plays](../pkg/mkimage-raw-efi/efi-files/EFI/BOOT/grub.cfg)
 is selecting whether to chainload second stage GRUB from IMGA or IMGB partitions.
 
-Second stage GRUB is expected to do all the [heavy lifiting](../pkg/grub/rootfs.cfg)
+Second stage GRUB is expected to do all the [heavy lifting](../pkg/grub/rootfs.cfg)
 of actually booting an EVE instance and because it resides in IMGA or IMGB
-partitions it can easily be upgraded and patched.
+partitions it can easily be upgraded and patched. Behavior of this stage of
+boot process is controlled by a read-only grub.cfg under {IMGA,IMGB}/EFI/BOOT/
+but it can further be tweaked by the grub.cfg overrides on the CONFIG partition.
+Note that an override grub.cfg is expected to be a [complete override](../pkg/grub/rootfs.cfg#L132)
+and anyone constructing its content is expected to be familiar with the overall
+flow of read-only grub.cfg.
 
 After second stage GRUB is done loading type-1 hypervisor and Control Domain
 kernel the rest of the runtime sequence relies solely on what happens with EVE

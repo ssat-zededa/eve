@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 	"io/ioutil"
@@ -37,7 +38,9 @@ type ZedCloudContext struct {
 	DevUUID             uuid.UUID
 	DevSerial           string
 	DevSoftSerial       string
-	NetworkSendTimeout  uint32 // In seconds
+	NetworkSendTimeout  uint32   // In seconds
+	V2API               bool     // XXX Needed?
+	PrevCertPEM         [][]byte // cached proxy certs for later comparison
 }
 
 var sendCounter uint32
@@ -214,6 +217,17 @@ func SendOnIntf(ctx ZedCloudContext, destUrl string, intf string, reqlen int64, 
 		log.Debugln(errStr)
 		return nil, nil, false, errors.New(errStr)
 	}
+	numDNSServers := types.CountDNSServers(*ctx.DeviceNetworkStatus, intf)
+	if numDNSServers == 0 {
+		if ctx.FailureFunc != nil {
+			ctx.FailureFunc(intf, reqUrl, 0, 0)
+		}
+		errStr := fmt.Sprintf("No DNS servers to connect to %s using intf %s",
+			reqUrl, intf)
+		log.Debugln(errStr)
+		return nil, nil, false, errors.New(errStr)
+	}
+
 	// Get the transport header with proxy information filled
 	proxyUrl, err := LookupProxy(ctx.DeviceNetworkStatus, intf, reqUrl)
 	var transport *http.Transport
@@ -256,7 +270,8 @@ func SendOnIntf(ctx ZedCloudContext, destUrl string, intf string, reqlen int64, 
 			d := net.Dialer{LocalAddr: &localUDPAddr}
 			return d.Dial(network, address)
 		}
-		r := net.Resolver{Dial: resolverDial}
+		r := net.Resolver{Dial: resolverDial, PreferGo: true,
+			StrictErrors: false}
 		d := net.Dialer{Resolver: &r, LocalAddr: &localTCPAddr}
 		transport.Dial = d.Dial
 
@@ -376,7 +391,7 @@ func SendOnIntf(ctx ZedCloudContext, destUrl string, intf string, reqlen int64, 
 				errorList = append(errorList, err)
 				// Inform ledmanager about broken cloud connectivity
 				if !ctx.NoLedManager {
-					types.UpdateLedManagerConfig(12)
+					utils.UpdateLedManagerConfig(12)
 				}
 				if ctx.FailureFunc != nil {
 					ctx.FailureFunc(intf, reqUrl, reqlen,
@@ -402,7 +417,7 @@ func SendOnIntf(ctx ZedCloudContext, destUrl string, intf string, reqlen int64, 
 					log.Errorln(errStr)
 					// Inform ledmanager about broken cloud connectivity
 					if !ctx.NoLedManager {
-						types.UpdateLedManagerConfig(13)
+						utils.UpdateLedManagerConfig(13)
 					}
 					if ctx.FailureFunc != nil {
 						ctx.FailureFunc(intf, reqUrl,

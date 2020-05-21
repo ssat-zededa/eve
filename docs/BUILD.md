@@ -2,6 +2,57 @@
 
 This document describes how the EVE build process works, its dependencies, inputs and outputs. The planned complementary document [CONTRIBUTING.md](./CONTRIBUTING.md) describes how to contribute to EVE.
 
+## Conceptual structure of EVE Makefile targets
+
+EVE Makefile automates building and running the following artifacts (all of which are described in gory details below):
+
+* linuxkit/Docker packages
+* EVE rootfs images
+* bootable EVE live images
+* bootable EVE installer images
+
+While linuxkit/Docker packages don't provide any knobs to control the flavor of the build, the rest of the artifacts do.
+
+The four main knobs you should be aware of are:
+
+* `ROOTFS_VERSION` - sets the version ID of the EVE image
+* `ZARCH` - sets the architecture (either arm64 or amd64) of the resulting image
+* `HV` - sets the hypervisor flavor of the resulting image (acrn, xen or kvm)
+* `IMAGE_FORMAT` - sets the image format of the resulting bootable image (raw, qcow2 or gcp)
+
+You can always specify an arbitrary combinations of these knobs to set the desired outcome of the build.
+For example, the following command line will build a Google Compute Platform live image with the default
+hypervisor set to `kvm`, hardware architecture set to `amd64` and the version ID set to `snapshot`:
+
+```shell
+make ROOTFS_VERSION=snapshot ZARCH=arm64 HV=kvm IMAGE_FORMAT=gcp live
+```
+
+In addition to that we also provide shortcuts on the target names themselves that allow you to tweak the
+knobs specific only to that target. For example our previous example could've been specified as:
+
+```shell
+make ROOTFS_VERSION=snapshot ZARCH=arm64 HV=kvm live-gcp
+```
+
+instead - since `IMAGE_FORMAT` only applies at the level of a `live` target. Same way, since HV applies at
+the rootfs level (rootfs binary is then fed wholesale into live and installer builds) you can build
+a `snapshot` rootfs with the default hypervisor set to acrn by doing either:
+
+```shell
+make ROOTFS_VERSION=snapshot HV=acrn rootfs
+```
+
+or
+
+```shell
+make ROOTFS_VERSION=snapshot rootfs-acrn
+```
+
+In this hierarchy, think of `ZARCH` and `ROOTFS_VERSION` as applicable to anything hence they don't get a -foo shortcut treatment.
+
+When in doubt, always use a full specification on all the knobs spelled out on the command line.
+
 ## EVE Install Methods
 
 Before describing how EVE is _built_, it is important to understand how EVE is _installed_. EVE has two distinct installation methods:
@@ -75,20 +126,23 @@ specific versions without polluting the user's normal workspace.
 
 The following are the output components from the build process and their purpose. There are two kinds of components: final, intended for actual direct usage, and interim, used to build the final components. Some interim components may be removed as part of the build finalization process.
 
-#### Final
+### Final
 
-* `live.img` - a symlink to `live.qcow2`
+* `rootfs-VERSION.IMG_FORMAT` - a live bootable rootfs filesystem image. This can be either [squashfs](https://en.wikipedia.org/wiki/SquashFS) (default) or [ext4](https://en.wikipedia.org/wiki/Ext4).
+* `rootfs.img` - a symlink to the actual, versioned rootfs image file that was built last
+* `live.raw` - a final bootable live disk image in raw format with only few key partitions created (the rest will be created on first boot):
+    1. UEFI partition with grub
+    2. config partition with the content of `config.img` described below
+    3. root partition from the above `rootfs.img`
 * `live.qcow2` - the final bootable live disk image in [qcow2](https://en.wikipedia.org/wiki/Qcow) format
+* `live.img.tar.gz` - the final bootable live disk image in [Google Compute Platform](https://cloud.google.com/compute/docs/import/import-existing-image) format
+* `live.img` - a symlink to one of the above images that was built last
 * `installer.raw` - a bootable image that can install EVE on a local device. The installer is intended to be flashed to a USB or SD device, or booted via PXE, and then run to install on a local drive.
 * `installer.iso` - a bootable ISO image with a hidden EFI boot partition and an installer partition, with the contents of `installer.raw`. The installer is intended to be booted in a manner typical of iso files, and then run to install on a local drive.
 
-#### Interim
+### Interim
 
-* `rootfs.img` - a live bootable rootfs filesystem image. This can be either [squashfs](https://en.wikipedia.org/wiki/SquashFS) (default) or [ext4](https://en.wikipedia.org/wiki/Ext4).
 * `rootfs_installer.img` - a bootable rootfs filesystem image to run as an installer.
-* `live.raw` - a live bootable disk image, will be converted to [qcow2](https://en.wikipedia.org/wiki/Qcow). Has 2 gpt partitions:
-    1. UEFI partition with grub
-    2. root partition from the above `rootfs.img`
 * `config.img` - 1MB FAT32 image file containing basic configuration information, including wpa supplicant, name of the controller, onboarding key/cert pair, and other configuration information.
 
 ## Build Process
@@ -128,7 +182,7 @@ We now have `rootfs.img`.
 To build `config.img`:
 
 1. Verify the existence of dependencies, essentially everything in `conf/`
-2. Call the script to create the image: `./maketestconfig.sh conf config.img`. This will:
+2. Call the script to create the image: `./tools/makeconfig.sh config.img conf`. This will:
     1. tar up the contents of the config directory into a tar format.
     2. stream the contents of the tar format into a docker container from the image generated by `pkg/mkconf`. `mkconf` is an image that contains the `make-config` script and all of `/opt/zededa/examples/config` from [pillar](https://github.com/lf-edge/eve/pkg/pillar).
     3. `mkconf` creates a FAT32 image whose root is everything copied from pillar/conf overwritten by everything from `$PWD/conf/`.
@@ -259,7 +313,7 @@ As described above, the bootable images - live `live.img` and installer `install
 |EFI|boot via grub|`makeraw.sh`|
 |imga|Root partition A|`rootfs.img` from linuxkit build|
 |imgb|Root partition B|`rootfs.img` from linuxkit build|
-|conf|Config data|`config.img` from `maketestconfig.sh`|
+|conf|Config data|`config.img` from `tools/makeconfig.sh`|
 |persist|Persistent storage|empty|
 
 ### Installer Image Contents
@@ -268,7 +322,7 @@ As described above, the bootable images - live `live.img` and installer `install
 |---|---|
 |EFI|boot via grub|`makeraw.sh`|
 |imga|Root partition A|`rootfs_installer.img` from linuxkit build|
-|conf_win|Config data|`config.img` from `maketestconfig.sh`|
+|conf_win|Config data|`config.img` from `tools/makeconfig.sh`|
 
 The rest of this section describes the contents of the root filesystem, both `rootfs.img` for live and `rootfs_installer.img` for installer.
 
@@ -501,7 +555,7 @@ The following are build tools used to create EVE images, their purpose and sourc
 * [mkrootfs-squash](../pkg/mkrootfs-squash) or [mkrootfs-ext4](../pkg/mkrootfs-ext4) - take a build rootfs from the previous step as stdin in tar stream format, customize it with a filesystem UUID and other parameters, and create a squashfs or ext4 filesystem.
 * [makeflash.sh](../makeflash.sh) - take an input tar stream of several images, primarily `rootfs.img` and `config.img`. Create a file to use as an image of a target size or default. Passes the resultant tar stream to a container from `pkg/mkimage-raw-efi`.
 * [mkimage-raw-efi](../pkg/mkimage-raw-efi) - create an output file that represents an entire disk, with multiple partitions. By default, `efi`,`imga`,`imgb`,`config`,`persist`. The installer image creates only `efi`,`img`,`config`.
-* [maketestconfig.sh](../maketestconfig.sh) - package up the provided directory, normally [conf/](../conf/) into a tar stream, and pass to a container from `pkg/mkconf`.
+* [tools/makeconfig.sh](../tools/makeconfig.sh) - package up the provided directory, normally [conf/](../conf/) into a tar stream, and pass to a container from `pkg/mkconf`.
 * [mkconf](../pkg/mkconf) - combine the input tar stream with defaults in `/conf/` from `lfedge/eve-pillar` into a new container image in `/`. Create a FAT32 disk image from it.
 * [parse-pkgs.sh](../parse-pkgs.sh) - determine the correct latest hash to use for all packages and higher-order components. See [parse-pks](#parse-pkgs).
 

@@ -36,7 +36,6 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
-	pubsublegacy "github.com/lf-edge/eve/pkg/pillar/pubsub/legacy"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
@@ -47,7 +46,6 @@ import (
 const (
 	agentName          = "zedagent"
 	restartCounterFile = types.IdentityDirname + "/restartcounter"
-	firstbootFile      = types.TmpDirname + "/first-boot"
 	// checkpointDirname - location of config checkpoint
 	checkpointDirname = types.PersistDir + "/checkpoint"
 	// Time limits for event loop handlers
@@ -83,8 +81,6 @@ type zedagentContext struct {
 	assignableAdapters        *types.AssignableAdapters
 	subAssignableAdapters     pubsub.Subscription
 	iteration                 int
-	subCipherContextConfig    pubsub.Subscription
-	subControllerCertConfig   pubsub.Subscription
 	subNetworkInstanceStatus  pubsub.Subscription
 	subCertObjConfig          pubsub.Subscription
 	TriggerDeviceInfo         chan<- struct{}
@@ -100,7 +96,9 @@ type zedagentContext struct {
 	subAppVifIPTrig           pubsub.Subscription
 	pubGlobalConfig           pubsub.Publication
 	subGlobalConfig           pubsub.Subscription
+	subAttestCert             pubsub.Subscription
 	subVaultStatus            pubsub.Subscription
+	subLogMetrics             pubsub.Subscription
 	GCInitialized             bool // Received initial GlobalConfig
 	subZbootStatus            pubsub.Subscription
 	rebootCmd                 bool
@@ -110,13 +108,21 @@ type zedagentContext struct {
 	rebootReason              string    // Previous reboot from nodeagent
 	rebootStack               string    // Previous reboot from nodeagent
 	rebootTime                time.Time // Previous reboot from nodeagent
-	restartCounter            uint32
-	subDevicePortConfigList   pubsub.Subscription
-	devicePortConfigList      types.DevicePortConfigList
-	remainingTestTime         time.Duration
-	physicalIoAdapterMap      map[string]types.PhysicalIOAdapter
-	globalConfig              types.GlobalConfig
-	globalStatus              types.GlobalStatus
+	// restartCounter - counts number of reboots of the device by Eve
+	restartCounter uint32
+	// rebootConfigCounter - reboot counter sent by the cloud in its config.
+	//  This is the value of counter that triggered reboot. This is sent in
+	//  device info msg. Can be used to verify device is caught up on all
+	// outstanding reboot commands from cloud.
+	rebootConfigCounter     uint32
+	subDevicePortConfigList pubsub.Subscription
+	devicePortConfigList    types.DevicePortConfigList
+	remainingTestTime       time.Duration
+	physicalIoAdapterMap    map[string]types.PhysicalIOAdapter
+	globalConfig            types.ConfigItemValueMap
+	specMap                 types.ConfigItemSpecMap
+	globalStatus            types.GlobalStatus
+	getCertsTimer           *time.Timer
 }
 
 var debug = false
@@ -124,9 +130,9 @@ var debugOverride bool // From command line arg
 var flowQ *list.List
 
 func Run(ps *pubsub.PubSub) {
+	var err error
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
 	parsePtr := flag.String("p", "", "parse checkpoint file")
 	validatePtr := flag.Bool("V", false, "validate UTF-8 in checkpoint")
 	fatalPtr := flag.Bool("F", false, "Cause log.Fatal fault injection")
@@ -141,7 +147,6 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	curpart := *curpartPtr
 	parse := *parsePtr
 	validate := *validatePtr
 	if *versionPtr {
@@ -154,7 +159,7 @@ func Run(ps *pubsub.PubSub) {
 	}
 	if parse != "" {
 		res, config := readValidateConfig(
-			types.GlobalConfigDefaults.StaleConfigTime, parse)
+			types.DefaultConfigItemValueMap().GlobalValueInt(types.StaleConfigTime), parse)
 		if !res {
 			fmt.Printf("Failed to parse %s\n", parse)
 			os.Exit(1)
@@ -169,20 +174,17 @@ func Run(ps *pubsub.PubSub) {
 		}
 		return
 	}
-	logf, err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logf.Close()
+	agentlog.Init(agentName)
 	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
 		log.Fatal(err)
 	}
 
-	log.Infof("Starting %s\n", agentName)
+	log.Infof("Starting %s", agentName)
 
 	triggerDeviceInfo := make(chan struct{}, 1)
 	zedagentCtx := zedagentContext{TriggerDeviceInfo: triggerDeviceInfo}
-	zedagentCtx.globalConfig = types.GlobalConfigDefaults
+	zedagentCtx.specMap = types.NewConfigItemSpecMap()
+	zedagentCtx.globalConfig = *types.DefaultConfigItemValueMap()
 	zedagentCtx.globalStatus.ConfigItems = make(
 		map[string]types.ConfigItemStatus)
 	zedagentCtx.globalStatus.UpdateItemValuesFromGlobalConfig(
@@ -190,10 +192,18 @@ func Run(ps *pubsub.PubSub) {
 	zedagentCtx.globalStatus.UnknownConfigItems = make(
 		map[string]types.ConfigItemStatus)
 
+	rebootConfig := readRebootConfig()
+	zedagentCtx.rebootConfigCounter = rebootConfig.Counter
+	log.Infof("Zedagent Run - rebootConfigCounter at init is %d",
+		zedagentCtx.rebootConfigCounter)
+
 	zedagentCtx.physicalIoAdapterMap = make(map[string]types.PhysicalIOAdapter)
 
-	zedagentCtx.pubGlobalConfig, err = pubsublegacy.PublishPersistent("",
-		types.GlobalConfig{})
+	zedagentCtx.pubGlobalConfig, err = ps.NewPublication(pubsub.PublicationOptions{
+		AgentName:  "",
+		TopicType:  types.ConfigItemValueMap{},
+		Persistent: true,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -207,7 +217,7 @@ func Run(ps *pubsub.PubSub) {
 
 	// Tell ourselves to go ahead
 	// initialize the module specifig stuff
-	handleInit(zedagentCtx.globalConfig.NetworkSendTimeout)
+	handleInit(zedagentCtx.globalConfig.GlobalValueInt(types.NetworkSendTimeout))
 
 	// Context to pass around
 	getconfigCtx := getconfigContext{}
@@ -227,60 +237,75 @@ func Run(ps *pubsub.PubSub) {
 	// Make sure we have a GlobalConfig file with defaults
 	utils.ReadAndUpdateGCFile(zedagentCtx.pubGlobalConfig)
 
-	subAssignableAdapters, err := pubsublegacy.Subscribe("domainmgr",
-		types.AssignableAdapters{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleAAModify,
-			ModifyHandler: handleAAModify,
-			DeleteHandler: handleAADelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subAssignableAdapters, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "domainmgr",
+		TopicImpl:     types.AssignableAdapters{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleAAModify,
+		ModifyHandler: handleAAModify,
+		DeleteHandler: handleAADelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subAssignableAdapters = subAssignableAdapters
 	subAssignableAdapters.Activate()
 
-	pubPhysicalIOAdapters, err := pubsublegacy.Publish(agentName,
-		types.PhysicalIOAdapterList{})
+	pubPhysicalIOAdapters, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.PhysicalIOAdapterList{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	pubPhysicalIOAdapters.ClearRestarted()
 	getconfigCtx.pubPhysicalIOAdapters = pubPhysicalIOAdapters
 
-	pubDevicePortConfig, err := pubsublegacy.Publish(agentName,
-		types.DevicePortConfig{})
+	pubDevicePortConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.DevicePortConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.pubDevicePortConfig = pubDevicePortConfig
 
 	// Publish NetworkXObjectConfig and for outselves. XXX remove
-	pubNetworkXObjectConfig, err := pubsublegacy.Publish(agentName,
-		types.NetworkXObjectConfig{})
+	pubNetworkXObjectConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.NetworkXObjectConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.pubNetworkXObjectConfig = pubNetworkXObjectConfig
 
-	pubNetworkInstanceConfig, err := pubsublegacy.Publish(agentName,
-		types.NetworkInstanceConfig{})
+	pubNetworkInstanceConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.NetworkInstanceConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.pubNetworkInstanceConfig = pubNetworkInstanceConfig
 
-	pubAppInstanceConfig, err := pubsublegacy.Publish(agentName,
-		types.AppInstanceConfig{})
+	pubAppInstanceConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.AppInstanceConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.pubAppInstanceConfig = pubAppInstanceConfig
 	pubAppInstanceConfig.ClearRestarted()
 
-	pubAppNetworkConfig, err := pubsublegacy.Publish(agentName,
-		types.AppNetworkConfig{})
+	pubAppNetworkConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.AppNetworkConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -290,134 +315,133 @@ func Run(ps *pubsub.PubSub) {
 	// XXX defer this until we have some config from cloud or saved copy
 	pubAppInstanceConfig.SignalRestarted()
 
-	pubCertObjConfig, err := pubsublegacy.Publish(agentName,
-		types.CertObjConfig{})
+	pubCertObjConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.CertObjConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	pubCertObjConfig.ClearRestarted()
 	getconfigCtx.pubCertObjConfig = pubCertObjConfig
 
-	pubBaseOsConfig, err := pubsublegacy.Publish(agentName,
-		types.BaseOsConfig{})
+	pubBaseOsConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.BaseOsConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	pubBaseOsConfig.ClearRestarted()
 	getconfigCtx.pubBaseOsConfig = pubBaseOsConfig
 
-	pubZedAgentStatus, err := pubsublegacy.Publish(agentName,
-		types.ZedAgentStatus{})
+	pubZedAgentStatus, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.ZedAgentStatus{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	pubZedAgentStatus.ClearRestarted()
 	getconfigCtx.pubZedAgentStatus = pubZedAgentStatus
-	pubDatastoreConfig, err := pubsublegacy.Publish(agentName,
-		types.DatastoreConfig{})
+	pubDatastoreConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.DatastoreConfig{},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.pubDatastoreConfig = pubDatastoreConfig
 	pubDatastoreConfig.ClearRestarted()
 
-	pubCipherContextConfig, err := pubsublegacy.Publish(agentName,
-		types.CipherContext{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	pubCipherContextConfig.ClearRestarted()
-	getconfigCtx.pubCipherContextConfig = pubCipherContextConfig
-
-	pubControllerCertConfig, err := pubsublegacy.Publish(agentName,
-		types.ControllerCertificate{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	pubControllerCertConfig.ClearRestarted()
-	getconfigCtx.pubControllerCertConfig = pubControllerCertConfig
-
-	// for handling changes in the cipher context
-	subCipherContextConfig, err := pubsublegacy.Subscribe(agentName,
-		types.CipherContext{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleCipherContextModify,
-			ModifyHandler: handleCipherContextModify,
-			DeleteHandler: handleCipherContextDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
+	pubControllerCert, err := ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			Persistent: true,
+			TopicType:  types.ControllerCert{},
 		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	zedagentCtx.subCipherContextConfig = subCipherContextConfig
-	subCipherContextConfig.Activate()
+	pubControllerCert.ClearRestarted()
+	getconfigCtx.pubControllerCert = pubControllerCert
 
-	// for handling changes in the controller certificate
-	subControllerCertConfig, err := pubsublegacy.Subscribe(agentName,
-		types.ControllerCertificate{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleControllerCertModify,
-			ModifyHandler: handleControllerCertModify,
-			DeleteHandler: handleControllerCertDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
+	// for CipherContextStatus Publisher
+	pubCipherContext, err := ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			Persistent: true,
+			TopicType:  types.CipherContext{},
 		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	zedagentCtx.subControllerCertConfig = subControllerCertConfig
-	subControllerCertConfig.Activate()
+	pubCipherContext.ClearRestarted()
+	getconfigCtx.pubCipherContext = pubCipherContext
 
 	// Look for global config such as log levels
-	subGlobalConfig, err := pubsublegacy.Subscribe("", types.GlobalConfig{},
-		false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleGlobalConfigModify,
-			ModifyHandler: handleGlobalConfigModify,
-			DeleteHandler: handleGlobalConfigDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "",
+		TopicImpl:     types.ConfigItemValueMap{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleGlobalConfigModify,
+		ModifyHandler: handleGlobalConfigModify,
+		DeleteHandler: handleGlobalConfigDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subGlobalConfig = subGlobalConfig
 	subGlobalConfig.Activate()
 
-	subNetworkInstanceStatus, err := pubsublegacy.Subscribe("zedrouter",
-		types.NetworkInstanceStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleNetworkInstanceModify,
-			ModifyHandler: handleNetworkInstanceModify,
-			DeleteHandler: handleNetworkInstanceDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subNetworkInstanceStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedrouter",
+		TopicImpl:     types.NetworkInstanceStatus{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleNetworkInstanceModify,
+		ModifyHandler: handleNetworkInstanceModify,
+		DeleteHandler: handleNetworkInstanceDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subNetworkInstanceStatus = subNetworkInstanceStatus
 	subNetworkInstanceStatus.Activate()
 
-	subNetworkInstanceMetrics, err := pubsublegacy.Subscribe("zedrouter",
-		types.NetworkInstanceMetrics{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleNetworkInstanceMetricsModify,
-			ModifyHandler: handleNetworkInstanceMetricsModify,
-			DeleteHandler: handleNetworkInstanceMetricsDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subNetworkInstanceMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedrouter",
+		TopicImpl:     types.NetworkInstanceMetrics{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleNetworkInstanceMetricsModify,
+		ModifyHandler: handleNetworkInstanceMetricsModify,
+		DeleteHandler: handleNetworkInstanceMetricsDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subNetworkInstanceMetrics = subNetworkInstanceMetrics
 	subNetworkInstanceMetrics.Activate()
 
-	subAppFlowMonitor, err := pubsublegacy.Subscribe("zedrouter",
-		types.IPFlow{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleAppFlowMonitorModify,
-			ModifyHandler: handleAppFlowMonitorModify,
-			DeleteHandler: handleAppFlowMonitorDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subAppFlowMonitor, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedrouter",
+		TopicImpl:     types.IPFlow{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleAppFlowMonitorModify,
+		ModifyHandler: handleAppFlowMonitorModify,
+		DeleteHandler: handleAppFlowMonitorDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -425,27 +449,34 @@ func Run(ps *pubsub.PubSub) {
 	flowQ = list.New()
 	log.Infof("FlowStats: create subFlowStatus")
 
-	subAppVifIPTrig, err := pubsublegacy.Subscribe("zedrouter",
-		types.VifIPTrig{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleAppVifIPTrigModify,
-			ModifyHandler: handleAppVifIPTrigModify,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subAppVifIPTrig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedrouter",
+		TopicImpl:     types.VifIPTrig{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleAppVifIPTrigModify,
+		ModifyHandler: handleAppVifIPTrigModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	subAppVifIPTrig.Activate()
 
 	// Look for AppInstanceStatus from zedmanager
-	subAppInstanceStatus, err := pubsublegacy.Subscribe("zedmanager",
-		types.AppInstanceStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleAppInstanceStatusCreate,
-			ModifyHandler: handleAppInstanceStatusModify,
-			DeleteHandler: handleAppInstanceStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+
+	subAppInstanceStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedmanager",
+		TopicImpl:     types.AppInstanceStatus{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleAppInstanceStatusModify,
+		ModifyHandler: handleAppInstanceStatusModify,
+		DeleteHandler: handleAppInstanceStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -453,63 +484,94 @@ func Run(ps *pubsub.PubSub) {
 	subAppInstanceStatus.Activate()
 
 	// Look for DomainMetric from domainmgr
-	subDomainMetric, err := pubsublegacy.Subscribe("domainmgr",
-		types.DomainMetric{}, true, &zedagentCtx, &pubsub.SubscriptionOptions{
-			WarningTime: warningTime,
-			ErrorTime:   errorTime,
-		})
+	subDomainMetric, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "domainmgr",
+		TopicImpl:   types.DomainMetric{},
+		Activate:    true,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.subDomainMetric = subDomainMetric
 
-	subHostMemory, err := pubsublegacy.Subscribe("domainmgr",
-		types.HostMemory{}, true, &zedagentCtx, &pubsub.SubscriptionOptions{
-			WarningTime: warningTime,
-			ErrorTime:   errorTime,
-		})
+	subHostMemory, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "domainmgr",
+		TopicImpl:   types.HostMemory{},
+		Activate:    true,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	getconfigCtx.subHostMemory = subHostMemory
 
 	// Look for zboot status
-	subZbootStatus, err := pubsublegacy.Subscribe("baseosmgr",
-		types.ZbootStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler:  handleZbootStatusModify,
-			ModifyHandler:  handleZbootStatusModify,
-			DeleteHandler:  handleZbootStatusDelete,
-			RestartHandler: handleZbootRestarted,
-			WarningTime:    warningTime,
-			ErrorTime:      errorTime,
-		})
+	subZbootStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:      "baseosmgr",
+		TopicImpl:      types.ZbootStatus{},
+		Activate:       false,
+		Ctx:            &zedagentCtx,
+		CreateHandler:  handleZbootStatusModify,
+		ModifyHandler:  handleZbootStatusModify,
+		DeleteHandler:  handleZbootStatusDelete,
+		RestartHandler: handleZbootRestarted,
+		WarningTime:    warningTime,
+		ErrorTime:      errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subZbootStatus = subZbootStatus
 	subZbootStatus.Activate()
 
-	subBaseOsStatus, err := pubsublegacy.Subscribe("baseosmgr",
-		types.BaseOsStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleBaseOsStatusModify,
-			ModifyHandler: handleBaseOsStatusModify,
-			DeleteHandler: handleBaseOsStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subBaseOsStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "baseosmgr",
+		TopicImpl:     types.BaseOsStatus{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		CreateHandler: handleBaseOsStatusModify,
+		ModifyHandler: handleBaseOsStatusModify,
+		DeleteHandler: handleBaseOsStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subBaseOsStatus = subBaseOsStatus
 	subBaseOsStatus.Activate()
 
-	subVaultStatus, err := pubsublegacy.Subscribe("vaultmgr",
-		types.VaultStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleVaultStatusModify,
-			DeleteHandler: handleVaultStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subAttestCert, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "tpmmgr",
+		TopicImpl:     types.AttestCert{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		ModifyHandler: handleAttestCertModify,
+		DeleteHandler: handleAttestCertDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedagentCtx.subAttestCert = subAttestCert
+	subAttestCert.Activate()
+
+	subVaultStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "vaultmgr",
+		TopicImpl:     types.VaultStatus{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		ModifyHandler: handleVaultStatusModify,
+		DeleteHandler: handleVaultStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -518,11 +580,15 @@ func Run(ps *pubsub.PubSub) {
 
 	// Look for DownloaderStatus from downloader
 	// used only for downloader storage stats collection
-	subBaseOsDownloadStatus, err := pubsublegacy.SubscribeScope("downloader",
-		types.BaseOsObj, types.DownloaderStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			WarningTime: warningTime,
-			ErrorTime:   errorTime,
-		})
+	subBaseOsDownloadStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "downloader",
+		AgentScope:  types.BaseOsObj,
+		TopicImpl:   types.DownloaderStatus{},
+		Activate:    false,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -531,11 +597,15 @@ func Run(ps *pubsub.PubSub) {
 
 	// Look for DownloaderStatus from downloader
 	// used only for downloader storage stats collection
-	subCertObjDownloadStatus, err := pubsublegacy.SubscribeScope("downloader",
-		types.CertObj, types.DownloaderStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			WarningTime: warningTime,
-			ErrorTime:   errorTime,
-		})
+	subCertObjDownloadStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "downloader",
+		AgentScope:  types.CertObj,
+		TopicImpl:   types.DownloaderStatus{},
+		Activate:    false,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -544,14 +614,18 @@ func Run(ps *pubsub.PubSub) {
 
 	// Look for VerifyBaseOsImageStatus from verifier
 	// used only for verifier storage stats collection
-	subBaseOsVerifierStatus, err := pubsublegacy.SubscribeScope("verifier",
-		types.BaseOsObj, types.VerifyImageStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler:  handleVerifierStatusModify,
-			DeleteHandler:  handleVerifierStatusDelete,
-			RestartHandler: handleVerifierRestarted,
-			WarningTime:    warningTime,
-			ErrorTime:      errorTime,
-		})
+	subBaseOsVerifierStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:      "verifier",
+		TopicImpl:      types.VerifyImageStatus{},
+		Activate:       false,
+		Ctx:            &zedagentCtx,
+		AgentScope:     types.BaseOsObj,
+		ModifyHandler:  handleVerifierStatusModify,
+		DeleteHandler:  handleVerifierStatusDelete,
+		RestartHandler: handleVerifierRestarted,
+		WarningTime:    warningTime,
+		ErrorTime:      errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -560,11 +634,15 @@ func Run(ps *pubsub.PubSub) {
 
 	// Look for VerifyImageStatus from verifier
 	// used only for verifier storage stats collection
-	subAppImgVerifierStatus, err := pubsublegacy.SubscribeScope("verifier",
-		types.AppImgObj, types.VerifyImageStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			WarningTime: warningTime,
-			ErrorTime:   errorTime,
-		})
+	subAppImgVerifierStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "verifier",
+		AgentScope:  types.AppImgObj,
+		TopicImpl:   types.VerifyImageStatus{},
+		Activate:    false,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -573,11 +651,15 @@ func Run(ps *pubsub.PubSub) {
 
 	// Look for DownloaderStatus from downloader for metric reporting
 	// used only for downloader storage stats collection
-	subAppImgDownloadStatus, err := pubsublegacy.SubscribeScope("downloader",
-		types.AppImgObj, types.DownloaderStatus{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			WarningTime: warningTime,
-			ErrorTime:   errorTime,
-		})
+	subAppImgDownloadStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "downloader",
+		AgentScope:  types.AppImgObj,
+		TopicImpl:   types.DownloaderStatus{},
+		Activate:    false,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -585,13 +667,16 @@ func Run(ps *pubsub.PubSub) {
 	subAppImgDownloadStatus.Activate()
 
 	// Look for nodeagent status
-	subNodeAgentStatus, err := pubsublegacy.Subscribe("nodeagent",
-		types.NodeAgentStatus{}, false, &getconfigCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleNodeAgentStatusModify,
-			DeleteHandler: handleNodeAgentStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subNodeAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "nodeagent",
+		TopicImpl:     types.NodeAgentStatus{},
+		Activate:      false,
+		Ctx:           &getconfigCtx,
+		ModifyHandler: handleNodeAgentStatusModify,
+		DeleteHandler: handleNodeAgentStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -601,36 +686,54 @@ func Run(ps *pubsub.PubSub) {
 	DNSctx := DNSContext{}
 	DNSctx.usableAddressCount = types.CountLocalAddrAnyNoLinkLocal(*deviceNetworkStatus)
 
-	subDeviceNetworkStatus, err := pubsublegacy.Subscribe("nim",
-		types.DeviceNetworkStatus{}, false, &DNSctx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleDNSModify,
-			DeleteHandler: handleDNSDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "nim",
+		TopicImpl:     types.DeviceNetworkStatus{},
+		Activate:      false,
+		Ctx:           &DNSctx,
+		ModifyHandler: handleDNSModify,
+		DeleteHandler: handleDNSDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	DNSctx.subDeviceNetworkStatus = subDeviceNetworkStatus
 	subDeviceNetworkStatus.Activate()
 
-	subDevicePortConfigList, err := pubsublegacy.Subscribe("nim",
-		types.DevicePortConfigList{}, false, &zedagentCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleDPCLModify,
-			DeleteHandler: handleDPCLDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subDevicePortConfigList, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "nim",
+		TopicImpl:     types.DevicePortConfigList{},
+		Activate:      false,
+		Ctx:           &zedagentCtx,
+		ModifyHandler: handleDPCLModify,
+		DeleteHandler: handleDPCLDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	zedagentCtx.subDevicePortConfigList = subDevicePortConfigList
 	subDevicePortConfigList.Activate()
 
+	// Subscribe to Log metrics from logmanager
+	subLogMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName: "logmanager",
+		TopicImpl: types.LogMetrics{},
+		Activate:  false,
+		Ctx:       &zedagentCtx,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedagentCtx.subLogMetrics = subLogMetrics
+
 	// Pick up debug aka log level before we start real work
 
 	for !zedagentCtx.GCInitialized {
-		log.Infof("Waiting for GCInitialized\n")
+		log.Infof("Waiting for GCInitialized")
 		select {
 		case change := <-subGlobalConfig.MsgChan():
 			subGlobalConfig.ProcessChange(change)
@@ -647,7 +750,7 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-subZbootStatus.MsgChan():
 			subZbootStatus.ProcessChange(change)
 			if zedagentCtx.zbootRestarted {
-				log.Infof("Zboot reported restarted\n")
+				log.Infof("Zboot reported restarted")
 			}
 
 		case change := <-getconfigCtx.subNodeAgentStatus.MsgChan():
@@ -670,9 +773,9 @@ func Run(ps *pubsub.PubSub) {
 		agentlog.StillRunning(agentName+"devinfo", warningTime, errorTime)
 	}
 
-	log.Infof("Waiting until we have some uplinks with usable addresses\n")
+	log.Infof("Waiting until we have some uplinks with usable addresses")
 	for !DNSctx.DNSinitialized {
-		log.Infof("Waiting for DeviceNetworkStatus %v\n",
+		log.Infof("Waiting for DeviceNetworkStatus %v",
 			DNSctx.DNSinitialized)
 
 		select {
@@ -706,14 +809,11 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-getconfigCtx.subNodeAgentStatus.MsgChan():
 			subNodeAgentStatus.ProcessChange(change)
 
+		case change := <-subAttestCert.MsgChan():
+			subAttestCert.ProcessChange(change)
+
 		case change := <-subVaultStatus.MsgChan():
 			subVaultStatus.ProcessChange(change)
-
-		case change := <-subCipherContextConfig.MsgChan():
-			subCipherContextConfig.ProcessChange(change)
-
-		case change := <-subControllerCertConfig.MsgChan():
-			subControllerCertConfig.ProcessChange(change)
 
 		case change := <-deferredChan:
 			start := time.Now()
@@ -739,25 +839,41 @@ func Run(ps *pubsub.PubSub) {
 	}
 
 	// Subscribe to network metrics from zedrouter
-	subNetworkMetrics, err := pubsublegacy.Subscribe("zedrouter",
-		types.NetworkMetrics{}, true, &zedagentCtx, nil)
+	subNetworkMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName: "zedrouter",
+		TopicImpl: types.NetworkMetrics{},
+		Activate:  true,
+		Ctx:       &zedagentCtx,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Subscribe to cloud metrics from different agents
 	cms := zedcloud.GetCloudMetrics()
-	subClientMetrics, err := pubsublegacy.Subscribe("zedclient", cms,
-		true, &zedagentCtx, nil)
+	subClientMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName: "zedclient",
+		TopicImpl: cms,
+		Activate:  true,
+		Ctx:       &zedagentCtx,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	subLogmanagerMetrics, err := pubsublegacy.Subscribe("logmanager",
-		cms, true, &zedagentCtx, nil)
+	subLogmanagerMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName: "logmanager",
+		TopicImpl: cms,
+		Activate:  true,
+		Ctx:       &zedagentCtx,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	subDownloaderMetrics, err := pubsublegacy.Subscribe("downloader",
-		cms, true, &zedagentCtx, nil)
+	subDownloaderMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName: "downloader",
+		TopicImpl: cms,
+		Activate:  true,
+		Ctx:       &zedagentCtx,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -777,7 +893,7 @@ func Run(ps *pubsub.PubSub) {
 
 	// Process the verifierStatus to avoid downloading an image we
 	// already have in place
-	log.Infof("Handling initial verifier Status\n")
+	log.Infof("Handling initial verifier Status")
 	for !zedagentCtx.verifierRestarted {
 		select {
 		case change := <-subZbootStatus.MsgChan():
@@ -789,7 +905,7 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-subBaseOsVerifierStatus.MsgChan():
 			subBaseOsVerifierStatus.ProcessChange(change)
 			if zedagentCtx.verifierRestarted {
-				log.Infof("Verifier reported restarted\n")
+				log.Infof("Verifier reported restarted")
 				break
 			}
 
@@ -812,7 +928,7 @@ func Run(ps *pubsub.PubSub) {
 			subDeviceNetworkStatus.ProcessChange(change)
 			if DNSctx.triggerDeviceInfo {
 				// IP/DNS in device info could have changed
-				log.Infof("NetworkStatus triggered PublishDeviceInfo\n")
+				log.Infof("NetworkStatus triggered PublishDeviceInfo")
 				triggerPublishDevInfo(&zedagentCtx)
 				DNSctx.triggerDeviceInfo = false
 			}
@@ -823,14 +939,11 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-subDevicePortConfigList.MsgChan():
 			subDevicePortConfigList.ProcessChange(change)
 
+		case change := <-subAttestCert.MsgChan():
+			subAttestCert.ProcessChange(change)
+
 		case change := <-subVaultStatus.MsgChan():
 			subVaultStatus.ProcessChange(change)
-
-		case change := <-subCipherContextConfig.MsgChan():
-			subCipherContextConfig.ProcessChange(change)
-
-		case change := <-subControllerCertConfig.MsgChan():
-			subControllerCertConfig.ProcessChange(change)
 
 		case change := <-deferredChan:
 			zedcloud.HandleDeferred(change, 100*time.Millisecond)
@@ -855,6 +968,12 @@ func Run(ps *pubsub.PubSub) {
 	configTickerHandle := <-handleChannel
 	// XXX close handleChannels?
 	getconfigCtx.configTickerHandle = configTickerHandle
+
+	// let zedagent get the certs for encryption/decryption at least once if V2
+	zedagentCtx.getCertsTimer = time.NewTimer(1 * time.Second)
+	if !zedcloud.UseV2API() {
+		zedagentCtx.getCertsTimer.Stop()
+	}
 
 	for {
 		select {
@@ -902,7 +1021,7 @@ func Run(ps *pubsub.PubSub) {
 			}
 			if DNSctx.triggerDeviceInfo {
 				// IP/DNS in device info could have changed
-				log.Infof("NetworkStatus triggered PublishDeviceInfo\n")
+				log.Infof("NetworkStatus triggered PublishDeviceInfo")
 				triggerPublishDevInfo(&zedagentCtx)
 				DNSctx.triggerDeviceInfo = false
 			}
@@ -914,7 +1033,7 @@ func Run(ps *pubsub.PubSub) {
 			subNetworkMetrics.ProcessChange(change)
 			m, err := subNetworkMetrics.Get("global")
 			if err != nil {
-				log.Errorf("subNetworkMetrics.Get failed: %s\n",
+				log.Errorf("subNetworkMetrics.Get failed: %s",
 					err)
 			} else {
 				networkMetrics = m.(types.NetworkMetrics)
@@ -924,7 +1043,7 @@ func Run(ps *pubsub.PubSub) {
 			subClientMetrics.ProcessChange(change)
 			m, err := subClientMetrics.Get("global")
 			if err != nil {
-				log.Errorf("subClientMetrics.Get failed: %s\n",
+				log.Errorf("subClientMetrics.Get failed: %s",
 					err)
 			} else {
 				clientMetrics = m.(types.MetricsMap)
@@ -934,7 +1053,7 @@ func Run(ps *pubsub.PubSub) {
 			subLogmanagerMetrics.ProcessChange(change)
 			m, err := subLogmanagerMetrics.Get("global")
 			if err != nil {
-				log.Errorf("subLogmanagerMetrics.Get failed: %s\n",
+				log.Errorf("subLogmanagerMetrics.Get failed: %s",
 					err)
 			} else {
 				logmanagerMetrics = m.(types.MetricsMap)
@@ -944,7 +1063,7 @@ func Run(ps *pubsub.PubSub) {
 			subDownloaderMetrics.ProcessChange(change)
 			m, err := subDownloaderMetrics.Get("global")
 			if err != nil {
-				log.Errorf("subDownloaderMetrics.Get failed: %s\n",
+				log.Errorf("subDownloaderMetrics.Get failed: %s",
 					err)
 			} else {
 				downloaderMetrics = m.(types.MetricsMap)
@@ -972,14 +1091,18 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-subAppVifIPTrig.MsgChan():
 			subAppVifIPTrig.ProcessChange(change)
 
+		case change := <-subAttestCert.MsgChan():
+			subAttestCert.ProcessChange(change)
+
 		case change := <-subVaultStatus.MsgChan():
 			subVaultStatus.ProcessChange(change)
 
-		case change := <-subCipherContextConfig.MsgChan():
-			subCipherContextConfig.ProcessChange(change)
-
-		case change := <-subControllerCertConfig.MsgChan():
-			subControllerCertConfig.ProcessChange(change)
+		case <-zedagentCtx.getCertsTimer.C:
+			start := time.Now()
+			ok := getCloudCertChain(&zedagentCtx)
+			log.Infof("zedagent Run: getCertsTimer get cloud cert ok %v", ok)
+			pubsub.CheckMaxTimeTopic(agentName, "getCertsTimer", start,
+				warningTime, errorTime)
 
 		case <-stillRunning.C:
 			// Fault injection
@@ -1032,7 +1155,7 @@ func deviceInfoTask(ctxPtr *zedagentContext, triggerDeviceInfo <-chan struct{}) 
 
 func handleVerifierRestarted(ctxArg interface{}, done bool) {
 	ctx := ctxArg.(*zedagentContext)
-	log.Infof("handleVerifierRestarted(%v)\n", done)
+	log.Infof("handleVerifierRestarted(%v)", done)
 	if done {
 		ctx.verifierRestarted = true
 	}
@@ -1043,7 +1166,7 @@ func handleVerifierStatusModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	status := statusArg.(types.VerifyImageStatus)
-	log.Infof("handleVerifierStatusModify for %s\n", status.ImageID)
+	log.Infof("handleVerifierStatusModify for %s", status.ImageID)
 	// Nothing to do
 }
 
@@ -1052,14 +1175,14 @@ func handleVerifierStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	status := statusArg.(types.VerifyImageStatus)
-	log.Infof("handleVeriferStatusDelete RefCount %d for %s\n",
+	log.Infof("handleVeriferStatusDelete RefCount %d for %s",
 		status.RefCount, key)
 	// Nothing to do
 }
 
 func handleZbootRestarted(ctxArg interface{}, done bool) {
 	ctx := ctxArg.(*zedagentContext)
-	log.Infof("handleZbootRestarted(%v)\n", done)
+	log.Infof("handleZbootRestarted(%v)", done)
 	if done {
 		ctx.zbootRestarted = true
 	}
@@ -1074,25 +1197,25 @@ func initializeDirs() {
 
 	// create persistent holder directory
 	if _, err := os.Stat(types.PersistDir); err != nil {
-		log.Debugf("Create %s\n", types.PersistDir)
+		log.Debugf("Create %s", types.PersistDir)
 		if err := os.MkdirAll(types.PersistDir, 0700); err != nil {
 			log.Fatal(err)
 		}
 	}
 	if _, err := os.Stat(types.CertificateDirname); err != nil {
-		log.Debugf("Create %s\n", types.CertificateDirname)
+		log.Debugf("Create %s", types.CertificateDirname)
 		if err := os.MkdirAll(types.CertificateDirname, 0700); err != nil {
 			log.Fatal(err)
 		}
 	}
 	if _, err := os.Stat(checkpointDirname); err != nil {
-		log.Debugf("Create %s\n", checkpointDirname)
+		log.Debugf("Create %s", checkpointDirname)
 		if err := os.MkdirAll(checkpointDirname, 0700); err != nil {
 			log.Fatal(err)
 		}
 	}
 	if _, err := os.Stat(types.DownloadDirname); err != nil {
-		log.Debugf("Create %s\n", types.DownloadDirname)
+		log.Debugf("Create %s", types.DownloadDirname)
 		if err := os.MkdirAll(types.DownloadDirname, 0700); err != nil {
 			log.Fatal(err)
 		}
@@ -1141,7 +1264,7 @@ func lookupAppInstanceStatus(ctx *zedagentContext, key string) *types.AppInstanc
 	sub := ctx.getconfigCtx.subAppInstanceStatus
 	st, _ := sub.Get(key)
 	if st == nil {
-		log.Infof("lookupAppInstanceStatus(%s) not found\n", key)
+		log.Infof("lookupAppInstanceStatus(%s) not found", key)
 		return nil
 	}
 	status := st.(types.AppInstanceStatus)
@@ -1153,13 +1276,13 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	status := statusArg.(types.DeviceNetworkStatus)
 	ctx := ctxArg.(*DNSContext)
 	if key != "global" {
-		log.Infof("handleDNSModify: ignoring %s\n", key)
+		log.Infof("handleDNSModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleDNSModify for %s\n", key)
+	log.Infof("handleDNSModify for %s", key)
 	// XXX empty is equal
 	if cmp.Equal(*deviceNetworkStatus, status) {
-		log.Infof("handleDNSModify no change\n")
+		log.Infof("handleDNSModify no change")
 		ctx.DNSinitialized = true
 		return
 	}
@@ -1170,7 +1293,7 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	// XXX should we also trigger if the count increases?
 	newAddrCount := types.CountLocalAddrAnyNoLinkLocal(*deviceNetworkStatus)
 	if newAddrCount != 0 && ctx.usableAddressCount == 0 {
-		log.Infof("DeviceNetworkStatus from %d to %d addresses\n",
+		log.Infof("DeviceNetworkStatus from %d to %d addresses",
 			ctx.usableAddressCount, newAddrCount)
 		ctx.triggerGetConfig = true
 	}
@@ -1181,24 +1304,24 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	if zedcloudCtx.V2API {
 		zedcloud.UpdateTLSProxyCerts(&zedcloudCtx)
 	}
-	log.Infof("handleDNSModify done for %s\n", key)
+	log.Infof("handleDNSModify done for %s", key)
 }
 
 func handleDNSDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleDNSDelete for %s\n", key)
+	log.Infof("handleDNSDelete for %s", key)
 	ctx := ctxArg.(*DNSContext)
 
 	if key != "global" {
-		log.Infof("handleDNSDelete: ignoring %s\n", key)
+		log.Infof("handleDNSDelete: ignoring %s", key)
 		return
 	}
 	*deviceNetworkStatus = types.DeviceNetworkStatus{}
 	newAddrCount := types.CountLocalAddrAnyNoLinkLocal(*deviceNetworkStatus)
 	ctx.DNSinitialized = false
 	ctx.usableAddressCount = newAddrCount
-	log.Infof("handleDNSDelete done for %s\n", key)
+	log.Infof("handleDNSDelete done for %s", key)
 }
 
 func handleDPCLModify(ctxArg interface{}, key string, statusArg interface{}) {
@@ -1206,11 +1329,11 @@ func handleDPCLModify(ctxArg interface{}, key string, statusArg interface{}) {
 	status := statusArg.(types.DevicePortConfigList)
 	ctx := ctxArg.(*zedagentContext)
 	if key != "global" {
-		log.Infof("handleDPCLModify: ignoring %s\n", key)
+		log.Infof("handleDPCLModify: ignoring %s", key)
 		return
 	}
 	if cmp.Equal(ctx.devicePortConfigList, status) {
-		log.Infof("handleDPCLModify no change\n")
+		log.Infof("handleDPCLModify no change")
 		return
 	}
 	// Note that lastSucceeded will increment a lot; ignore it but compare
@@ -1225,10 +1348,10 @@ func handleDPCLDelete(ctxArg interface{}, key string, statusArg interface{}) {
 
 	ctx := ctxArg.(*zedagentContext)
 	if key != "global" {
-		log.Infof("handleDPCLDelete: ignoring %s\n", key)
+		log.Infof("handleDPCLDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleDPCLDelete for %s\n", key)
+	log.Infof("handleDPCLDelete for %s", key)
 	ctx.devicePortConfigList = types.DevicePortConfigList{}
 	triggerPublishDevInfo(ctx)
 }
@@ -1239,16 +1362,16 @@ func handleDPCLDelete(ctxArg interface{}, key string, statusArg interface{}) {
 func handleBaseOsStatusModify(ctxArg interface{}, key string, statusArg interface{}) {
 	ctx := ctxArg.(*zedagentContext)
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleBaseOsStatusModify(%s) done\n", key)
+	log.Infof("handleBaseOsStatusModify(%s) done", key)
 }
 
 func handleBaseOsStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleBaseOsStatusDelete(%s)\n", key)
+	log.Infof("handleBaseOsStatusDelete(%s)", key)
 	ctx := ctxArg.(*zedagentContext)
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleBaseOsStatusDelete(%s) done\n", key)
+	log.Infof("handleBaseOsStatusDelete(%s) done", key)
 }
 
 // vault status event handlers
@@ -1256,16 +1379,16 @@ func handleBaseOsStatusDelete(ctxArg interface{}, key string,
 func handleVaultStatusModify(ctxArg interface{}, key string, statusArg interface{}) {
 	ctx := ctxArg.(*zedagentContext)
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleVaultStatusModify(%s) done\n", key)
+	log.Infof("handleVaultStatusModify(%s) done", key)
 }
 
 func handleVaultStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleVaultStatusDelete(%s)\n", key)
+	log.Infof("handleVaultStatusDelete(%s)", key)
 	ctx := ctxArg.(*zedagentContext)
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleVaultStatusDelete(%s) done\n", key)
+	log.Infof("handleVaultStatusDelete(%s) done", key)
 }
 
 func appendError(allErrors string, prefix string, lasterr string) string {
@@ -1278,24 +1401,18 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedagentContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigModify: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigModify for %s\n", key)
-	var gcp *types.GlobalConfig
+	log.Infof("handleGlobalConfigModify for %s", key)
+	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
 	if gcp != nil && !ctx.GCInitialized {
-		updated := types.ApplyGlobalConfig(*gcp)
-		log.Infof("handleGlobalConfigModify setting initials to %+v\n",
-			updated)
-		sane := types.EnforceGlobalConfigMinimums(updated)
-		log.Infof("handleGlobalConfigModify: enforced minimums %v\n",
-			cmp.Diff(updated, sane))
-		ctx.globalConfig = sane
+		ctx.globalConfig = *gcp
 		ctx.GCInitialized = true
 	}
-	log.Infof("handleGlobalConfigModify done for %s\n", key)
+	log.Infof("handleGlobalConfigModify done for %s", key)
 }
 
 func handleGlobalConfigDelete(ctxArg interface{}, key string,
@@ -1303,14 +1420,14 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedagentContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigDelete: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigDelete for %s\n", key)
+	log.Infof("handleGlobalConfigDelete for %s", key)
 	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
-	ctx.globalConfig = types.GlobalConfigDefaults
-	log.Infof("handleGlobalConfigDelete done for %s\n", key)
+	ctx.globalConfig = *types.DefaultConfigItemValueMap()
+	log.Infof("handleGlobalConfigDelete done for %s", key)
 }
 
 // Handles both create and modify events
@@ -1320,13 +1437,13 @@ func handleAAModify(ctxArg interface{}, key string,
 	ctx := ctxArg.(*zedagentContext)
 	status := statusArg.(types.AssignableAdapters)
 	if key != "global" {
-		log.Infof("handleAAModify: ignoring %s\n", key)
+		log.Infof("handleAAModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleAAModify() %+v\n", status)
+	log.Infof("handleAAModify() %+v", status)
 	*ctx.assignableAdapters = status
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleAAModify() done\n")
+	log.Infof("handleAAModify() done")
 }
 
 func handleAADelete(ctxArg interface{}, key string,
@@ -1334,13 +1451,13 @@ func handleAADelete(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedagentContext)
 	if key != "global" {
-		log.Infof("handleAADelete: ignoring %s\n", key)
+		log.Infof("handleAADelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleAADelete()\n")
+	log.Infof("handleAADelete()")
 	ctx.assignableAdapters.Initialized = false
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleAADelete() done\n")
+	log.Infof("handleAADelete() done")
 }
 
 // Handles both create and modify events
@@ -1349,10 +1466,10 @@ func handleZbootStatusModify(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedagentContext)
 	if !isZbootValidPartitionLabel(key) {
-		log.Errorf("handleZbootStatusModify: invalid key %s\n", key)
+		log.Errorf("handleZbootStatusModify: invalid key %s", key)
 		return
 	}
-	log.Infof("handleZbootStatusModify: for %s\n", key)
+	log.Infof("handleZbootStatusModify: for %s", key)
 	// nothing to do
 	triggerPublishDevInfo(ctx)
 }
@@ -1360,10 +1477,10 @@ func handleZbootStatusModify(ctxArg interface{}, key string,
 func handleZbootStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	if !isZbootValidPartitionLabel(key) {
-		log.Errorf("handleZbootStatusDelete: invalid key %s\n", key)
+		log.Errorf("handleZbootStatusDelete: invalid key %s", key)
 		return
 	}
-	log.Infof("handleZbootStatusDelete: for %s\n", key)
+	log.Infof("handleZbootStatusDelete: for %s", key)
 	// Nothing to do
 }
 
@@ -1387,7 +1504,7 @@ func handleNodeAgentStatusModify(ctxArg interface{}, key string,
 	// state, initiate the reboot process
 	if ctx.rebootCmdDeferred &&
 		updateInprogress && !status.UpdateInprogress {
-		log.Infof("TestComplete and deferred reboot\n")
+		log.Infof("TestComplete and deferred reboot")
 		ctx.rebootCmdDeferred = false
 		infoStr := fmt.Sprintf("TestComplete and deferred Reboot Cmd\n")
 		handleRebootCmd(ctx, infoStr)
@@ -1396,13 +1513,13 @@ func handleNodeAgentStatusModify(ctxArg interface{}, key string,
 		handleDeviceReboot(ctx)
 	}
 	triggerPublishDevInfo(ctx)
-	log.Infof("handleNodeAgentStatusModify: done.\n")
+	log.Infof("handleNodeAgentStatusModify: done.")
 }
 
 func handleNodeAgentStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	ctx := ctxArg.(*zedagentContext)
-	log.Infof("handleNodeAgentStatusDelete: for %s\n", key)
+	log.Infof("handleNodeAgentStatusDelete: for %s", key)
 	// Nothing to do
 	triggerPublishDevInfo(ctx)
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	uuid "github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
@@ -65,12 +66,12 @@ type AppInstanceConfig struct {
 	IoAdapterList       []IoAdapter
 	RestartCmd          AppInstanceOpsCmd
 	PurgeCmd            AppInstanceOpsCmd
-	// XXX: to be deprecated, use CipherBlock instead
+	// XXX: to be deprecated, use CipherBlockStatus instead
 	CloudInitUserData *string // base64-encoded
 	RemoteConsole     bool
 
-	// CipherBlock, for encrypted cloud-init data
-	CipherBlock
+	// CipherBlockStatus, for encrypted cloud-init data
+	CipherBlockStatus
 }
 
 type AppInstanceOpsCmd struct {
@@ -82,6 +83,55 @@ type AppInstanceOpsCmd struct {
 type IoAdapter struct {
 	Type IoType
 	Name string // Short hand name such as "COM1" or "eth1-2"
+}
+
+// LogCreate :
+func (config AppInstanceConfig) LogCreate() {
+	logObject := base.NewLogObject(base.AppInstanceConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("activate", config.Activate).
+		AddField("remote-console", config.RemoteConsole).
+		Infof("App instance config create")
+}
+
+// LogModify :
+func (config AppInstanceConfig) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.AppInstanceConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+
+	oldConfig, ok := old.(AppInstanceConfig)
+	if !ok {
+		log.Errorf("LogModify: Old object interface passed is not of AppInstanceConfig type")
+	}
+	if oldConfig.Activate != config.Activate ||
+		oldConfig.RemoteConsole != config.RemoteConsole {
+
+		logObject.CloneAndAddField("activate", config.Activate).
+			AddField("remote-console", config.RemoteConsole).
+			AddField("old-activate", oldConfig.Activate).
+			AddField("old-remote-console", oldConfig.RemoteConsole).
+			Infof("App instance config modify")
+	}
+
+}
+
+// LogDelete :
+func (config AppInstanceConfig) LogDelete() {
+	logObject := base.EnsureLogObject(base.AppInstanceConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+	logObject.CloneAndAddField("activate", config.Activate).
+		AddField("remote-console", config.RemoteConsole).
+		Infof("App instance config delete")
+
+	base.DeleteLogObject(config.LogKey())
+}
+
+// LogKey :
+func (config AppInstanceConfig) LogKey() string {
+	return string(base.AppInstanceConfigLogType) + "-" + config.Key()
 }
 
 func (config AppInstanceConfig) Key() string {
@@ -128,19 +178,82 @@ type AppInstanceStatus struct {
 	State          SwState
 	MissingNetwork bool // If some Network UUID not found
 	// All error strings across all steps and all StorageStatus
-	ErrorSource string
-	Error       string
-	ErrorTime   time.Time
+	// ErrorAndTimeWithSource provides SetError, SetErrrorWithSource, etc
+	ErrorAndTimeWithSource
+}
+
+// LogCreate :
+func (status AppInstanceStatus) LogCreate() {
+	logObject := base.NewLogObject(base.AppInstanceStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("state", status.State.String()).
+		AddField("restart-in-progress", status.RestartInprogress).
+		AddField("purge-in-progress", status.PurgeInprogress).
+		Infof("App instance status create")
+}
+
+// LogModify :
+func (status AppInstanceStatus) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.AppInstanceStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+
+	oldStatus, ok := old.(AppInstanceStatus)
+	if !ok {
+		log.Errorf("LogModify: Old object interface passed is not of AppInstanceStatus type")
+	}
+	if oldStatus.State != status.State ||
+		oldStatus.RestartInprogress != status.RestartInprogress ||
+		oldStatus.PurgeInprogress != status.PurgeInprogress {
+
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("restart-in-progress", status.RestartInprogress).
+			AddField("purge-in-progress", status.PurgeInprogress).
+			AddField("old-state", oldStatus.State.String()).
+			AddField("old-restart-in-progress", oldStatus.RestartInprogress).
+			AddField("old-purge-in-progress", oldStatus.PurgeInprogress).
+			Infof("App instance status modify")
+	}
+
+	if status.HasError() {
+		errAndTime := status.ErrorAndTime()
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("restart-in-progress", status.RestartInprogress).
+			AddField("purge-in-progress", status.PurgeInprogress).
+			AddField("error", errAndTime.Error).
+			AddField("error-time", errAndTime.ErrorTime).
+			Errorf("App instance status modify")
+	}
+}
+
+// LogDelete :
+func (status AppInstanceStatus) LogDelete() {
+	logObject := base.EnsureLogObject(base.AppInstanceStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+	logObject.CloneAndAddField("state", status.State.String()).
+		AddField("restart-in-progress", status.RestartInprogress).
+		AddField("purge-in-progress", status.PurgeInprogress).
+		Infof("App instance status delete")
+
+	base.DeleteLogObject(status.LogKey())
+}
+
+// LogKey :
+func (status AppInstanceStatus) LogKey() string {
+	return string(base.AppInstanceStatusLogType) + "-" + status.Key()
 }
 
 // Track more complicated workflows
 type Inprogress uint8
 
+// NotInprogress and other values for Inprogress
 const (
-	NONE     Inprogress = iota
-	DOWNLOAD            // Download and verify new images
-	BRING_DOWN
-	BRING_UP
+	NotInprogress   Inprogress = iota
+	RecreateVolumes            // Download and verify new images if need be
+	BringDown
+	BringUp
 )
 
 func (status AppInstanceStatus) Key() string {
@@ -186,22 +299,6 @@ func (status AppInstanceStatus) GetAppInterfaceList() []string {
 	return viflist
 }
 
-// SetError - Clears error state of Status
-func (statusPtr *AppInstanceStatus) SetError( //revive:disable-line
-	errStr string, source string,
-	errTime time.Time) {
-	statusPtr.Error = errStr
-	statusPtr.ErrorSource = source
-	statusPtr.ErrorTime = errTime
-}
-
-// ClearError - Clears error state of Status
-func (statusPtr *AppInstanceStatus) ClearError() { //revive:disable-line
-	statusPtr.Error = ""
-	statusPtr.ErrorSource = ""
-	statusPtr.ErrorTime = time.Time{}
-}
-
 // MaybeUpdateAppIPAddr - Check if the AI status has the underlay network with this Mac Address
 func (status *AppInstanceStatus) MaybeUpdateAppIPAddr(macAddr, ipAddr string) bool {
 	for idx, ulStatus := range status.UnderlayNetworks {
@@ -241,6 +338,7 @@ type StorageConfig struct {
 	// ImageID - UUID of the image
 	ImageID          uuid.UUID
 	DatastoreID      uuid.UUID
+	PurgeCounter     uint32
 	Name             string   // XXX Do depend on URL for clobber avoidance?
 	NameIsURL        bool     // If not we form URL based on datastore info
 	Size             uint64   // In bytes
@@ -262,17 +360,11 @@ func RoundupToKB(b uint64) uint64 {
 	return (b + 1023) / 1024
 }
 
-// ErrorInfo errorInfo holder structure
-type ErrorInfo struct {
-	Error       string
-	ErrorSource string
-	ErrorTime   time.Time
-}
-
 type StorageStatus struct {
 	// ImageID - UUID of the image
 	ImageID            uuid.UUID
 	DatastoreID        uuid.UUID
+	PurgeCounter       uint32
 	Name               string
 	ImageSha256        string   // sha256 of immutable image
 	NameIsURL          bool     // If not we form URL based on datastore info
@@ -288,108 +380,106 @@ type StorageStatus struct {
 	Target             string  // Default "" is interpreted as "disk"
 	State              SwState // DOWNLOADED etc
 	Progress           uint    // In percent i.e., 0-100
-	HasDownloaderRef   bool    // Reference against downloader to clean up
-	HasVerifierRef     bool    // Reference against verifier to clean up
+	HasVolumemgrRef    bool    // Reference against volumemgr to clean up
+	HasResolverRef     bool    // Reference against resolver for resolving tags
 	IsContainer        bool    // Is the image a Container??
 	Vdev               string  // Allocated
 	ActiveFileLocation string  // Location of filestystem
 	FinalObjDir        string  // Installation dir; may differ from verified
-	ErrorInfo
+	// ErrorAndTimeWithSource provides SetError, SetErrrorWithSource, etc
+	ErrorAndTimeWithSource
+}
+
+// ResolveKey will return the key of resolver config/status
+func (ss *StorageStatus) ResolveKey() string {
+	return fmt.Sprintf("%s+%s+%v", ss.DatastoreID.String(), ss.Name, ss.PurgeCounter)
 }
 
 // UpdateFromStorageConfig sets up StorageStatus based on StorageConfig struct
 func (ss *StorageStatus) UpdateFromStorageConfig(sc StorageConfig) {
-	ss.DatastoreID = sc.DatastoreID
-	ss.Name = sc.Name
-	ss.NameIsURL = sc.NameIsURL
 	ss.ImageID = sc.ImageID
+	ss.DatastoreID = sc.DatastoreID
+	ss.PurgeCounter = sc.PurgeCounter
+	ss.Name = sc.Name
 	ss.ImageSha256 = sc.ImageSha256
+	ss.NameIsURL = sc.NameIsURL
 	ss.Size = sc.Size
 	ss.CertificateChain = sc.CertificateChain
 	ss.ImageSignature = sc.ImageSignature
 	ss.SignatureKey = sc.SignatureKey
 	ss.ReadOnly = sc.ReadOnly
 	ss.Preserve = sc.Preserve
-	ss.Format = sc.Format
 	ss.Maxsizebytes = sc.Maxsizebytes
+	ss.Format = sc.Format
 	ss.Devtype = sc.Devtype
 	ss.Target = sc.Target
+	ss.State = 0
+	ss.Progress = 0
+	ss.HasVolumemgrRef = false
+	ss.HasResolverRef = false
 	if ss.Format == zconfig.Format_CONTAINER {
 		ss.IsContainer = true
 	}
+	ss.Vdev = ""
+	ss.ActiveFileLocation = ""
+	ss.FinalObjDir = ""
+	ss.ErrorAndTimeWithSource = ErrorAndTimeWithSource{}
 	return
 }
 
-// GetErrorInfo sets the errorInfo for the Storage Object
-func (ss StorageStatus) GetErrorInfo() ErrorInfo {
-	errInfo := ErrorInfo{
-		Error:       ss.Error,
-		ErrorSource: ss.ErrorSource,
-		ErrorTime:   ss.ErrorTime,
-	}
-	return errInfo
-}
-
-// SetErrorInfo sets the errorInfo for the Storage Object
-func (ss *StorageStatus) SetErrorInfo(errInfo ErrorInfo) {
-	ss.Error = errInfo.Error
-	ss.ErrorTime = errInfo.ErrorTime
-	ss.ErrorSource = errInfo.ErrorSource
-}
-
-// ClearErrorInfo clears errorInfo for the Storage Object
-func (ss *StorageStatus) ClearErrorInfo() {
-	ss.Error = ""
-	ss.ErrorSource = ""
-	ss.ErrorTime = time.Time{}
-}
-
-// IsCertsAvailable checks certificate requirement/availability for a storage object
-func (ss StorageStatus) IsCertsAvailable(displaystr string) (bool, error) {
-	if !ss.needsCerts() {
+// IsCertsAvailable checks certificate requirement/availability for a Volume object
+func (vs VolumeStatus) IsCertsAvailable(displaystr string) (bool, error) {
+	if !vs.needsCerts() {
 		log.Debugf("%s, Certs are not required\n", displaystr)
 		return false, nil
 	}
-	cidx, err := ss.getCertCount(displaystr)
+	cidx, err := vs.getCertCount(displaystr)
 	return cidx != 0, err
 }
 
-// HandleCertStatus gets the CertObject Status for the storage object
+// HandleCertStatus gets the CertObject Status for the volume object
 // True, when there is no Certs or, the certificates are ready
 // False, Certificates are not ready or, there are some errors
-func (ss StorageStatus) HandleCertStatus(displaystr string,
-	certObjStatus CertObjStatus) (bool, ErrorInfo) {
-	if ret, errInfo := ss.checkCertsStatusForObject(certObjStatus); !ret {
+func (vs VolumeStatus) HandleCertStatus(displaystr string,
+	certObjStatus CertObjStatus) (bool, ErrorAndTime) {
+	if ret, errInfo := vs.checkCertsStatusForObject(certObjStatus); !ret {
 		log.Infof("%s, Certs are still not ready\n", displaystr)
 		return ret, errInfo
 	}
-	if ret := ss.checkCertsForObject(); !ret {
+	if ret := vs.checkCertsForObject(); !ret {
 		log.Infof("%s, Certs are still not installed\n", displaystr)
-		return ret, ErrorInfo{}
+		return ret, ErrorAndTime{}
 	}
-	return true, ErrorInfo{}
+	return true, ErrorAndTime{}
 }
 
-// needsCerts whether certificates are required for the Storage Object
-func (ss StorageStatus) needsCerts() bool {
-	if len(ss.ImageSignature) == 0 {
+// needsCerts whether certificates are required for the Volume object
+func (vs VolumeStatus) needsCerts() bool {
+	if vs.DownloadOrigin == nil {
+		return false
+	}
+	if len(vs.DownloadOrigin.ImageSignature) == 0 {
 		return false
 	}
 	return true
 }
 
-// getCertCount returns the number of certificates for the Storage Object
+// getCertCount returns the number of certificates for the Volume Object
 // called with valid ImageSignature only
-func (ss StorageStatus) getCertCount(displaystr string) (int, error) {
+func (vs VolumeStatus) getCertCount(displaystr string) (int, error) {
 	cidx := 0
-	if ss.SignatureKey == "" {
+	if vs.DownloadOrigin == nil {
+		return 0, nil
+	}
+	dos := vs.DownloadOrigin
+	if dos.SignatureKey == "" {
 		errStr := fmt.Sprintf("%s, Invalid Root CertURL\n", displaystr)
 		log.Errorf(errStr)
 		return cidx, errors.New(errStr)
 	}
 	cidx++
-	if len(ss.CertificateChain) != 0 {
-		for _, certURL := range ss.CertificateChain {
+	if len(dos.CertificateChain) != 0 {
+		for _, certURL := range dos.CertificateChain {
 			if certURL == "" {
 				errStr := fmt.Sprintf("%s, Invalid Intermediate CertURL\n", displaystr)
 				log.Errorf(errStr)
@@ -402,29 +492,37 @@ func (ss StorageStatus) getCertCount(displaystr string) (int, error) {
 }
 
 // checkCertsStatusForObject checks certificates for installation status
-func (ss StorageStatus) checkCertsStatusForObject(certObjStatus CertObjStatus) (bool, ErrorInfo) {
+func (vs VolumeStatus) checkCertsStatusForObject(certObjStatus CertObjStatus) (bool, ErrorAndTime) {
 
-	if ss.SignatureKey != "" {
-		found, installed, errInfo := certObjStatus.getCertStatus(ss.SignatureKey)
+	dos := vs.DownloadOrigin
+	if dos == nil {
+		return true, ErrorAndTime{}
+	}
+	if dos.SignatureKey != "" {
+		found, installed, errInfo := certObjStatus.getCertStatus(dos.SignatureKey)
 		if !found || !installed {
 			return false, errInfo
 		}
 	}
 
-	for _, certURL := range ss.CertificateChain {
-		found, installed, errInfo := certObjStatus.getCertStatus(certURL)
+	for _, certURL := range dos.CertificateChain {
+		found, installed, errorAndTime := certObjStatus.getCertStatus(certURL)
 		if !found || !installed {
-			return false, errInfo
+			return false, errorAndTime
 		}
 	}
-	return true, ErrorInfo{}
+	return true, ErrorAndTime{}
 }
 
 // checkCertsForObject checks availability of Certs in Disk
-func (ss StorageStatus) checkCertsForObject() bool {
+func (vs VolumeStatus) checkCertsForObject() bool {
 
-	if ss.SignatureKey != "" {
-		safename := UrlToSafename(ss.SignatureKey, "")
+	dos := vs.DownloadOrigin
+	if dos == nil {
+		return true
+	}
+	if dos.SignatureKey != "" {
+		safename := UrlToSafename(dos.SignatureKey, "")
 		filename := CertificateDirname + "/" + SafenameToFilename(safename)
 		// XXX result is just the sha? Or "serverCert.<sha>?
 		if _, err := os.Stat(filename); err != nil {
@@ -434,7 +532,7 @@ func (ss StorageStatus) checkCertsForObject() bool {
 		// XXX check for valid or non-zero length?
 	}
 
-	for _, certURL := range ss.CertificateChain {
+	for _, certURL := range dos.CertificateChain {
 		safename := UrlToSafename(certURL, "")
 		filename := CertificateDirname + "/" + SafenameToFilename(safename)
 		// XXX result is just the sha? Or "serverCert.<sha>?
@@ -458,12 +556,17 @@ type SignatureInfo struct {
 // Key for OCI images which can be specified with a tag and we need to be
 // able to latch the sha and choose when to update/refresh from the tag.
 type AppAndImageToHash struct {
-	AppUUID uuid.UUID
-	ImageID uuid.UUID
-	Hash    string
+	AppUUID      uuid.UUID
+	ImageID      uuid.UUID
+	Hash         string
+	PurgeCounter uint32
 }
 
 // Key is used for pubsub
 func (aih AppAndImageToHash) Key() string {
-	return fmt.Sprintf("%s.%s", aih.AppUUID.String(), aih.ImageID.String())
+	if aih.PurgeCounter == 0 {
+		return fmt.Sprintf("%s.%s", aih.AppUUID.String(), aih.ImageID.String())
+	} else {
+		return fmt.Sprintf("%s.%s.%d", aih.AppUUID.String(), aih.ImageID.String(), aih.PurgeCounter)
+	}
 }

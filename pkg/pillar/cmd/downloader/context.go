@@ -3,6 +3,7 @@ package downloader
 import (
 	"sync"
 
+	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zedUpload"
@@ -10,6 +11,7 @@ import (
 )
 
 type downloaderContext struct {
+	decryptCipherContext    cipher.DecryptCipherContext
 	dCtx                    *zedUpload.DronaCtx
 	subDeviceNetworkStatus  pubsub.Subscription
 	subAppImgConfig         pubsub.Subscription
@@ -18,8 +20,11 @@ type downloaderContext struct {
 	pubBaseOsStatus         pubsub.Publication
 	subCertObjConfig        pubsub.Subscription
 	pubCertObjStatus        pubsub.Publication
+	subAppImgResolveConfig  pubsub.Subscription
+	pubAppImgResolveStatus  pubsub.Publication
 	subGlobalDownloadConfig pubsub.Subscription
 	pubGlobalDownloadStatus pubsub.Publication
+	pubCipherBlockStatus    pubsub.Publication
 	subDatastoreConfig      pubsub.Subscription
 	deviceNetworkStatus     types.DeviceNetworkStatus
 	globalConfig            types.GlobalDownloadConfig
@@ -30,6 +35,38 @@ type downloaderContext struct {
 }
 
 func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
+	// Look for controller certs which will be used for decryption
+	subControllerCert, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "zedagent",
+		TopicImpl:   types.ControllerCert{},
+		Activate:    false,
+		Ctx:         ctx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+		Persistent:  true,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx.decryptCipherContext.SubControllerCert = subControllerCert
+	subControllerCert.Activate()
+
+	// Look for cipher context which will be used for decryption
+	subCipherContext, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "zedagent",
+		TopicImpl:   types.CipherContext{},
+		Activate:    false,
+		Ctx:         ctx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+		Persistent:  true,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx.decryptCipherContext.SubCipherContext = subCipherContext
+	subCipherContext.Activate()
+
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		CreateHandler: handleGlobalConfigModify,
@@ -37,10 +74,9 @@ func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
 		DeleteHandler: handleGlobalConfigDelete,
 		WarningTime:   warningTime,
 		ErrorTime:     errorTime,
-		TopicImpl:     types.GlobalConfig{},
+		TopicImpl:     types.ConfigItemValueMap{},
 		Ctx:           ctx,
 	})
-
 	if err != nil {
 		return err
 	}
@@ -96,6 +132,15 @@ func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
 	ctx.subDatastoreConfig = subDatastoreConfig
 	subDatastoreConfig.Activate()
 
+	pubCipherBlockStatus, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.CipherBlockStatus{},
+	})
+	if err != nil {
+		return err
+	}
+	ctx.pubCipherBlockStatus = pubCipherBlockStatus
+
 	pubGlobalDownloadStatus, err := ps.NewPublication(pubsub.PublicationOptions{
 		AgentName: agentName,
 		TopicType: types.GlobalDownloadStatus{},
@@ -139,13 +184,24 @@ func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
 	ctx.pubCertObjStatus = pubCertObjStatus
 	pubCertObjStatus.ClearRestarted()
 
+	pubAppImgResolveStatus, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName:  agentName,
+		AgentScope: types.AppImgObj,
+		TopicType:  types.ResolveStatus{},
+	})
+	if err != nil {
+		return err
+	}
+	ctx.pubAppImgResolveStatus = pubAppImgResolveStatus
+	pubAppImgResolveStatus.ClearRestarted()
+
 	subAppImgConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		CreateHandler: handleAppImgCreate,
 		ModifyHandler: handleAppImgModify,
 		DeleteHandler: handleAppImgDelete,
 		WarningTime:   warningTime,
 		ErrorTime:     errorTime,
-		AgentName:     "zedmanager",
+		AgentName:     "volumemgr",
 		AgentScope:    types.AppImgObj,
 		TopicImpl:     types.DownloaderConfig{},
 		Ctx:           ctx,
@@ -162,7 +218,7 @@ func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
 		DeleteHandler: handleBaseOsDelete,
 		WarningTime:   warningTime,
 		ErrorTime:     errorTime,
-		AgentName:     "baseosmgr",
+		AgentName:     "volumemgr",
 		AgentScope:    types.BaseOsObj,
 		TopicImpl:     types.DownloaderConfig{},
 		Ctx:           ctx,
@@ -179,7 +235,7 @@ func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
 		DeleteHandler: handleCertObjDelete,
 		WarningTime:   warningTime,
 		ErrorTime:     errorTime,
-		AgentName:     "baseosmgr",
+		AgentName:     "volumemgr",
 		AgentScope:    types.CertObj,
 		TopicImpl:     types.DownloaderConfig{},
 		Ctx:           ctx,
@@ -190,9 +246,27 @@ func (ctx *downloaderContext) registerHandlers(ps *pubsub.PubSub) error {
 	ctx.subCertObjConfig = subCertObjConfig
 	subCertObjConfig.Activate()
 
+	subAppImgResolveConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		CreateHandler: handleAppImgResolveModify,
+		ModifyHandler: handleAppImgResolveModify,
+		DeleteHandler: handleAppImgResolveDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+		AgentName:     "zedmanager",
+		AgentScope:    types.AppImgObj,
+		TopicImpl:     types.ResolveConfig{},
+		Ctx:           ctx,
+	})
+	if err != nil {
+		return err
+	}
+	ctx.subAppImgResolveConfig = subAppImgResolveConfig
+	subAppImgResolveConfig.Activate()
+
 	pubAppImgStatus.SignalRestarted()
 	pubBaseOsStatus.SignalRestarted()
 	pubCertObjStatus.SignalRestarted()
+	pubAppImgResolveStatus.SignalRestarted()
 
 	return nil
 }
@@ -207,7 +281,7 @@ func (ctx *downloaderContext) subscription(objType string) pubsub.Subscription {
 	case types.CertObj:
 		sub = ctx.subCertObjConfig
 	default:
-		log.Fatalf("downloaderSubscription: Unknown ObjType %s\n",
+		log.Fatalf("downloaderSubscription: Unknown ObjType %s",
 			objType)
 	}
 	return sub
@@ -223,7 +297,7 @@ func (ctx *downloaderContext) publication(objType string) pubsub.Publication {
 	case types.CertObj:
 		pub = ctx.pubCertObjStatus
 	default:
-		log.Fatalf("downloaderPublication: Unknown ObjType %s\n",
+		log.Fatalf("downloaderPublication: Unknown ObjType %s",
 			objType)
 	}
 	return pub

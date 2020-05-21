@@ -7,25 +7,21 @@ WATCHDOG_PID=/run/watchdog/pid
 WATCHDOG_FILE=/run/watchdog/file
 CONFIGDIR=/config
 PERSISTDIR=/persist
-PERSIST_RKT_DATA_DIR=$PERSISTDIR/rkt
-PERSIST_RKT_CNI_DIR=$PERSISTDIR/rkt-cni
+PERSIST_CERTS=$PERSISTDIR/certs
 BINDIR=/opt/zededa/bin
 TMPDIR=/persist/tmp
 ZTMPDIR=/var/tmp/zededa
 DPCDIR=$ZTMPDIR/DevicePortConfig
 FIRSTBOOTFILE=$ZTMPDIR/first-boot
-GCDIR=$PERSISTDIR/config/GlobalConfig
-LOGDIRA=$PERSISTDIR/IMGA/log
-LOGDIRB=$PERSISTDIR/IMGB/log
+GCDIR=$PERSISTDIR/config/ConfigItemValueMap
 AGENTS0="logmanager ledmanager nim nodeagent"
-AGENTS1="zedmanager zedrouter domainmgr downloader verifier identitymgr zedagent baseosmgr wstunnelclient"
+AGENTS1="zedmanager zedrouter domainmgr downloader verifier identitymgr zedagent baseosmgr wstunnelclient volumemgr"
 AGENTS="$AGENTS0 $AGENTS1"
 TPM_DEVICE_PATH="/dev/tpmrm0"
-
 PATH=$BINDIR:$PATH
 
 echo "$(date -Ins -u) Starting device-steps.sh"
-echo "$(date -Ins -u) EVE version: $(cat $BINDIR/versioninfo)"
+echo "$(date -Ins -u) EVE version: $(cat /run/eve-release)"
 
 MEASURE=0
 while [ $# != 0 ]; do
@@ -65,11 +61,14 @@ fi
 mkdir -p $TMPDIR
 export TMPDIR
 
+mkdir -p $PERSISTDIR/containerd
+ln -s $PERSISTDIR/containerd /var/lib/containerd
+
 if ! mount -o remount,flush,dirsync,noatime $CONFIGDIR; then
     echo "$(date -Ins -u) Remount $CONFIGDIR failed"
 fi
 
-DIRS="$CONFIGDIR $ZTMPDIR $CONFIGDIR/DevicePortConfig"
+DIRS="$CONFIGDIR $ZTMPDIR $CONFIGDIR/DevicePortConfig $PERSIST_CERTS"
 
 for d in $DIRS; do
     d1=$(dirname "$d")
@@ -104,25 +103,16 @@ if [ ! -f /config/v2tlsbaseroot-certificates.pem ]; then
     cp -p /etc/ssl/certs/ca-certificates.crt /config/v2tlsbaseroot-certificates.pem
 fi
 sha=$(openssl sha256 /config/v2tlsbaseroot-certificates.pem | awk '{print $2}')
-if [ ! -f "/persist/certs/$sha" ]; then
-    echo "$(date -Ins -u) Adding /config/v2tlsbaseroot-certificates.pem to /persist/certs"
-    cp /config/v2tlsbaseroot-certificates.pem "/persist/certs/$sha"
+if [ ! -f "$PERSIST_CERTS/$sha" ]; then
+    echo "$(date -Ins -u) Adding /config/v2tlsbaseroot-certificates.pem to $PERSIST_CERTS"
+    cp /config/v2tlsbaseroot-certificates.pem "$PERSIST_CERTS/$sha"
 fi
-if [ ! -f /persist/certs/v2tlsbaseroot-certificates.sha256 ]; then
+if [ ! -f "$PERSIST_CERTS/v2tlsbaseroot-certificates.sha256" ]; then
     echo "$(date -Ins -u) Setting /config/v2tlsbaseroot-certificates.pem as current"
-    echo "$sha" >/persist/certs/v2tlsbaseroot-certificates.sha256
+    echo "$sha" >"$PERSIST_CERTS/v2tlsbaseroot-certificates.sha256"
 fi
 
 CONFIGDEV=$(zboot partdev CONFIG)
-
-if [ ! -d $LOGDIRA ]; then
-    echo "$(date -Ins -u) Creating $LOGDIRA"
-    mkdir -p $LOGDIRA
-fi
-if [ ! -d $LOGDIRB ]; then
-    echo "$(date -Ins -u) Creating $LOGDIRB"
-    mkdir -p $LOGDIRB
-fi
 
 P3=$(/hostfs/sbin/findfs PARTLABEL=P3)
 P3_FS_TYPE=$(blkid "$P3"| awk '{print $3}' | sed 's/TYPE=//' | sed 's/"//g')
@@ -130,19 +120,7 @@ if [ -c $TPM_DEVICE_PATH ] && ! [ -f $CONFIGDIR/disable-tpm ] && [ "$P3_FS_TYPE"
     #It is a device with TPM, and formatted with ext4, setup fscrypt
     echo "$(date -Ins -u) EXT4 partitioned $PERSISTDIR, enabling fscrypt"
     #Initialize fscrypt algorithm, hash length etc.
-    $BINDIR/vaultmgr -c "$CURPART" setupVaults
-fi
-
-# FIXME: remove these two once we get rid of rkt (or move it to xen-tools)
-if [ ! -d "$PERSIST_RKT_DATA_DIR" ]; then
-    echo "$(date -Ins -u) Create $PERSIST_RKT_DATA_DIR"
-    mkdir -p "$PERSIST_RKT_DATA_DIR"
-    chmod 700 "$PERSIST_RKT_DATA_DIR"
-fi
-if [ ! -d "$PERSIST_RKT_CNI_DIR" ]; then
-    echo "$(date -Ins -u) Create $PERSIST_RKT_CNI_DIR"
-    mkdir -p "$PERSIST_RKT_CNI_DIR"
-    chmod 744 "$PERSIST_RKT_CNI_DIR"
+    $BINDIR/vaultmgr setupVaults
 fi
 
 if [ -f $PERSISTDIR/IMGA/reboot-reason ]; then
@@ -151,6 +129,7 @@ fi
 if [ -f $PERSISTDIR/IMGB/reboot-reason ]; then
     echo "IMGB reboot-reason: $(cat $PERSISTDIR/IMGB/reboot-reason)"
 fi
+
 if [ -f $PERSISTDIR/reboot-reason ]; then
     echo "Common reboot-reason: $(cat $PERSISTDIR/reboot-reason)"
 fi
@@ -176,13 +155,21 @@ for f in "$dir"/*.json; do
     cp -p "$f" $GCDIR
 done
 
-if ! CURPART=$(zboot curpart); then
-    CURPART="IMGA"
-fi
-
 if [ ! -d $PERSISTDIR/log ]; then
     echo "$(date -Ins -u) Creating $PERSISTDIR/log"
     mkdir $PERSISTDIR/log
+fi
+
+# Run upgradeconverter
+echo "$(date -Ins -u) device-steps: Starting upgradeconverter"
+status=$($BINDIR/upgradeconverter)
+echo "$(date -Ins -u) device-steps: upgradeconverter Completed. Status: $status"
+
+if [ -c $TPM_DEVICE_PATH ] && ! [ -f $CONFIGDIR/disable-tpm ]; then
+    echo "$(date -Ins -u) device-steps: TPM device, creating additional security certificates"
+    if ! $BINDIR/tpmmgr createCerts; then
+        echo "$(date -Ins -u) device-steps: createCerts failed"
+    fi
 fi
 
 # BlinkCounter 1 means we have started; might not yet have IP addresses
@@ -198,8 +185,11 @@ if ! pgrep ledmanager >/dev/null; then
     ledmanager &
     wait_for_touch ledmanager
 fi
+if [ ! -f $CONFIGDIR/device.cert.pem ]; then
+    touch $FIRSTBOOTFILE # For nodeagent
+fi
 echo "$(date -Ins -u) Starting nodeagent"
-$BINDIR/nodeagent -c $CURPART &
+$BINDIR/nodeagent &
 wait_for_touch nodeagent
 
 mkdir -p "$WATCHDOG_PID" "$WATCHDOG_FILE"
@@ -254,7 +244,7 @@ access_usb() {
         if [ -d /mnt/dump ]; then
             echo "$(date -Ins -u) Dumping diagnostics to USB stick"
             # Check if it fits without clobbering an existing tar file
-            if tar cf /mnt/dump/diag1.tar /persist/status/ /persist/config /var/run/ /persist/log "/persist/$CURPART/log"; then
+            if tar cf /mnt/dump/diag1.tar /persist/status/ /persist/config /var/run/ /persist/log "/persist/rsyslog"; then
                 mv /mnt/dump/diag1.tar /mnt/dump/diag.tar
             else
                 rm -f /mnt/dump/diag1.tar
@@ -289,19 +279,19 @@ done
 
 # Get IP addresses
 echo "$(date -Ins -u) Starting nim"
-$BINDIR/nim -c $CURPART &
+$BINDIR/nim &
 wait_for_touch nim
 
 # Restart watchdog ledmanager and nim
 touch "$WATCHDOG_PID/nim.pid" "$WATCHDOG_FILE/nim.touch"
 
 # Print diag output forever on changes
-$BINDIR/diag -c $CURPART -f -o /dev/console &
+$BINDIR/diag -f -o /dev/console &
 
 # Wait for having IP addresses for a few minutes
 # so that we are likely to have an address when we run ntp
 echo "$(date -Ins -u) Starting waitforaddr"
-$BINDIR/waitforaddr -c $CURPART
+$BINDIR/waitforaddr
 
 # Deposit any diag information from nim
 access_usb
@@ -333,7 +323,6 @@ touch "$WATCHDOG_PID/zedclient.pid" \
 
 if [ ! -f $CONFIGDIR/device.cert.pem ]; then
     echo "$(date -Ins -u) Generating a device key pair and self-signed cert (using TPM/TEE if available)"
-    touch $FIRSTBOOTFILE # For zedagent
     touch $CONFIGDIR/self-register-pending
     sync
     blockdev --flushbufs "$CONFIGDEV"
@@ -381,7 +370,7 @@ if [ $SELF_REGISTER = 1 ]; then
         exit 1
     fi
     echo "$(date -Ins -u) Starting client selfRegister getUuid"
-    if ! $BINDIR/client -c $CURPART selfRegister getUuid; then
+    if ! $BINDIR/client selfRegister getUuid; then
         # XXX $? is always zero
         echo "$(date -Ins -u) client selfRegister failed with $?"
         exit 1
@@ -408,7 +397,7 @@ if [ $SELF_REGISTER = 1 ]; then
 else
     echo "$(date -Ins -u) Get UUID in in case device was deleted and recreated with same device cert"
     echo "$(date -Ins -u) Starting client getUuid"
-    $BINDIR/client -c $CURPART getUuid
+    $BINDIR/client getUuid
     if [ ! -f $CONFIGDIR/hardwaremodel ]; then
         echo "$(date -Ins -u) XXX /config/hardwaremodel missing; creating"
         /opt/zededa/bin/hardwaremodel -c >$CONFIGDIR/hardwaremodel
@@ -438,31 +427,31 @@ echo \{\"MaxSpace\":"$space"\} >/var/tmp/zededa/GlobalDownloadConfig/global.json
 # Remove zedclient.pid from watchdog (get back to ledmanager and nim)
 rm "$WATCHDOG_PID/zedclient.pid"
 
+#If logmanager is already running we don't have to start it.
+if ! pgrep logmanager >/dev/null; then
+    echo "$(date -Ins -u) Starting logmanager"
+    $BINDIR/logmanager &
+    wait_for_touch logmanager
+    touch "$WATCHDOG_PID/logmanager.pid" "$WATCHDOG_FILE/logmanager.touch"
+fi
+
 for AGENT in $AGENTS1; do
     echo "$(date -Ins -u) Starting $AGENT"
-    $BINDIR/"$AGENT" -c $CURPART &
+    $BINDIR/"$AGENT" &
     wait_for_touch "$AGENT"
 done
 
 # Start vaultmgr as a service
-$BINDIR/vaultmgr -c "$CURPART" runAsService &
+$BINDIR/vaultmgr runAsService &
 wait_for_touch vaultmgr
 touch "$WATCHDOG_PID/vaultmgr.pid" "$WATCHDOG_FILE/vaultmgr.touch"
 
 # Start tpmmgr as a service
 if [ -c $TPM_DEVICE_PATH ] && ! [ -f $CONFIGDIR/disable-tpm ] ; then
     echo "$(date -Ins -u) Starting tpmmgr as a service agent"
-    $BINDIR/tpmmgr -c "$CURPART" runAsService &
+    $BINDIR/tpmmgr runAsService &
     wait_for_touch tpmmgr
     touch "$WATCHDOG_PID/tpmmgr.pid" "$WATCHDOG_FILE/tpmmgr.touch"
-fi
-
-#If logmanager is already running we don't have to start it.
-if ! pgrep logmanager >/dev/null; then
-    echo "$(date -Ins -u) Starting logmanager"
-    $BINDIR/logmanager -c $CURPART &
-    wait_for_touch logmanager
-    touch "$WATCHDOG_PID/logmanager.pid" "$WATCHDOG_FILE/logmanager.touch"
 fi
 
 # Now run watchdog for all agents
@@ -483,7 +472,7 @@ if [ $MEASURE = 1 ]; then
     echo "$(date -Ins -u) Measurement done"
 fi
 
-echo "$(date -Ins -u) Done starting EVE version: $(cat $BINDIR/versioninfo)"
+echo "$(date -Ins -u) Done starting EVE version: $(cat /run/eve-release)"
 
 # If there is a USB stick inserted and debug.enable.usb is set, we periodically
 # check for any usb.json with DevicePortConfig, deposit our identity,

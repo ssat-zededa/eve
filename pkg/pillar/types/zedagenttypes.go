@@ -4,9 +4,10 @@
 package types
 
 import (
+	"fmt"
 	"time"
 
-	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
@@ -47,6 +48,50 @@ func (config BaseOsConfig) VerifyFilename(fileName string) bool {
 	return ret
 }
 
+// LogCreate :
+func (config BaseOsConfig) LogCreate() {
+	logObject := base.NewLogObject(base.BaseOsConfigLogType, config.BaseOsVersion,
+		config.UUIDandVersion.UUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("activate", config.Activate).
+		Infof("BaseOs config create")
+}
+
+// LogModify :
+func (config BaseOsConfig) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.BaseOsConfigLogType, config.BaseOsVersion,
+		config.UUIDandVersion.UUID, config.LogKey())
+
+	oldConfig, ok := old.(BaseOsConfig)
+	if !ok {
+		log.Errorf("LogModify: Old object interface passed is not of BaseOsConfig type")
+	}
+	if oldConfig.Activate != config.Activate {
+
+		logObject.CloneAndAddField("activate", config.Activate).
+			AddField("old-activate", oldConfig.Activate).
+			Infof("BaseOs config modify")
+	}
+
+}
+
+// LogDelete :
+func (config BaseOsConfig) LogDelete() {
+	logObject := base.EnsureLogObject(base.BaseOsConfigLogType, config.BaseOsVersion,
+		config.UUIDandVersion.UUID, config.LogKey())
+	logObject.CloneAndAddField("activate", config.Activate).
+		Infof("BaseOs config delete")
+
+	base.DeleteLogObject(config.LogKey())
+}
+
+// LogKey :
+func (config BaseOsConfig) LogKey() string {
+	return string(base.BaseOsConfigLogType) + "-" + config.BaseOsVersion
+}
+
 // Indexed by UUIDandVersion as above
 type BaseOsStatus struct {
 	UUIDandVersion    UUIDandVersion
@@ -65,8 +110,8 @@ type BaseOsStatus struct {
 	// Error* set implies error.
 	State SwState
 	// error strings across all steps/StorageStatus
-	Error     string
-	ErrorTime time.Time
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 func (status BaseOsStatus) Key() string {
@@ -93,6 +138,57 @@ func (status BaseOsStatus) CheckPendingModify() bool {
 
 func (status BaseOsStatus) CheckPendingDelete() bool {
 	return false
+}
+
+// LogCreate :
+func (status BaseOsStatus) LogCreate() {
+	logObject := base.NewLogObject(base.BaseOsStatusLogType, status.BaseOsVersion,
+		status.UUIDandVersion.UUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("state", status.State.String()).
+		Infof("BaseOs status create")
+}
+
+// LogModify :
+func (status BaseOsStatus) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.BaseOsStatusLogType, status.BaseOsVersion,
+		status.UUIDandVersion.UUID, status.LogKey())
+
+	oldStatus, ok := old.(BaseOsStatus)
+	if !ok {
+		log.Errorf("LogModify: Old object interface passed is not of BaseOsStatus type")
+	}
+	if oldStatus.State != status.State {
+
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("old-state", oldStatus.State.String()).
+			Infof("BaseOs status modify")
+	}
+
+	if status.HasError() {
+		errAndTime := status.ErrorAndTime
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("error", errAndTime.Error).
+			AddField("error-time", errAndTime.ErrorTime).
+			Errorf("BaseOs status modify")
+	}
+}
+
+// LogDelete :
+func (status BaseOsStatus) LogDelete() {
+	logObject := base.EnsureLogObject(base.BaseOsStatusLogType, status.BaseOsVersion,
+		status.UUIDandVersion.UUID, status.LogKey())
+	logObject.CloneAndAddField("state", status.State.String()).
+		Infof("BaseOs status delete")
+
+	base.DeleteLogObject(status.LogKey())
+}
+
+// LogKey :
+func (status BaseOsStatus) LogKey() string {
+	return string(base.BaseOsStatusLogType) + "-" + status.BaseOsVersion
 }
 
 // captures the certificate config currently embeded
@@ -131,8 +227,8 @@ type CertObjStatus struct {
 	// Error* set implies error.
 	State SwState
 	// error strings across all steps/StorageStatus
-	Error     string
-	ErrorTime time.Time
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 func (status CertObjStatus) Key() string {
@@ -166,32 +262,34 @@ func (status CertObjStatus) CheckPendingDelete() bool {
 //  - whether the cert object status is found
 //  - whether the cert object is installed
 //  - any error information
-func (status CertObjStatus) getCertStatus(certURL string) (bool, bool, ErrorInfo) {
+func (status CertObjStatus) getCertStatus(certURL string) (bool, bool, ErrorAndTime) {
 	for _, certObj := range status.StorageStatusList {
 		if certObj.Name == certURL {
 			installed := true
-			if certObj.Error != "" || certObj.State != INSTALLED {
+			if certObj.HasError() || certObj.State != INSTALLED {
 				installed = false
 			}
-			return true, installed, certObj.GetErrorInfo()
+			// An Error in StorageStatus can be from
+			// DownloaderStatus with changing timestamp
+			// from re-trying the download. Carry that to caller.
+			return true, installed, ErrorAndTime{
+				Error:     certObj.Error,
+				ErrorTime: certObj.ErrorTime,
+			}
 		}
 	}
-	errorInfo := ErrorInfo{
-		Error:       "Invalid Certificate, not found",
-		ErrorSource: pubsub.TypeToName(VerifyImageStatus{}),
-		ErrorTime:   time.Now(),
+	return false, false, ErrorAndTime{
+		Error:     fmt.Sprintf("Invalid Certificate %s, not found", certURL),
+		ErrorTime: time.Now(),
 	}
-	return false, false, errorInfo
 }
 
 // return value holder
 type RetStatus struct {
-	Changed          bool
-	MinState         SwState
-	WaitingForCerts  bool
-	MissingDatastore bool
-	AllErrors        string
-	ErrorTime        time.Time
+	Changed   bool
+	MinState  SwState
+	AllErrors string
+	ErrorTime time.Time
 }
 
 // Mirrors proto definition for ConfigItem
@@ -222,15 +320,16 @@ type DatastoreConfig struct {
 	UUID     uuid.UUID
 	DsType   string
 	Fqdn     string
-	ApiKey   string // XXX: to be deprecated, use CipherBlock instead
-	Password string // XXX: to be deprecated, use CipherBlock instead
+	ApiKey   string // XXX: to be deprecated, use CipherBlockStatus instead
+	Password string // XXX: to be deprecated, use CipherBlockStatus instead
 	Dpath    string // depending on DsType, it could be bucket or path
 	Region   string
 
-	// CipherBlock, for encrypted credentials
-	CipherBlock
+	// CipherBlockStatus, for encrypted credentials
+	CipherBlockStatus
 }
 
+// Key is the key in pubsub
 func (config DatastoreConfig) Key() string {
 	return config.UUID.String()
 }
@@ -246,6 +345,7 @@ type NodeAgentStatus struct {
 	RebootStack       string    // From last reboot
 	RebootTime        time.Time // From last reboot
 	RestartCounter    uint32
+	RebootImage       string
 }
 
 // Key :
@@ -275,4 +375,11 @@ type ZedAgentStatus struct {
 // Key :
 func (status ZedAgentStatus) Key() string {
 	return status.Name
+}
+
+// DeviceOpsCmd - copy of zconfig.DeviceOpsCmd
+type DeviceOpsCmd struct {
+	Counter      uint32
+	DesiredState bool
+	OpsTime      string
 }

@@ -16,9 +16,9 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
-	pubsublegacy "github.com/lf-edge/eve/pkg/pillar/pubsub/legacy"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
+	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -47,6 +47,7 @@ type wstunnelclientContext struct {
 	serverNameAndPort    string
 	wstunnelclient       *zedcloud.WSTunnelClient
 	dnsContext           *DNSContext
+	devUUID              uuid.UUID
 	// XXX add any output from scanAIConfigs()?
 }
 
@@ -56,7 +57,6 @@ var debugOverride bool // From command line arg
 func Run(ps *pubsub.PubSub) {
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
@@ -65,16 +65,11 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	curpart := *curpartPtr
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
 		return
 	}
-	logf, err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logf.Close()
+	agentlog.Init(agentName)
 	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
 		log.Fatal(err)
 	}
@@ -92,28 +87,34 @@ func Run(ps *pubsub.PubSub) {
 	wscCtx := wstunnelclientContext{}
 
 	// Look for global config such as log levels
-	subGlobalConfig, err := pubsublegacy.Subscribe("", types.GlobalConfig{},
-		false, &wscCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleGlobalConfigModify,
-			ModifyHandler: handleGlobalConfigModify,
-			DeleteHandler: handleGlobalConfigDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "",
+		TopicImpl:     types.ConfigItemValueMap{},
+		Activate:      false,
+		Ctx:           &wscCtx,
+		CreateHandler: handleGlobalConfigModify,
+		ModifyHandler: handleGlobalConfigModify,
+		DeleteHandler: handleGlobalConfigDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	wscCtx.subGlobalConfig = subGlobalConfig
 	subGlobalConfig.Activate()
 
-	subDeviceNetworkStatus, err := pubsublegacy.Subscribe("nim",
-		types.DeviceNetworkStatus{}, false, &DNSctx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleDNSModify,
-			ModifyHandler: handleDNSModify,
-			DeleteHandler: handleDNSDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "nim",
+		TopicImpl:     types.DeviceNetworkStatus{},
+		Activate:      false,
+		Ctx:           &DNSctx,
+		CreateHandler: handleDNSModify,
+		ModifyHandler: handleDNSModify,
+		DeleteHandler: handleDNSDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -122,14 +123,17 @@ func Run(ps *pubsub.PubSub) {
 
 	// Look for AppInstanceConfig from zedagent
 	// XXX is it better to look for AppInstanceStatus from zedmanager?
-	subAppInstanceConfig, err := pubsublegacy.Subscribe("zedagent",
-		types.AppInstanceConfig{}, false, &wscCtx, &pubsub.SubscriptionOptions{
-			CreateHandler: handleAppInstanceConfigModify,
-			ModifyHandler: handleAppInstanceConfigModify,
-			DeleteHandler: handleAppInstanceConfigDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subAppInstanceConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		TopicImpl:     types.AppInstanceConfig{},
+		Activate:      false,
+		Ctx:           &wscCtx,
+		CreateHandler: handleAppInstanceConfigModify,
+		ModifyHandler: handleAppInstanceConfigModify,
+		DeleteHandler: handleAppInstanceConfigDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -143,6 +147,19 @@ func Run(ps *pubsub.PubSub) {
 	wscCtx.serverNameAndPort = strings.TrimSpace(string(bytes))
 
 	subAppInstanceConfig.Activate()
+
+	if zedcloud.UseV2API() {
+		b, err := ioutil.ReadFile(types.UUIDFileName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		uuidStr := strings.TrimSpace(string(b))
+		wscCtx.devUUID, err = uuid.FromString(uuidStr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Infof("Read devUUID %s\n", wscCtx.devUUID.String())
+	}
 
 	// Pick up debug aka log level before we start real work
 	for !wscCtx.GCInitialized {
@@ -196,7 +213,7 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigModify for %s\n", key)
-	var gcp *types.GlobalConfig
+	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
 	if gcp != nil {
@@ -344,7 +361,7 @@ func scanAIConfigs(ctx *wstunnelclientContext) {
 
 			proxyURL, _ := zedcloud.LookupProxy(deviceNetworkStatus,
 				ifname, destURL)
-			if err := wstunnelclient.TestConnection(deviceNetworkStatus, proxyURL, localAddr); err != nil {
+			if err := wstunnelclient.TestConnection(deviceNetworkStatus, proxyURL, localAddr, ctx.devUUID); err != nil {
 				log.Info(err)
 				continue
 			}

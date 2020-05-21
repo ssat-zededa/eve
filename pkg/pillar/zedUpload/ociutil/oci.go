@@ -3,17 +3,20 @@ package ociutil
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path"
+	"strings"
+
+	"sync/atomic"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	log "github.com/sirupsen/logrus"
-	"sync/atomic"
 )
 
 const (
@@ -30,25 +33,6 @@ type UpdateStats struct {
 
 // NotifChan channel for sending status updates
 type NotifChan chan UpdateStats
-
-// CustomWriter is a writer which will send the download progress
-type CustomWriter struct {
-	fp        *os.File
-	upSize    UpdateStats
-	prgNotify NotifChan
-}
-
-func (r *CustomWriter) Write(p []byte) (int, error) {
-	n, err := r.fp.Write(p)
-	if err != nil {
-		return n, err
-	}
-	atomic.AddInt64(&r.upSize.Asize, int64(n))
-
-	sendStats(r.prgNotify, r.upSize)
-
-	return n, err
-}
 
 // Tags return all known tags for a given repository on a given registry.
 // Optionally, can use authentication of username and apiKey as provided, else defaults
@@ -136,23 +120,50 @@ func Pull(registry, repo, localFile, username, apiKey string, client *http.Clien
 	if err != nil {
 		return manifestDirect, manifestResolved, size, err
 	}
-
-	cWriter := &CustomWriter{
-		fp:        w,
-		upSize:    stats,
-		prgNotify: prgchan,
-	}
 	defer w.Close()
+
+	tag, ok := ref.(name.Tag)
+	if !ok {
+		d, ok := ref.(name.Digest)
+		if !ok {
+			err := fmt.Errorf("Image name %s doesn't have a tag or digest", ref)
+			return manifestDirect, manifestResolved, size, err
+		}
+		parts := strings.Split(d.DigestStr(), ":")
+		if len(parts) != 2 {
+			err := fmt.Errorf("Image name %s is malformed, expected: <name>@sha256:<hash>", d.String())
+			return manifestDirect, manifestResolved, size, err
+		}
+		digestTag := fmt.Sprintf("dummyTag-%s", parts[1])
+		tag = d.Repository.Tag(digestTag)
+	}
+
+	// get updates on downloads, convert and pass them to sendStats
+	c := make(chan v1.Update, 200)
+	defer close(c)
 
 	// create a local file to write the output
 	// this uses the v1/tarball to write it, which is fully compatible with docker save.
 	// However, it is missing the "repositories" file, so we add it.
 	// Eventially, we may want to move to an entire cache of the registry in the
 	// OCI layout format.
-	err = tarball.Write(ref, img, cWriter)
-	if err != nil {
-		return manifestDirect, manifestResolved, size, fmt.Errorf("error saving to %s: %v", localFile, err)
+	go func() {
+		// we do not need to catch the return error, because tarball.WithProgress sends error updates on channels
+		_ = tarball.Write(tag, img, w, tarball.WithProgress(c))
+	}()
+
+	for update := range c {
+		atomic.StoreInt64(&stats.Asize, update.Complete)
+		sendStats(prgchan, stats)
+		// EOF means we are at the end
+		if update.Error != nil && update.Error == io.EOF {
+			break
+		}
+		if update.Error != nil {
+			return manifestDirect, manifestResolved, size, fmt.Errorf("error saving to %s: %v", localFile, update.Error)
+		}
 	}
+
 	return manifestDirect, manifestResolved, size, nil
 }
 

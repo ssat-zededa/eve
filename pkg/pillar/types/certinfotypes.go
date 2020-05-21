@@ -4,20 +4,24 @@
 package types
 
 import (
-	"encoding/base64"
-	//zcert "github.com/lf-edge/eve/api/go/certs"
+	"encoding/hex"
+
+	zcert "github.com/lf-edge/eve/api/go/certs"
+	zcommon "github.com/lf-edge/eve/api/go/evecommon"
 )
 
-// ControllerCertificate : controller certicate
-type ControllerCertificate struct {
-	//	HashAlgo zcert.ZCertHashAlgorithm
-	//	Type     zcert.ZCertType
-	//	Attr     zcert.ZCertProperties
+// ControllerCert : controller certicate
+// config received from controller
+type ControllerCert struct {
+	HashAlgo zcommon.HashAlgorithm
+	Type     zcert.ZCertType
 	Cert     []byte
 	CertHash []byte
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 // Key :
-func (cert *ControllerCertificate) Key() string {
-	return base64.StdEncoding.EncodeToString(cert.CertHash)
+func (cert *ControllerCert) Key() string {
+	return hex.EncodeToString(cert.CertHash)
 }

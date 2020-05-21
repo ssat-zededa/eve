@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
-	"github.com/lf-edge/eve/pkg/pillar/diskmetrics"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
@@ -34,20 +33,19 @@ const (
 
 // Go doesn't like this as a constant
 var (
-	debug              = false
-	debugOverride      bool                               // From command line arg
-	downloadGCTime     = time.Duration(600) * time.Second // Unless from GlobalConfig
-	downloadRetryTime  = time.Duration(600) * time.Second // Unless from GlobalConfig
-	downloaderObjTypes = []string{types.AppImgObj, types.BaseOsObj, types.CertObj}
-	Version            = "No version specified" // Set from Makefile
-	nilUUID            uuid.UUID                // should be a const, just the default nil value of uuid.UUID
-	dHandler           = makeDownloadHandler()
+	debug          = false
+	debugOverride  bool                               // From command line arg
+	downloadGCTime = time.Duration(600) * time.Second // Unless from GlobalConfig
+	retryTime      = time.Duration(600) * time.Second // Unless from GlobalConfig
+	Version        = "No version specified"           // Set from Makefile
+	nilUUID        uuid.UUID                          // should be a const, just the default nil value of uuid.UUID
+	dHandler       = makeDownloadHandler()
+	resHandler     = makeResolveHandler()
 )
 
 func Run(ps *pubsub.PubSub) {
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
@@ -56,21 +54,16 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	curpart := *curpartPtr
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
 		return
 	}
-	logf, err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logf.Close()
+	agentlog.Init(agentName)
 
 	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
 		log.Fatal(err)
 	}
-	log.Infof("Starting %s\n", agentName)
+	log.Infof("Starting %s", agentName)
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
@@ -118,7 +111,7 @@ func Run(ps *pubsub.PubSub) {
 	// Also ensure GlobalDownloadConfig has been read
 	for types.CountLocalAddrAnyNoLinkLocal(ctx.deviceNetworkStatus) == 0 ||
 		ctx.globalConfig.MaxSpace == 0 {
-		log.Infof("Waiting for management port addresses or Global Config\n")
+		log.Infof("Waiting for management port addresses or Global Config")
 
 		select {
 		case change := <-ctx.subGlobalConfig.MsgChan():
@@ -136,7 +129,7 @@ func Run(ps *pubsub.PubSub) {
 		}
 		agentlog.StillRunning(agentName, warningTime, errorTime)
 	}
-	log.Infof("Have %d management ports addresses to use\n",
+	log.Infof("Have %d management ports addresses to use",
 		types.CountLocalAddrAnyNoLinkLocal(ctx.deviceNetworkStatus))
 
 	ctx.dCtx = downloaderInit(&ctx)
@@ -147,6 +140,12 @@ func Run(ps *pubsub.PubSub) {
 
 	for {
 		select {
+		case change := <-ctx.decryptCipherContext.SubControllerCert.MsgChan():
+			ctx.decryptCipherContext.SubControllerCert.ProcessChange(change)
+
+		case change := <-ctx.decryptCipherContext.SubCipherContext.MsgChan():
+			ctx.decryptCipherContext.SubCipherContext.ProcessChange(change)
+
 		case change := <-ctx.subGlobalConfig.MsgChan():
 			ctx.subGlobalConfig.ProcessChange(change)
 
@@ -158,6 +157,9 @@ func Run(ps *pubsub.PubSub) {
 
 		case change := <-ctx.subAppImgConfig.MsgChan():
 			ctx.subAppImgConfig.ProcessChange(change)
+
+		case change := <-ctx.subAppImgResolveConfig.MsgChan():
+			ctx.subAppImgResolveConfig.ProcessChange(change)
 
 		case change := <-ctx.subBaseOsConfig.MsgChan():
 			ctx.subBaseOsConfig.ProcessChange(change)
@@ -219,7 +221,7 @@ func lookupDownloaderStatus(ctx *downloaderContext, objType string,
 	pub := ctx.publication(objType)
 	st, _ := pub.Get(key)
 	if st == nil {
-		log.Infof("lookupDownloaderStatus(%s) not found\n", key)
+		log.Infof("lookupDownloaderStatus(%s) not found", key)
 		return nil
 	}
 	status := st.(types.DownloaderStatus)
@@ -232,7 +234,7 @@ func lookupDownloaderConfig(ctx *downloaderContext, objType string,
 	sub := ctx.subscription(objType)
 	c, _ := sub.Get(key)
 	if c == nil {
-		log.Infof("lookupDownloaderConfig(%s) not found\n", key)
+		log.Infof("lookupDownloaderConfig(%s) not found", key)
 		return nil
 	}
 	config := c.(types.DownloaderConfig)
@@ -243,9 +245,9 @@ func lookupDownloaderConfig(ctx *downloaderContext, objType string,
 func runHandler(ctx *downloaderContext, objType string, key string,
 	c <-chan Notify) {
 
-	log.Infof("runHandler starting\n")
+	log.Infof("runHandler starting")
 
-	max := float64(downloadRetryTime)
+	max := float64(retryTime)
 	min := max * 0.3
 	ticker := flextimer.NewRangeTicker(time.Duration(min),
 		time.Duration(max))
@@ -280,14 +282,14 @@ func runHandler(ctx *downloaderContext, objType string, key string,
 				// XXX stop timer
 			}
 		case <-ticker.C:
-			log.Debugf("runHandler(%s) timer\n", key)
+			log.Debugf("runHandler(%s) timer", key)
 			status := lookupDownloaderStatus(ctx, objType, key)
 			if status != nil {
 				maybeRetryDownload(ctx, status)
 			}
 		}
 	}
-	log.Infof("runHandler(%s) DONE\n", key)
+	log.Infof("runHandler(%s) DONE", key)
 }
 
 func maybeRetryDownload(ctx *downloaderContext,
@@ -295,30 +297,30 @@ func maybeRetryDownload(ctx *downloaderContext,
 
 	// object is either in download progress or,
 	// successfully downloaded, nothing to do
-	if status.LastErr == "" {
+	if !status.HasError() {
 		return
 	}
 	t := time.Now()
-	elapsed := t.Sub(status.LastErrTime)
-	if elapsed < downloadRetryTime {
-		log.Infof("maybeRetryDownload(%s) %d remaining\n",
+	elapsed := t.Sub(status.ErrorTime)
+	if elapsed < retryTime {
+		log.Infof("maybeRetryDownload(%s) %d remaining",
 			status.Key(),
-			(downloadRetryTime-elapsed)/time.Second)
+			(retryTime-elapsed)/time.Second)
 		return
 	}
-	log.Infof("maybeRetryDownload(%s) after %s at %v\n",
-		status.Key(), status.LastErr, status.LastErrTime)
+	log.Infof("maybeRetryDownload(%s) after %s at %v",
+		status.Key(), status.Error, status.ErrorTime)
 
 	config := lookupDownloaderConfig(ctx, status.ObjType, status.Key())
 	if config == nil {
-		log.Infof("maybeRetryDownload(%s) no config\n",
+		log.Infof("maybeRetryDownload(%s) no config",
 			status.Key())
 		return
 	}
 
-	// reset ErrorInfo, to start download again
+	// reset Error, to start download again
 	status.RetryCount++
-	status.ClearErrorInfo()
+	status.ClearError()
 	publishDownloaderStatus(ctx, status)
 
 	doDownload(ctx, *config, status)
@@ -327,11 +329,11 @@ func maybeRetryDownload(ctx *downloaderContext,
 func handleCreate(ctx *downloaderContext, objType string,
 	config types.DownloaderConfig, status *types.DownloaderStatus, key string) {
 
-	log.Infof("handleCreate(%s) objType %s for %s\n",
+	log.Infof("handleCreate(%s) objType %s for %s",
 		config.ImageID, objType, config.Name)
 
 	if objType == "" {
-		log.Fatalf("handleCreate: No ObjType for %s\n",
+		log.Fatalf("handleCreate: No ObjType for %s",
 			config.ImageID)
 	}
 	if status == nil {
@@ -340,8 +342,9 @@ func handleCreate(ctx *downloaderContext, objType string,
 			ImageID:          config.ImageID,
 			DatastoreID:      config.DatastoreID,
 			Name:             config.Name,
+			ImageSha256:      config.ImageSha256,
 			ObjType:          objType,
-			IsContainer:      config.IsContainer,
+			State:            types.DOWNLOADING,
 			RefCount:         config.RefCount,
 			LastUse:          time.Now(),
 			AllowNonFreePort: config.AllowNonFreePort,
@@ -353,10 +356,12 @@ func handleCreate(ctx *downloaderContext, objType string,
 		// should trigger a fresh download of the object
 		status.ImageID = config.ImageID
 		status.DatastoreID = config.DatastoreID
-		status.IsContainer = config.IsContainer
+		status.ImageSha256 = config.ImageSha256
+		status.State = types.DOWNLOADING
 		status.RefCount = config.RefCount
 		status.LastUse = time.Now()
 		status.Expired = false
+		status.ClearError()
 	}
 	publishDownloaderStatus(ctx, status)
 
@@ -370,39 +375,25 @@ func handleCreate(ctx *downloaderContext, objType string,
 func handleModify(ctx *downloaderContext, key string,
 	config types.DownloaderConfig, status *types.DownloaderStatus) {
 
-	log.Infof("handleModify(%s) objType %s for %s\n",
+	log.Infof("handleModify(%s) objType %s for %s",
 		status.ImageID, status.ObjType, status.Name)
 
 	status.PendingModify = true
 	publishDownloaderStatus(ctx, status)
 
 	if status.ObjType == "" {
-		log.Fatalf("handleModify: No ObjType for %s\n",
+		log.Fatalf("handleModify: No ObjType for %s",
 			status.ImageID)
 	}
-	if config.Name != status.Name {
-		errStr := fmt.Sprintf("Name changed - not allowed %s -> %s\n",
-			config.Name, status.Name)
-		status.RetryCount++
-		status.HandleDownloadFail(errStr)
-		publishDownloaderStatus(ctx, status)
-		log.Errorf("handleModify(%s): failed with %s\n", config.Name, errStr)
-		return
-	}
 
-	log.Infof("handleModify(%s) RefCount %d to %d, Expired %v for %s\n",
+	log.Infof("handleModify(%s) RefCount %d to %d, Expired %v for %s",
 		status.ImageID, status.RefCount, config.RefCount,
 		status.Expired, status.Name)
 
-	if config.IsContainer != status.IsContainer {
-		log.Infof("handleModify: Setting IsContainer to %t for %s",
-			config.IsContainer, status.ImageID)
-		status.IsContainer = config.IsContainer
-		publishDownloaderStatus(ctx, status)
-	}
-	// If RefCount from zero to non-zero then do install
-	if status.RefCount == 0 && config.RefCount != 0 {
-		log.Infof("handleModify installing %s\n", config.Name)
+	// If RefCount from zero to non-zero and status has error
+	// or status is not downloaded then do install
+	if config.RefCount != 0 && (status.HasError() || status.State != types.DOWNLOADED) {
+		log.Infof("handleModify installing %s", config.Name)
 		handleCreate(ctx, status.ObjType, config, status, key)
 	} else if status.RefCount != config.RefCount {
 		status.RefCount = config.RefCount
@@ -411,18 +402,23 @@ func handleModify(ctx *downloaderContext, key string,
 	status.Expired = false
 	status.ClearPendingStatus()
 	publishDownloaderStatus(ctx, status)
-	log.Infof("handleModify done for %s\n", config.Name)
+	log.Infof("handleModify done for %s", config.Name)
 }
 
-func doDelete(ctx *downloaderContext, key string, locDirname string,
+func doDelete(ctx *downloaderContext, key string, filename string,
 	status *types.DownloaderStatus) {
 
-	log.Infof("doDelete(%s) for %s\n", status.ImageID, status.Name)
+	log.Infof("doDelete(%s) for %s", status.ImageID, status.Name)
 
-	deletefile(locDirname+"/pending", status)
+	if _, err := os.Stat(filename); err == nil {
+		log.Infof("Deleting %s", filename)
+		if err := os.RemoveAll(filename); err != nil {
+			log.Errorf("Failed to remove %s: err %s",
+				filename, err)
+		}
+	}
 
 	status.State = types.INITIAL
-	deleteSpace(ctx, status)
 
 	// XXX Asymmetric; handleCreate reserved on RefCount 0. We unreserve
 	// going back to RefCount 0. FIXed
@@ -439,101 +435,58 @@ func doDownload(ctx *downloaderContext, config types.DownloaderConfig, status *t
 		status.RetryCount++
 		status.HandleDownloadFail(errStr)
 		publishDownloaderStatus(ctx, status)
-		log.Errorf("doDownload(%s): deferred with %s\n", config.Name, errStr)
+		log.Errorf("doDownload(%s): deferred with %s", config.Name, errStr)
 		return
 	}
 
 	dst, errStr := lookupDatastoreConfig(ctx, config.DatastoreID, config.Name)
 	if dst == nil {
 		status.RetryCount++
+		// XXX can we have a faster retry in this case?
+		// React when DatastoreConfig changes?
 		status.HandleDownloadFail(errStr)
 		publishDownloaderStatus(ctx, status)
-		log.Errorf("doDownload(%s): deferred with %s\n", config.Name, errStr)
+		log.Errorf("doDownload(%s): deferred with %s", config.Name, errStr)
 		return
 	}
 
-	// try to reserve storage, must be released on error
-	kb := types.RoundupToKB(config.Size)
-	if ret, errStr := tryReserveSpace(ctx, status, kb); !ret {
-		status.RetryCount++
-		status.HandleDownloadFail(errStr)
-		publishDownloaderStatus(ctx, status)
-		log.Errorf("doDownload(%s): deferred with %s\n", config.Name, errStr)
-		return
-	}
 	handleSyncOp(ctx, status.Key(), config, status, dst)
-}
-
-func deletefile(dirname string, status *types.DownloaderStatus) {
-	// XXX common routines to determine pathname?
-	dirname = dirname + "/" + status.ImageID.String()
-
-	// XXX delete whole directory?
-	if _, err := os.Stat(dirname); err == nil {
-		log.Infof("Deleting %s\n", dirname)
-		// Remove directory
-		if err := os.RemoveAll(dirname); err != nil {
-			log.Errorf("Failed to remove %s: err %s\n",
-				dirname, err)
-		}
-	}
 }
 
 func handleDelete(ctx *downloaderContext, key string,
 	status *types.DownloaderStatus) {
 
-	log.Infof("handleDelete(%s) objType %s for %s RefCount %d LastUse %v Expired %v\n",
+	log.Infof("handleDelete(%s) objType %s for %s RefCount %d LastUse %v Expired %v",
 		status.ImageID, status.ObjType, status.Name,
 		status.RefCount, status.LastUse, status.Expired)
 
 	if status.ObjType == "" {
-		log.Fatalf("handleDelete: No ObjType for %s\n",
+		log.Fatalf("handleDelete: No ObjType for %s",
 			status.ImageID)
 	}
-	locDirname := types.DownloadDirname + "/" + status.ObjType
 
 	status.PendingDelete = true
 	publishDownloaderStatus(ctx, status)
 
-	// Update globalStatus and status
-	unreserveSpace(ctx, status)
-
-	publishDownloaderStatus(ctx, status)
-
-	doDelete(ctx, key, locDirname, status)
+	doDelete(ctx, key, status.Target, status)
 
 	status.PendingDelete = false
 	publishDownloaderStatus(ctx, status)
 
 	// Write out what we modified to DownloaderStatus aka delete
 	unpublishDownloaderStatus(ctx, status)
-	log.Infof("handleDelete done for %s, %s\n", status.Name,
-		locDirname)
+	log.Infof("handleDelete done for %s", status.Name)
 }
 
 // helper functions
 
 func downloaderInit(ctx *downloaderContext) *zedUpload.DronaCtx {
 
-	initializeDirs()
-
-	log.Infof("MaxSpace %d\n", ctx.globalConfig.MaxSpace)
-
-	// XXX how do we find out when verifier cleans up duplicates etc?
-	// XXX run this periodically... What about downloads inprogress
-	// when we run it?
-	// XXX look at verifier and downloader status which have Size
-	// We read types.DownloadDirname/* and determine how much space
-	// is used. Place in GlobalDownloadStatus. Calculate remaining space.
-	totalUsed := diskmetrics.SizeFromDir(types.DownloadDirname)
-	kb := types.RoundupToKB(totalUsed)
-	initSpace(ctx, kb)
-
 	// create drona interface
 	dCtx, err := zedUpload.NewDronaCtx("zdownloader", 0)
 
 	if dCtx == nil {
-		log.Errorf("context create fail %s\n", err)
+		log.Errorf("context create fail %s", err)
 		log.Fatal(err)
 	}
 
@@ -542,11 +495,12 @@ func downloaderInit(ctx *downloaderContext) *zedUpload.DronaCtx {
 
 // If an object has a zero RefCount and dropped to zero more than
 // downloadGCTime ago, then we delete the Status. That will result in the
-// user (zedmanager or baseosmgr) deleting the Config, unless a RefCount
+// user (volumemgr) deleting the Config, unless a RefCount
 // increase is underway.
 // XXX Note that this runs concurrently with the handler.
+// XXX needed for downloader?
 func gcObjects(ctx *downloaderContext) {
-	log.Debugf("gcObjects()\n")
+	log.Debugf("gcObjects()")
 	publications := []pubsub.Publication{
 		ctx.pubAppImgStatus,
 		ctx.pubBaseOsStatus,
@@ -557,18 +511,18 @@ func gcObjects(ctx *downloaderContext) {
 		for _, st := range items {
 			status := st.(types.DownloaderStatus)
 			if status.RefCount != 0 {
-				log.Debugf("gcObjects: skipping RefCount %d: %s\n",
+				log.Debugf("gcObjects: skipping RefCount %d: %s",
 					status.RefCount, status.Key())
 				continue
 			}
 			timePassed := time.Since(status.LastUse)
 			if timePassed < downloadGCTime {
-				log.Debugf("gcObjects: skipping recently used %s remains %d seconds\n",
+				log.Debugf("gcObjects: skipping recently used %s remains %d seconds",
 					status.Key(),
 					(timePassed-downloadGCTime)/time.Second)
 				continue
 			}
-			log.Infof("gcObjects: expiring status for %s; LastUse %v now %v\n",
+			log.Infof("gcObjects: expiring status for %s; LastUse %v now %v",
 				status.Key(), status.LastUse, time.Now())
 			status.Expired = true
 			publishDownloaderStatus(ctx, &status)
@@ -576,16 +530,12 @@ func gcObjects(ctx *downloaderContext) {
 	}
 }
 
-func publishGlobalStatus(ctx *downloaderContext) {
-	ctx.pubGlobalDownloadStatus.Publish("global", ctx.globalStatus)
-}
-
 func publishDownloaderStatus(ctx *downloaderContext,
 	status *types.DownloaderStatus) {
 
 	pub := ctx.publication(status.ObjType)
 	key := status.Key()
-	log.Debugf("publishDownloaderStatus(%s)\n", key)
+	log.Debugf("publishDownloaderStatus(%s)", key)
 	pub.Publish(key, *status)
 }
 
@@ -594,10 +544,10 @@ func unpublishDownloaderStatus(ctx *downloaderContext,
 
 	pub := ctx.publication(status.ObjType)
 	key := status.Key()
-	log.Debugf("unpublishDownloaderStatus(%s)\n", key)
+	log.Debugf("unpublishDownloaderStatus(%s)", key)
 	st, _ := pub.Get(key)
 	if st == nil {
-		log.Errorf("unpublishDownloaderStatus(%s) not found\n", key)
+		log.Errorf("unpublishDownloaderStatus(%s) not found", key)
 		return
 	}
 	pub.Unpublish(key)
@@ -621,7 +571,7 @@ func lookupDatastoreConfig(ctx *downloaderContext, dsID uuid.UUID,
 		log.Errorln(errStr)
 		return nil, errStr
 	}
-	log.Debugf("Found datastore(%s) for %s\n", dsID, name)
+	log.Debugf("Found datastore(%s) for %s", dsID, name)
 	dst := cfg.(types.DatastoreConfig)
 	return &dst, ""
 }

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	dbg "runtime/debug"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -20,60 +21,14 @@ import (
 )
 
 const (
-	reasonFile = "reboot-reason"
-	stackFile  = "reboot-stack"
+	reasonFile  = "reboot-reason"
+	stackFile   = "reboot-stack"
+	rebootImage = "reboot-image"
 )
 
 var savedAgentName = "unknown" // Keep for signal and exit handlers
 var savedRebootReason = "unknown"
 var savedPid = 0
-
-// Parameter description
-// 1. agentName: Name with which disk log file will be created.
-// 2. logdir: Directory in which disk log file will be placed.
-// 3. text: Test based loggin i.e. logs do into a file created based on
-//          the argument values passed for agentName & logdir.
-//          examples: logmanager
-func initImpl(agentName string, logdir string, text bool) (*os.File, error) {
-
-	var err error
-	var logf *os.File
-	if text {
-		logfile := fmt.Sprintf("%s/%s.log", logdir, agentName)
-		logf, err = os.OpenFile(logfile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-		if err != nil {
-			return nil, err
-		}
-		log.SetOutput(logf)
-	} else {
-		log.SetOutput(os.Stdout)
-	}
-	hook := new(FatalHook)
-	log.AddHook(hook)
-	hook2 := new(SourceHook)
-	log.AddHook(hook2)
-	if text {
-		// Report nano timestamps
-		formatter := log.TextFormatter{
-			TimestampFormat: time.RFC3339Nano,
-		}
-		log.SetFormatter(&formatter)
-	} else {
-		// Report nano timestamps
-		formatter := log.JSONFormatter{
-			TimestampFormat: time.RFC3339Nano,
-		}
-		log.SetFormatter(&formatter)
-	}
-	log.SetReportCaller(true)
-	log.RegisterExitHandler(printStack)
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGUSR1)
-	signal.Notify(sigs, syscall.SIGUSR2)
-	go handleSignals(sigs)
-	return logf, nil
-}
 
 // FatalHook is used make sure we save the fatal and panic strings to a file
 type FatalHook struct {
@@ -132,7 +87,7 @@ func handleSignals(sigs chan os.Signal) {
 			case syscall.SIGUSR2:
 				log.Warnf("SIGUSR2 triggered memory info:\n")
 				logMemUsage()
-				logGCStats()
+				logMemAllocationSites()
 			}
 		}
 	}
@@ -152,16 +107,17 @@ func printStack() {
 	RebootStack(stacks)
 }
 
-// RebootReason writes a reason string in /persist/IMGx/reboot-reason, including agentName and date
+// RebootReason writes a reason string in /persist/reboot-reason, including agentName and date
 // It also appends to /persist/log/reboot-reason.log
-// Note: can not use log here since we are called from a log hook!
+// NOTE: can not use log here since we are called from a log hook!
 func RebootReason(reason string, normal bool) {
-	log.Infof("RebootReason(%s)", reason)
-	filename := fmt.Sprintf("%s/%s", getCurrentIMGdir(), reasonFile)
+	// NOTE: can not use log here since we are called from a log hook!
+	fmt.Printf("RebootReason(%s)", reason)
+	filename := fmt.Sprintf("%s/%s", types.PersistDir, reasonFile)
 	dateStr := time.Now().Format(time.RFC3339Nano)
 	if !normal {
-		reason = fmt.Sprintf("Reboot from agent %s[%d] at %s: %s\n",
-			savedAgentName, savedPid, dateStr, reason)
+		reason = fmt.Sprintf("Reboot from agent %s[%d] in partition %s EVE version %s at %s: %s\n",
+			savedAgentName, savedPid, EveCurrentPartition(), EveVersion(), dateStr, reason)
 	}
 	err := printToFile(filename, reason)
 	if err != nil {
@@ -174,13 +130,20 @@ func RebootReason(reason string, normal bool) {
 		// Note: can not use log here since we are called from a log hook!
 		fmt.Printf("printToFile failed %s\n", err)
 	}
+	filename = "/persist/" + rebootImage
+	curPart := EveCurrentPartition()
+	err = printToFile(filename, curPart)
+	if err != nil {
+		// Note: can not use log here since we are called from a log hook!
+		fmt.Printf("printToFile failed %s\n", err)
+	}
 	syscall.Sync()
 }
 
-// RebootStack writes stack in /persist/IMGx/reboot-stack
+// RebootStack writes stack in /persist/reboot-stack
 // and appends to /persist/log/reboot-stack.log
 func RebootStack(stacks string) {
-	filename := fmt.Sprintf("%s/%s", getCurrentIMGdir(), stackFile)
+	filename := fmt.Sprintf("%s/%s", types.PersistDir, stackFile)
 	log.Warnf("RebootStack to %s", filename)
 	err := printToFile(filename, fmt.Sprintf("%v\n", stacks))
 	if err != nil {
@@ -192,14 +155,6 @@ func RebootStack(stacks string) {
 		log.Errorf("printToFile failed %s\n", err)
 	}
 	syscall.Sync()
-}
-
-func GetCurrentRebootReason() (string, time.Time, string) {
-	reasonFilename := fmt.Sprintf("%s/%s", getCurrentIMGdir(), reasonFile)
-	stackFilename := fmt.Sprintf("%s/%s", getCurrentIMGdir(), stackFile)
-	reason, ts := statAndRead(reasonFilename)
-	stack, _ := statAndRead(stackFilename)
-	return reason, ts, stack
 }
 
 func GetOtherRebootReason() (string, time.Time, string) {
@@ -221,6 +176,13 @@ func GetCommonRebootReason() (string, time.Time, string) {
 	reason, ts := statAndRead(reasonFilename)
 	stack, _ := statAndRead(stackFilename)
 	return reason, ts, stack
+}
+
+// GetRebootImage : Image from which the reboot happened
+func GetRebootImage() string {
+	rebootFilename := fmt.Sprintf("%s/%s", types.PersistDir, rebootImage)
+	image, _ := statAndRead(rebootFilename)
+	return image
 }
 
 // Returns content and Modtime
@@ -253,20 +215,6 @@ func printToFile(filename string, str string) error {
 	return nil
 }
 
-func DiscardCurrentRebootReason() {
-	reasonFilename := fmt.Sprintf("%s/%s", getCurrentIMGdir(), reasonFile)
-	stackFilename := fmt.Sprintf("%s/%s", getCurrentIMGdir(), stackFile)
-	if err := os.Remove(reasonFilename); err != nil {
-		log.Errorf("DiscardCurrentRebootReason failed %s\n", err)
-	}
-	_, err := os.Stat(stackFilename)
-	if err != nil {
-		if err := os.Remove(stackFilename); err != nil {
-			log.Errorf("DiscardCurrentRebootReason failed %s\n", err)
-		}
-	}
-}
-
 func DiscardOtherRebootReason() {
 	dirname := getOtherIMGdir(false)
 	if dirname == "" {
@@ -278,7 +226,7 @@ func DiscardOtherRebootReason() {
 		log.Errorf("DiscardOtherRebootReason failed %s\n", err)
 	}
 	_, err := os.Stat(stackFilename)
-	if err != nil {
+	if err == nil {
 		if err := os.Remove(stackFilename); err != nil {
 			log.Errorf("DiscardOtherRebootReason failed %s\n", err)
 		}
@@ -292,10 +240,18 @@ func DiscardCommonRebootReason() {
 		log.Errorf("DiscardCommonRebootReason failed %s\n", err)
 	}
 	_, err := os.Stat(stackFilename)
-	if err != nil {
+	if err == nil {
 		if err := os.Remove(stackFilename); err != nil {
 			log.Errorf("DiscardCommonRebootReason failed %s\n", err)
 		}
+	}
+}
+
+// DiscardRebootImage : Discard the last reboot-image file
+func DiscardRebootImage() {
+	rebootFilename := fmt.Sprintf("%s/%s", types.PersistDir, rebootImage)
+	if err := os.Remove(rebootFilename); err != nil {
+		log.Errorf("DiscardRebootImage failed %s\n", err)
 	}
 }
 
@@ -321,23 +277,37 @@ func logGCStats() {
 	log.Infof("GCStats %+v\n", m)
 }
 
+// Print in sorted order based on top bytes
+func logMemAllocationSites() {
+	reportZeroInUse := false
+	numSites, sites := GetMemAllocationSites(reportZeroInUse)
+	log.Warnf("alloc %d sites len %d", numSites, len(sites))
+	sort.Slice(sites,
+		func(i, j int) bool {
+			return sites[i].InUseBytes > sites[j].InUseBytes ||
+				(sites[i].InUseBytes == sites[j].InUseBytes &&
+					sites[i].AllocBytes > sites[j].AllocBytes)
+		})
+	for _, site := range sites {
+		log.Warnf("alloc %d bytes %d objects total %d/%d at:\n%s",
+			site.InUseBytes, site.InUseObjects, site.AllocBytes,
+			site.AllocObjects, site.PrintedStack)
+	}
+}
+
 // LogMemoryUsage provides for user-triggered memory reports
 func LogMemoryUsage() {
 	log.Info("User-triggered memory report")
 	logMemUsage()
-	logGCStats()
+	logMemAllocationSites()
 }
 
 func logMemUsage() {
 	var m runtime.MemStats
 
 	runtime.ReadMemStats(&m)
-
-	log.Infof("Alloc %v Mb", roundToMb(m.Alloc))
-	log.Infof("TotalAlloc %v Mb", roundToMb(m.TotalAlloc))
-	log.Infof("Sys %v Mb", roundToMb(m.Sys))
-	log.Infof("NumGC %v", m.NumGC)
-	log.Infof("MemStats %+v", m)
+	log.Infof("Alloc %d Mb, TotalAlloc %d Mb, Sys %d Mb, NumGC %d",
+		roundToMb(m.Alloc), roundToMb(m.TotalAlloc), roundToMb(m.Sys), m.NumGC)
 }
 
 func roundToMb(b uint64) uint64 {
@@ -347,41 +317,31 @@ func roundToMb(b uint64) uint64 {
 	return mb
 }
 
-func Init(agentName string, curpart string) (*os.File, error) {
-	if curpart != "" {
-		zboot.SetCurpart(curpart)
-	}
-	logdir := GetCurrentLogdir()
+func Init(agentName string) {
 	savedAgentName = agentName
 	savedPid = os.Getpid()
-	return initImpl(agentName, logdir, false)
-}
-
-func InitWithDirText(agentName string, logdir string, curpart string) (*os.File, error) {
-	if curpart != "" {
-		zboot.SetCurpart(curpart)
+	log.SetOutput(os.Stdout)
+	hook := new(FatalHook)
+	log.AddHook(hook)
+	hook2 := new(SourceHook)
+	log.AddHook(hook2)
+	// Report nano timestamps
+	formatter := log.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
 	}
-	savedAgentName = agentName
-	savedPid = os.Getpid()
-	return initImpl(agentName, logdir, true)
-}
+	log.SetFormatter(&formatter)
+	log.SetReportCaller(true)
+	log.RegisterExitHandler(printStack)
 
-var currentIMGdir = ""
-
-func getCurrentIMGdir() string {
-
-	if currentIMGdir != "" {
-		return currentIMGdir
-	}
-	partName := zboot.GetCurrentPartition()
-	currentIMGdir = fmt.Sprintf("%s/%s", types.PersistDir, partName)
-	return currentIMGdir
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGUSR1)
+	signal.Notify(sigs, syscall.SIGUSR2)
+	go handleSignals(sigs)
 }
 
 var otherIMGdir = ""
 
 func getOtherIMGdir(inprogressCheck bool) string {
-
 	if otherIMGdir != "" {
 		return otherIMGdir
 	}
@@ -391,20 +351,6 @@ func getOtherIMGdir(inprogressCheck bool) string {
 	partName := zboot.GetOtherPartition()
 	otherIMGdir = fmt.Sprintf("%s/%s", types.PersistDir, partName)
 	return otherIMGdir
-}
-
-// Return a logdir for agents and logmanager to use by default
-func GetCurrentLogdir() string {
-	return fmt.Sprintf("%s/log", getCurrentIMGdir())
-}
-
-// If the other partition is not inprogress we return the empty string
-func GetOtherLogdir() string {
-	dirname := getOtherIMGdir(true)
-	if dirname == "" {
-		return ""
-	}
-	return fmt.Sprintf("%s/log", dirname)
 }
 
 // Debug info to tell how often/late we call stillRunning; keyed by agentName

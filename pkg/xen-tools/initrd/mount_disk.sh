@@ -9,17 +9,6 @@ ls /sys/block/ | grep xvd | while read -r disk ; do
       echo "Error while mounting: No Mount-Point found for $disk."
       exit 0
   fi
-  #Fetching Major and Minor device
-  IN=$(cat /sys/block/$disk/dev | tr ":" "\n")
-  major=$(echo ${IN} | cut -d' ' -f1)
-  minor=$(echo ${IN} | cut -d' ' -f2)
-
-  #Creating a block device under /dev with Major and minor devices
-  echo "Creating device file /dev/$disk"
-  mknod /dev/$disk b $major $minor && \
-  echo "Successfully created device file for /dev/$disk" || \
-  echo "Failed to create device file for /dev/$disk"
-  echo
 
   #Checking and creating a file system inside the partition
   fileSystem="vfat"

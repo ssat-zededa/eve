@@ -3,9 +3,10 @@ package ociutil
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	v1tarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	log "github.com/sirupsen/logrus"
@@ -21,14 +22,22 @@ func manifestsDescImg(image string, options []remote.Option) (name.Reference, *r
 		ref                              name.Reference
 	)
 	log.Infof("manifestsDescImg(%s)", image)
-	// this one should go away
-	log.Infof("options %#v", options)
+
+	// FIXME tar archive size is 1024 bytes greater than the sizes of
+	// the underlying file. Currently, it has been added purely on the
+	// basis of analysis. These changes will go away once underlying
+	// "go-containerregistry" library will start supporting download progess
+	size = 1024
 
 	ref, err = name.ParseReference(image)
 	if err != nil {
 		log.Errorf("error parsing image (%s): %v", image, err)
 		return ref, desc, img, manifestDirect, manifestResolved, size, fmt.Errorf("parsing reference %q: %v", image, err)
 	}
+
+	// resolve out platform
+	options = append(options, remote.WithPlatform(v1.Platform{Architecture: runtime.GOARCH, OS: runtime.GOOS}))
+	log.Debugf("options %#v", options)
 
 	// first get the root manifest. This might be an index or a manifest
 	log.Infof("manifestsDescImg(%s) getting image ref %#v", image, ref)
@@ -58,30 +67,35 @@ func manifestsDescImg(image string, options []remote.Option) (name.Reference, *r
 		return ref, desc, img, manifestDirect, manifestResolved, size, fmt.Errorf("error getting resolved manifest object: %v", err)
 	}
 
-	cfgName := manifest.Config.Digest
-	layerFiles := make([]string, 0)
-
 	// size starts at the default of 0
 	// add the size of the config
-	size += manifest.Config.Size
+	size += v1tarball.CalculateTarFileSize(manifest.Config.Size)
 
 	// next the layers and their sizes, along with filenames for the manifest
-	for _, layer := range manifest.Layers {
-		size += layer.Size
-		layerFiles = append(layerFiles, fmt.Sprintf("%s.tar.gz", layer.Digest))
+	imgLayers, err := img.Layers()
+	if err != nil {
+		return ref, desc, img, manifestDirect, manifestResolved, size, fmt.Errorf("error getting layers of image: %v", err)
+	}
+	for _, layer := range imgLayers {
+		layerSize, err := layer.Size()
+		if err != nil {
+			return ref, desc, img, manifestDirect, manifestResolved, size, fmt.Errorf("error getting size of layers: %v", err)
+		}
+		size += v1tarball.CalculateTarFileSize(layerSize)
 	}
 
 	// get our manifestFile that will be added, convert to bytes, get size
-	manifestFile := v1tarball.Descriptor{
-		Config:   cfgName.String(),
-		RepoTags: []string{image},
-		Layers:   layerFiles,
+	manifestFile, err := v1tarball.ComputeManifest(map[name.Reference]v1.Image{
+		ref: img,
+	})
+	if err != nil {
+		return ref, desc, img, manifestDirect, manifestResolved, size, fmt.Errorf("error getting tar manifest file: %v", err)
 	}
 	manifestFileBytes, err := json.Marshal(manifestFile)
 	if err != nil {
 		return ref, desc, img, manifestDirect, manifestResolved, size, fmt.Errorf("error converting tar manifest file to json: %v", err)
 	}
-	size += int64(len(manifestFileBytes))
+	size += v1tarball.CalculateTarFileSize(int64(len(manifestFileBytes)))
 
 	return ref, desc, img, manifestDirect, manifestResolved, size, nil
 }

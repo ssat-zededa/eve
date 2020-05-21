@@ -7,6 +7,7 @@ import (
 	"time"
 
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	uuid "github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
@@ -28,13 +29,13 @@ type DomainConfig struct {
 	VifList        []VifInfo
 	IoAdapterList  []IoAdapter
 
-	// XXX: to be deprecated, use CipherBlock instead
+	// XXX: to be deprecated, use CipherBlockStatus instead
 	CloudInitUserData *string // base64-encoded
 	// Container related info
 	IsContainer bool // Is this Domain for a Container?
 
-	// CipherBlock, for encrypted cloud-init data
-	CipherBlock
+	// CipherBlockStatus, for encrypted cloud-init data
+	CipherBlockStatus
 }
 
 func (config DomainConfig) Key() string {
@@ -59,6 +60,55 @@ func (config DomainConfig) VirtualizationModeOrDefault() VmMode {
 	default:
 		return PV
 	}
+}
+
+// LogCreate :
+func (config DomainConfig) LogCreate() {
+	logObject := base.NewLogObject(base.DomainConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("activate", config.Activate).
+		AddField("enable-vnc", config.EnableVnc).
+		Infof("domain config create")
+}
+
+// LogModify :
+func (config DomainConfig) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.DomainConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+
+	oldConfig, ok := old.(DomainConfig)
+	if !ok {
+		log.Errorf("LogModify: Old object interface passed is not of DomainConfig type")
+	}
+	if oldConfig.Activate != config.Activate ||
+		oldConfig.EnableVnc != config.EnableVnc {
+
+		logObject.CloneAndAddField("activate", config.Activate).
+			AddField("enable-vnc", config.EnableVnc).
+			AddField("old-activate", oldConfig.Activate).
+			AddField("old-enable-vnc", oldConfig.EnableVnc).
+			Infof("domain config modify")
+	}
+
+}
+
+// LogDelete :
+func (config DomainConfig) LogDelete() {
+	logObject := base.EnsureLogObject(base.DomainConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+	logObject.CloneAndAddField("activate", config.Activate).
+		AddField("enable-vnc", config.EnableVnc).
+		Infof("domain config delete")
+
+	base.DeleteLogObject(config.LogKey())
+}
+
+// LogKey :
+func (config DomainConfig) LogKey() string {
+	return string(base.DomainConfigLogType) + "-" + config.Key()
 }
 
 // Some of these items can be overridden by matching Targets in
@@ -120,13 +170,12 @@ type DomainStatus struct {
 	VncDisplay         uint32
 	VncPasswd          string
 	TriedCount         int
-	LastErr            string // Xen error
-	LastErrTime        time.Time
-	BootFailed         bool
-	AdaptersFailed     bool
-	IsContainer        bool              // Is this Domain for a Container?
-	PodUUID            string            // Pod UUID outputted by rkt
-	EnvVariables       map[string]string // List of environment variables to be set in container
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
+	BootFailed     bool
+	AdaptersFailed bool
+	IsContainer    bool              // Is this Domain for a Container?
+	EnvVariables   map[string]string // List of environment variables to be set in container
 }
 
 func (status DomainStatus) Key() string {
@@ -170,6 +219,63 @@ func (status DomainStatus) VifInfoByVif(vif string) *VifInfo {
 	return nil
 }
 
+// LogCreate :
+func (status DomainStatus) LogCreate() {
+	logObject := base.NewLogObject(base.DomainStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("state", status.State.String()).
+		AddField("activated", status.Activated).
+		Infof("domain status create")
+}
+
+// LogModify :
+func (status DomainStatus) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.DomainStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+
+	oldStatus, ok := old.(DomainStatus)
+	if !ok {
+		log.Errorf("LogModify: Old object interface passed is not of DomainStatus type")
+	}
+	if oldStatus.State != status.State ||
+		oldStatus.Activated != status.Activated {
+
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("activated", status.Activated).
+			AddField("old-state", oldStatus.State.String()).
+			AddField("old-activated", oldStatus.Activated).
+			Infof("domain status modify")
+	}
+
+	if status.HasError() {
+		errAndTime := status.ErrorAndTime
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("activated", status.Activated).
+			AddField("error", errAndTime.Error).
+			AddField("error-time", errAndTime.ErrorTime).
+			Errorf("domain status modify")
+	}
+}
+
+// LogDelete :
+func (status DomainStatus) LogDelete() {
+	logObject := base.EnsureLogObject(base.DomainStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+	logObject.CloneAndAddField("state", status.State.String()).
+		AddField("activated", status.Activated).
+		Infof("domain status delete")
+
+	base.DeleteLogObject(status.LogKey())
+}
+
+// LogKey :
+func (status DomainStatus) LogKey() string {
+	return string(base.DomainStatusLogType) + "-" + status.Key()
+}
+
 type VifInfo struct {
 	Bridge  string
 	Vif     string
@@ -183,10 +289,11 @@ type VifInfo struct {
 // Note that vdev in general can be hd[x], xvd[x], sd[x] but here we only
 // use xvd
 type DiskConfig struct {
-	ImageID     uuid.UUID // UUID of the image
-	ImageSha256 string    // sha256 of immutable image
-	ReadOnly    bool
-	Preserve    bool // If set a rw disk will be preserved across
+	ImageID      uuid.UUID // UUID of the image
+	ImageSha256  string    // sha256 of immutable image
+	FileLocation string    // Where to find the volume
+	ReadOnly     bool
+	Preserve     bool // If set a rw disk will be preserved across
 	// boots (acivate/inactivate)
 	Maxsizebytes uint64 // Resize filesystem to this size if set
 	Format       zconfig.Format
@@ -194,34 +301,15 @@ type DiskConfig struct {
 }
 
 type DiskStatus struct {
-	ImageID            uuid.UUID // UUID of immutable image
-	ImageSha256        string    // sha256 of immutable image
-	ReadOnly           bool
-	Preserve           bool
-	FileLocation       string // Local location of Image
-	Maxsizebytes       uint64 // Resize filesystem to this size if set
-	Format             zconfig.Format
-	Devtype            string // From config
-	Vdev               string // Allocated
-	ActiveFileLocation string // Allocated; private copy if RW; FileLocation if RO
-}
-
-// Track the active image files in rwImgDirname
-// The ImageSha256 is used when an app instance has multiple virtual disks.
-// We do not have an imageID in the pathnames for the RW images hence we can't report
-// an imageID on startup.
-type ImageStatus struct {
-	AppInstUUID  uuid.UUID // UUID of App Instance using the image.
-	ImageSha256  string    // ImageSha256 of original image
-	Filename     string    // Basename; used as key
-	FileLocation string    // Local location of Image
-	RefCount     uint
-	LastUse      time.Time // When RefCount dropped to zero
-	Size         uint64
-}
-
-func (status ImageStatus) Key() string {
-	return status.Filename
+	ImageID      uuid.UUID // UUID of immutable image
+	ImageSha256  string    // sha256 of immutable image
+	ReadOnly     bool
+	Preserve     bool
+	FileLocation string // From DiskConfig
+	Maxsizebytes uint64 // Resize filesystem to this size if set
+	Format       zconfig.Format
+	Devtype      string // From config
+	Vdev         string // Allocated
 }
 
 // DomainMetric carries CPU and memory usage. UUID=devUUID for the dom0/host metrics overhead

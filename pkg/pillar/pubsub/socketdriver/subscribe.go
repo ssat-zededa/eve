@@ -29,6 +29,50 @@ type Subscriber struct {
 	C                chan<- pubsub.Change
 }
 
+// Load load entire persisted data set into a map
+func (s *Subscriber) Load() (map[string][]byte, bool, error) {
+	dirName := s.dirName
+	foundRestarted := false
+	items := make(map[string][]byte)
+
+	log.Debugf("Load(%s)\n", s.name)
+
+	files, err := ioutil.ReadDir(dirName)
+	if err != nil {
+		// Drive on?
+		log.Error(err)
+		return items, foundRestarted, err
+	}
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			if file.Name() == "restarted" {
+				foundRestarted = true
+			}
+			continue
+		}
+		// Remove .json from name */
+		key := strings.Split(file.Name(), ".json")[0]
+
+		statusFile := dirName + "/" + file.Name()
+		if _, err := os.Stat(statusFile); err != nil {
+			// File just vanished!
+			log.Errorf("populate: File disappeared <%s>\n",
+				statusFile)
+			continue
+		}
+
+		log.Debugf("Load found key %s file %s\n", key, statusFile)
+
+		sb, err := ioutil.ReadFile(statusFile)
+		if err != nil {
+			log.Errorf("Load: %s for %s\n", err, statusFile)
+			continue
+		}
+		items[key] = sb
+	}
+	return items, foundRestarted, err
+}
+
 // Start start the subscriber listening on the given name and topic
 // internally, will watch for changes on either the socket or the file, and then
 // send the change summary to s.C
@@ -100,7 +144,10 @@ func (s *Subscriber) connectAndRead() (string, string, []byte) {
 			if err != nil {
 				errStr := fmt.Sprintf("connectAndRead(%s): Dial failed %s",
 					s.name, err)
-				log.Warnln(errStr)
+				// During startup and after a publisher has
+				// exited we get these failures; treat
+				// as debug
+				log.Debugln(errStr)
 				time.Sleep(10 * time.Second)
 				continue
 			}
@@ -129,7 +176,9 @@ func (s *Subscriber) connectAndRead() (string, string, []byte) {
 
 		if res == len(buf) {
 			// Likely truncated
-			log.Fatalf("connectAndRead(%s) request likely truncated\n", s.name)
+			// Peer process could have died
+			log.Errorf("connectAndRead(%s) request likely truncated\n", s.name)
+			continue
 		}
 		reply := strings.Split(string(buf[0:res]), " ")
 		count := len(reply)

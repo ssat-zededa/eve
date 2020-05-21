@@ -14,16 +14,16 @@ import (
 	"sync"
 	"time"
 
+	"io/ioutil"
+	"syscall"
+
 	"github.com/eriknordmark/netlink"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/wrap"
+	pcap "github.com/packetcap/go-pcap"
 	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
-	"io/ioutil"
-	"syscall"
 )
 
 type flowStats struct {
@@ -53,7 +53,6 @@ type aclAttr struct {
 	tableName string
 	aclName   string
 	chainName string
-	action    string
 	bridge    string
 	intfname  string // App virtual interface name assigned by cloud template
 }
@@ -88,7 +87,7 @@ type dnsEntry struct {
 
 const (
 	maxBridgeNumber int    = 256
-	timeoutSec      int32  = 150      // less than 150 sec, consider done
+	timeoutSec      int32  = 150      // less than 150 sec, consider done (make sure to update 01-eve.conf in pkg/dom0-ztools)
 	markMask        uint32 = 0xffffff // get the Mark bits for ACL number
 	appShiftBits    uint32 = 24       // top 8 bits for App Number
 	maxFlowPack     int    = 125      // approximate 320 bytes per flow/dns, got an assert in zedagent when size was 241
@@ -151,7 +150,7 @@ func FlowStatsCollect(ctx *zedrouterContext) {
 			return
 		}
 
-		log.Infof("***FlowStats(%d): device=%v, size of the flows %d\n", proto, devUUID, len(connT))
+		log.Debugf("***FlowStats(%d): device=%v, size of the flows %d\n", proto, devUUID, len(connT))
 
 		for _, entry := range connT { // loop through and process current timedout flow collection
 
@@ -166,7 +165,7 @@ func FlowStatsCollect(ctx *zedrouterContext) {
 		}
 	}
 
-	log.Infof("FlowStats ++ Total timedout flows %d, loopcount debug %d\n", totalFlow, loopcount)
+	log.Debugf("FlowStats ++ Total timedout flows %d, loopcount debug %d\n", totalFlow, loopcount)
 	loopcount++
 
 	// per app/bridge packing flow stats to be uploaded
@@ -191,8 +190,9 @@ func FlowStatsCollect(ctx *zedrouterContext) {
 			// temp print out the flow "tuple" and stats per app/bridge
 			for i, tuple := range timeOutTuples { // search for flowstats by bridge
 				var aclattr aclAttr
-				var bridgeName, aclaction string
+				var bridgeName string
 				var aclNum int
+				var aclaction types.ACLActionType
 
 				appN := tuple.appNum
 				if int(appN) != appIdx { // allow non-App flows to be uploaded
@@ -226,7 +226,7 @@ func FlowStatsCollect(ctx *zedrouterContext) {
 						continue
 					}
 					scope.Intf = aclattr.intfname // App side DomU internal interface name
-					aclaction = aclattr.action
+					aclaction = types.ACLActionAccept
 					aclNum = int(aclattr.aclNum)
 				} else { // conntrack mark aclNum field being 0xffffff
 					// special drop aclNum
@@ -236,7 +236,7 @@ func FlowStatsCollect(ctx *zedrouterContext) {
 					}
 					scope.Intf = appinfo.intf
 					bridgeName = appinfo.localintf
-					aclaction = "drop-" + bridgeName + "-" + appinfo.intf
+					aclaction = types.ACLActionDrop
 					aclNum = 0
 				}
 
@@ -571,9 +571,7 @@ func checkAppAndACL(ctx *zedrouterContext, instData *networkAttrs) {
 				tempAttr.tableName = rule.Table
 				tempAttr.bridge = ulStatus.Bridge
 				tempAttr.intfname = ulStatus.Name
-				if len(rule.Action) >= 2 { // '-j ACCEPT', '-j drop-all-bn1-nbu2x1'
-					tempAttr.action = rule.Action[1]
-				}
+
 				if _, ok := instData.ipaclattr[status.AppNum][int(rule.RuleID)]; !ok { // fake j as the aclNUM
 					instData.ipaclattr[status.AppNum][int(rule.RuleID)] = tempAttr
 				} else {
@@ -606,13 +604,11 @@ func flowPublish(ctx *zedrouterContext, flowdata *types.IPFlow, seq, idx *int) {
 // DNSMonitor : DNS Query and Reply monitor on bridges
 func DNSMonitor(bn string, bnNum int, ctx *zedrouterContext, status *types.NetworkInstanceStatus) {
 	var (
-		err error
-		//action      string
+		err         error
 		snapshotLen int32 = 1280             // draft-madi-dnsop-udp4dns-00
 		promiscuous       = true             // mainly for switched network
 		timeout           = 10 * time.Second // collect enough packets in 10sec before processing
-		handle      *pcap.Handle
-		filter      = "udp and port 53"
+		filter            = "udp and port 53"
 		switched    bool
 		// XXX come back to handle TCP DNS snoop, more useful for zone transfer
 		// https://github.com/google/gopacket/issues/236
@@ -627,7 +623,7 @@ func DNSMonitor(bn string, bnNum int, ctx *zedrouterContext, status *types.Netwo
 	}
 	log.Infof("(FlowStats) DNS Monitor on %s(bridge-num %d) swithced=%v, filter=%s", bn, bnNum, switched, filter)
 
-	handle, err = pcap.OpenLive(bn, snapshotLen, promiscuous, timeout)
+	handle, err := pcap.OpenLive(bn, snapshotLen, promiscuous, timeout, false)
 	if err != nil {
 		log.Errorf("Can not snoop on bridge %s", bn)
 		return
@@ -642,7 +638,7 @@ func DNSMonitor(bn string, bnNum int, ctx *zedrouterContext, status *types.Netwo
 
 	dnssys[bnNum].Done = make(chan bool)
 	dnssys[bnNum].channelOpen = true
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packetSource := gopacket.NewPacketSource(handle, layers.LinkType(handle.LinkType()))
 	dnsIn := packetSource.Packets()
 	for {
 		var packet gopacket.Packet
@@ -854,87 +850,4 @@ func bridgeStrToNum(bnStr string) (int, error) {
 		return 0, err
 	}
 	return bnNum, nil
-}
-
-func flowTimeOutSet(item string, origValue int) {
-
-	tOutValue := origValue + int(timeoutSec) // add 150 seconds
-	setStr := item + "=" + strconv.Itoa(tOutValue)
-	_, err := wrap.Command("sysctl", "-w", setStr).Output()
-	if err != nil {
-		log.Errorf("FlowStats: set item %s error", setStr)
-	}
-}
-
-// AppFlowMonitorTimeoutAdjust :
-// Adjust the conntrack flow session timeout values
-// by adding 150 seconds on top of default seconds
-func AppFlowMonitorTimeoutAdjust() {
-
-	baseStr := "net.netfilter.nf_conntrack_"
-
-	flowTimeOutSet(baseStr+"tcp_timeout_fin_wait", 120)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_last_ack", 30)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_max_retrans", 300)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_syn_recv", 60)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_syn_sent", 120)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_time_wait", 120)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_unacknowledged", 300)
-
-	flowTimeOutSet(baseStr+"udp_timeout", 30)
-
-	flowTimeOutSet(baseStr+"udp_timeout_stream", 180)
-
-	flowTimeOutSet(baseStr+"dccp_timeout_closereq", 64)
-
-	flowTimeOutSet(baseStr+"dccp_timeout_closing", 64)
-
-	// default was 432000 (5 days) see discussion https://dev.archive.openwrt.org/ticket/12976.html
-	flowTimeOutSet(baseStr+"dccp_timeout_open", 3600)
-
-	flowTimeOutSet(baseStr+"dccp_timeout_partopen", 480)
-
-	flowTimeOutSet(baseStr+"dccp_timeout_request", 240)
-
-	flowTimeOutSet(baseStr+"dccp_timeout_respond", 480)
-
-	flowTimeOutSet(baseStr+"dccp_timeout_timewait", 240)
-
-	flowTimeOutSet(baseStr+"frag6_timeout", 60)
-
-	flowTimeOutSet(baseStr+"generic_timeout", 600)
-
-	flowTimeOutSet(baseStr+"icmp_timeout", 30)
-
-	flowTimeOutSet(baseStr+"icmpv6_timeout", 30)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_closed", 10)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_cookie_echoed", 3)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_cookie_wait", 3)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_established", 3600)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_heartbeat_acked", 210)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_heartbeat_sent", 30)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_shutdown_ack_sent", 3)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_shutdown_recd", 0)
-
-	flowTimeOutSet(baseStr+"sctp_timeout_shutdown_sent", 0)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_close", 10)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_close_wait", 60)
-
-	flowTimeOutSet(baseStr+"tcp_timeout_established", 3600)
 }

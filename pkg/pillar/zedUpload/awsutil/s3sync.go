@@ -4,16 +4,19 @@
 package awsutil
 
 import (
+	"bytes"
 	"compress/gzip"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"io"
-	"os"
-	"path"
-	"path/filepath"
-	"sync/atomic"
 )
 
 // stats update
@@ -158,13 +161,10 @@ func (s *S3ctx) UploadFile(fname, bname, bkey string, compression bool, prgNotif
 	return result.Location, nil
 }
 
-func (s *S3ctx) DownloadFile(fname, bname, bkey string, prgNotify NotifChan) error {
-	if err := os.MkdirAll(filepath.Dir(fname), 0775); err != nil {
-		return err
-	}
+func (s *S3ctx) DownloadFile(fname, bname, bkey string,
+	bsize int64, prgNotify NotifChan) error {
 
-	err, bsize := s.GetObjectSize(bname, bkey)
-	if err != nil {
+	if err := os.MkdirAll(filepath.Dir(fname), 0775); err != nil {
 		return err
 	}
 
@@ -237,57 +237,76 @@ func (s *S3ctx) GetObjectMetaData(bname, bkey string) (int64, string, error) {
 	return bsize, md5, nil
 }
 
-func (s *S3ctx) UploadDir(localPath, bname, bkey string, compression bool, prgNotify NotifChan) error {
-	walker := make(fileWalk)
-	go func() {
-		// Gather the files to upload by walking the path recursively.
-		if err := filepath.Walk(localPath, walker.Walk); err != nil {
+// UploadPart is used to upload the given chunk of data into the Multipart file
+func (s *S3ctx) UploadPart(bname, bkey string, chunk []byte, partNumber int64, uploadID string) (string, string, error) {
+	// initializing Multipart request before uploading parts
+	if uploadID == "" {
+		fileType := http.DetectContentType(chunk)
+		input := &s3.CreateMultipartUploadInput{
+			Bucket:      aws.String(bname),
+			Key:         aws.String(bkey),
+			ContentType: aws.String(fileType),
 		}
-		close(walker)
-	}()
-
-	// For each file found walking upload it to S3.
-	for path := range walker {
-		rel, err := filepath.Rel(localPath, path)
+		multiPartUplladCreateResponse, err := s.ss3.CreateMultipartUpload(input)
 		if err != nil {
+			return "", "", err
 		}
-		s.UploadFile(rel, bname, bkey, compression, prgNotify)
+		uploadID = *multiPartUplladCreateResponse.UploadId
 	}
-
-	return nil
+	partInput := &s3.UploadPartInput{
+		Body:          bytes.NewReader(chunk),
+		Bucket:        &bname,
+		Key:           &bkey,
+		PartNumber:    aws.Int64(partNumber),
+		UploadId:      &uploadID,
+		ContentLength: aws.Int64(int64(len(chunk))),
+	}
+	uploadResult, err := s.ss3.UploadPart(partInput)
+	return *uploadResult.ETag, uploadID, err
 }
 
-type fileWalk chan string
-
-func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
+// CompleteUploadedParts is used to complete the multiple upladed parts
+func (s *S3ctx) CompleteUploadedParts(bname, bkey, uploadID string, parts []string) error {
+	completeInput := &s3.CompleteMultipartUploadInput{
+		Bucket:   &bname,
+		Key:      &bkey,
+		UploadId: &uploadID,
+		MultipartUpload: &s3.CompletedMultipartUpload{
+			Parts: getUploadedParts(parts),
+		},
+	}
+	_, err := s.ss3.CompleteMultipartUpload(completeInput)
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
-		f <- path
-	}
 	return nil
 }
 
-func (s *S3ctx) DownloadDir(localpath, bname, prefix string, prgNotify NotifChan) error {
-	d := downloader{s, bname, localpath, prgNotify}
-
-	client := s3.New(nil)
-	err := client.ListObjectsPages(&s3.ListObjectsInput{Bucket: aws.String(bname), Prefix: aws.String(prefix)}, d.eachPage)
-
-	return err
-}
-
-type downloader struct {
-	*S3ctx
-	bucket, dir string
-	prgNotify   NotifChan
-}
-
-func (d *downloader) eachPage(page *s3.ListObjectsOutput, more bool) bool {
-	for _, obj := range page.Contents {
-		d.DownloadFile(path.Join(d.dir, *obj.Key), d.bucket, *obj.Key, d.prgNotify)
+// GetSignedURL is used to generate the URI which can be used to access the resource until the URI expries
+func (s *S3ctx) GetSignedURL(bname, bkey string, duration time.Duration) (string, error) {
+	_, err := s.ss3.HeadObject(&s3.HeadObjectInput{
+		Bucket: aws.String(bname),
+		Key:    aws.String(bkey)})
+	if err != nil {
+		return "", err
 	}
+	req, _ := s.ss3.GetObjectRequest(&s3.GetObjectInput{
+		Bucket: aws.String(bname),
+		Key:    aws.String(bkey)})
 
-	return true
+	// Presign a request with specified duration.
+	signedURL, err := req.Presign(duration)
+
+	return signedURL, err
+}
+
+func getUploadedParts(parts []string) []*s3.CompletedPart {
+	var completedParts []*s3.CompletedPart
+	for i := 0; i < len(parts); i++ {
+		part := s3.CompletedPart{
+			ETag:       &parts[i],
+			PartNumber: aws.Int64(int64(i + 1))}
+		completedParts = append(completedParts, &part)
+	}
+	return completedParts
 }

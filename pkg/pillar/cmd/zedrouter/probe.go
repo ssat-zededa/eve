@@ -47,12 +47,12 @@ type probeRes struct {
 var iteration uint32
 var serverNameAndPort string
 var addrChgTime time.Time // record last time intf address change time
-var zcloudCtx = zedcloud.ZedCloudContext{
-	FailureFunc:        zedcloud.ZedCloudFailure,
-	SuccessFunc:        zedcloud.ZedCloudSuccess,
-	TlsConfig:          &tls.Config{InsecureSkipVerify: true},
-	NetworkSendTimeout: maxRemoteProbeWait,
-}
+var zcloudCtx = zedcloud.NewContext(zedcloud.ContextOptions{
+	Timeout:       maxRemoteProbeWait,
+	TLSConfig:     &tls.Config{InsecureSkipVerify: true},
+	NeedStatsFunc: true,
+	AgentName:     agentName,
+})
 
 // use probeMutex to protect the status.PInfo[] map entries. When the external
 // port is configured from Management into App-Shared, this map entry of the port
@@ -65,12 +65,12 @@ func deviceUpdateNIprobing(ctx *zedrouterContext, status *types.DeviceNetworkSta
 	pub := ctx.pubNetworkInstanceStatus
 	log.Debugf("deviceUpdateNIprobing: enter\n")
 	for _, port := range status.Ports {
-		log.Infof("deviceUpdateNIprobing: port %s, is Mgmt %v\n", port.Name, port.IsMgmt)
+		log.Infof("deviceUpdateNIprobing: port %s/%s, is Mgmt %v\n", port.Phylabel, port.IfName, port.IsMgmt)
 
 		items := pub.GetAll()
 		for _, st := range items {
 			netstatus := st.(types.NetworkInstanceStatus)
-			if !isSharedPortLabel(netstatus.Port) {
+			if !isSharedPortLabel(netstatus.Logicallabel) {
 				continue
 			}
 			resetIsPresentFlag(&netstatus, port.IfName)
@@ -89,7 +89,7 @@ func deviceUpdateNIprobing(ctx *zedrouterContext, status *types.DeviceNetworkSta
 func niUpdateNIprobing(ctx *zedrouterContext, status *types.NetworkInstanceStatus) {
 	pub := ctx.subDeviceNetworkStatus
 	items := pub.GetAll()
-	portList := getIfNameListForPort(ctx, status.Port)
+	portList := getIfNameListForLLOrIfname(ctx, status.Logicallabel)
 	log.Infof("niUpdateNIprobing: enter, type %v, number of ports %d\n", status.Type, len(portList))
 	for _, st := range items {
 		devStatus := st.(types.DeviceNetworkStatus)
@@ -101,8 +101,8 @@ func niUpdateNIprobing(ctx *zedrouterContext, status *types.NetworkInstanceStatu
 					port, devStatus)
 				continue
 			}
-			if !isSharedPortLabel(status.Port) &&
-				status.Port != devPort.Name {
+			if !isSharedPortLabel(status.Logicallabel) &&
+				status.Logicallabel != devPort.Logicallabel {
 				continue
 			}
 			niProbingUpdatePort(ctx, *devPort, status)
@@ -124,14 +124,14 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 	netstatus *types.NetworkInstanceStatus) bool {
 	var needTrigPing bool
 	log.Debugf("niProbingUpdatePort: %s, type %v, enter\n", netstatus.BridgeName, netstatus.Type)
-	if netstatus.Error != "" {
+	if netstatus.HasError() {
 		log.Errorf("niProbingUpdatePort: Network instance is in errored state: %s",
 			netstatus.Error)
 		return needTrigPing
 	}
 	// we skip the non-Mgmt port for now
 	if !port.IsMgmt {
-		log.Infof("niProbingUpdatePort: %s is type %v, not mgmt, skip\n", port.IfName, port.Type)
+		log.Infof("niProbingUpdatePort: %s is type %v, not mgmt, skip\n", port.IfName, port.NetworkXConfig.Type)
 		if info, ok := netstatus.PInfo[port.IfName]; ok {
 			log.Infof("niProbingUpdatePort:   info intf %s is present %v\n", info.IfName, info.IsPresent)
 		}
@@ -150,7 +150,7 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 			IfName:       port.IfName,
 			IsPresent:    true,
 			GatewayUP:    true,
-			NhAddr:       port.Gateway,
+			NhAddr:       port.NetworkXConfig.Gateway,
 			LocalAddr:    portGetIntfAddr(port),
 			IsFree:       port.Free,
 			RemoteHostUP: true,
@@ -166,13 +166,13 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 		info := netstatus.PInfo[port.IfName]
 		prevLocalAddr := info.LocalAddr
 		info.IsPresent = true
-		info.NhAddr = port.Gateway
+		info.NhAddr = port.NetworkXConfig.Gateway
 		info.LocalAddr = portGetIntfAddr(port)
 		info.IsFree = port.Free
 		// the probe status are copied inside publish NI status
 		netstatus.PInfo[port.IfName] = info
 		log.Infof("niProbingUpdatePort: %s modified %s, isFree %v\n", netstatus.BridgeName, port.IfName, info.IsFree)
-		if netstatus.Port == port.Name {
+		if netstatus.Logicallabel == port.Logicallabel {
 			// if the intf lose ip address or gain ip address, react faster
 			// XXX detect changes to LocalAddr and NHAddr in general?
 			if ipAddrIsValid(prevLocalAddr) && !ipAddrIsValid(info.LocalAddr) {
@@ -231,7 +231,7 @@ func checkNIprobeUplink(ctx *zedrouterContext, status *types.NetworkInstanceStat
 		// No link local.
 		for _, info := range status.PInfo {
 			// Pick uplink with atleast one usable IP address
-			ifNameList := getIfNameListForPort(ctx, info.IfName)
+			ifNameList := getIfNameListForLLOrIfname(ctx, info.IfName)
 			if len(ifNameList) != 0 {
 				for _, ifName := range ifNameList {
 					_, err := types.GetLocalAddrAnyNoLinkLocal(*ctx.deviceNetworkStatus, 0, ifName)
@@ -252,7 +252,7 @@ func checkNIprobeUplink(ctx *zedrouterContext, status *types.NetworkInstanceStat
 			// We are not able to find a port with usable unicast IP address.
 			// Try and find a port that atleast has a local UP address.
 			for _, info := range status.PInfo {
-				ifNameList := getIfNameListForPort(ctx, info.IfName)
+				ifNameList := getIfNameListForLLOrIfname(ctx, info.IfName)
 				if len(ifNameList) != 0 {
 					for _, ifName := range ifNameList {
 						_, err := types.GetLocalAddrAny(*ctx.deviceNetworkStatus, 0, ifName)
@@ -290,7 +290,7 @@ func checkNIprobeUplink(ctx *zedrouterContext, status *types.NetworkInstanceStat
 func portGetIntfAddr(port types.NetworkPortStatus) net.IP {
 	var localip net.IP
 	for _, addrinfo := range port.AddrInfoList {
-		if port.Subnet.Contains(addrinfo.Addr) {
+		if port.NetworkXConfig.Subnet.Contains(addrinfo.Addr) {
 			localip = addrinfo.Addr
 		}
 	}
@@ -304,7 +304,7 @@ func launchHostProbe(ctx *zedrouterContext) {
 	nhPing := make(map[string]bool)
 	localDown := make(map[string]bool)
 	remoteProbe := make(map[string]map[string]probeRes)
-	log.Infof("launchHostProbe: enter\n")
+	log.Debugf("launchHostProbe: enter\n")
 	dpub := ctx.subDeviceNetworkStatus
 	ditems := dpub.GetAll()
 
@@ -394,11 +394,11 @@ func launchHostProbe(ctx *zedrouterContext) {
 					}
 					if foundport {
 						startTime := time.Now()
-						resp, _, rtf, err := zedcloud.SendOnIntf(zcloudCtx, remoteURL, info.IfName, 0, nil, true)
+						resp, _, rtf, err := zedcloud.SendOnIntf(&zcloudCtx, remoteURL, info.IfName, 0, nil, true)
 						if err != nil {
 							log.Debugf("launchHostProbe: send on intf %s, err %v\n", info.IfName, err)
 						}
-						if rtf {
+						if rtf == types.SenderStatusRemTempFail {
 							log.Debugf("launchHostProbe: remote temp failure\n")
 						}
 						if resp != nil {
@@ -462,7 +462,7 @@ func probeCheckStatus(status *types.NetworkInstanceStatus) {
 		if currIntf != "" {
 			if currinfo, ok := status.PInfo[currIntf]; ok {
 				numOfUps = infoUpCount(currinfo)
-				log.Infof("probeCheckStatus: level %d, currintf %s, num Ups %d\n", c, currIntf, numOfUps)
+				log.Debugf("probeCheckStatus: level %d, currintf %s, num Ups %d\n", c, currIntf, numOfUps)
 			}
 		}
 		if numOfUps > 0 {
@@ -633,7 +633,7 @@ func getProbeRatio(netstatus *types.NetworkInstanceStatus) uint32 {
 func probeProcessReply(info *types.ProbeInfo, gotReply bool, latency int64, isLocal bool) bool {
 	var stateChange bool
 	if isLocal {
-		log.Infof("probeProcessReply: intf %s, gw up %v, sucess count %d, down count %d, got reply %v\n",
+		log.Debugf("probeProcessReply: intf %s, gw up %v, sucess count %d, down count %d, got reply %v\n",
 			info.IfName, info.GatewayUP, info.SuccessCnt, info.FailedCnt, gotReply)
 		if gotReply {
 			// fast convergence treatment for local ping, if the intf has stayed down for a while

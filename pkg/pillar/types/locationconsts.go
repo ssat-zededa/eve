@@ -11,19 +11,22 @@ const (
 	PersistDir = "/persist"
 	// PersistConfigDir is where we keep some configuration across reboots
 	PersistConfigDir = PersistDir + "/config"
+	// PersistStatusDir is where we keep some configuration across reboots
+	PersistStatusDir = PersistDir + "/status"
 	// DownloadDirname - Location of downloaded images / objects
 	DownloadDirname = PersistDir + "/downloads"
 	// CertificateDirname - Location of certificates
 	CertificateDirname = PersistDir + "/certs"
+	// RWImgDirname - Location of read/write images used by app instances
+	RWImgDirname = PersistDir + "/img"
+	// ROContImgDirname - Location of read only images used by containerd
+	ROContImgDirname = PersistDir + "/runx/pods/prepared"
 	// AppImgDirname - location of downloaded app images. Read-only images
 	// named based on sha256 hash each in its own directory
 	AppImgDirname = DownloadDirname + "/" + AppImgObj
 	// VerifiedAppImgDirname - Location of verified App images. Read-only images
 	// named based on sha256 hash each in its own directory
 	VerifiedAppImgDirname = AppImgDirname + "/verified"
-
-	// PersistRktDataDir - Location of rkt dir,
-	PersistRktDataDir = PersistDir + "/rkt"
 
 	// IdentityDirname - Config dir
 	IdentityDirname = "/config"
@@ -46,10 +49,20 @@ const (
 	// UUIDFileName - device UUID
 	UUIDFileName = IdentityDirname + "/uuid"
 
+	// APIV1FileName - user can statically allow for API v1
+	APIV1FileName = IdentityDirname + "/Force-API-V1"
+
+	// ServerSigningCertFileName - filename for server signing leaf certificate
+	ServerSigningCertFileName = CertificateDirname + "/server-signing-cert.pem"
+
+	// ShareCertDirname - directory to place private proxy server certificates
+	ShareCertDirname = "/usr/local/share/ca-certificates"
 	// AppImgObj - name of app image obj dir
 	AppImgObj = "appImg.obj"
 	// BaseOsObj - name of base image obj dir
 	BaseOsObj = "baseOs.obj"
 	// CertObj - Name of Certificate obj. dir
 	CertObj = "cert.obj"
+	// UnknownObj - Name of unknown obj. dir for what's found in /persist/img
+	UnknownObj = "unknown.obj"
 )

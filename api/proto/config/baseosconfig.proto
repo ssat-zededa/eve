@@ -4,27 +4,27 @@
 syntax = "proto3";
 
 option go_package  = "github.com/lf-edge/eve/api/go/config";
-option java_package = "com.zededa.cloud.uservice.proto";
+option java_package = "org.lfedge.eve.config";
 
-import "devcommon.proto";
-import "storage.proto";
+import "config/devcommon.proto";
+import "config/storage.proto";
 
 // OS version key and value pair
 message OSKeyTags {
-	string OSVerKey = 1;
-	string OSVerValue = 2;
+  string OSVerKey = 1;
+  string OSVerValue = 2;
 }
 
 // repeated key value tags compromising
 message OSVerDetails {
-	repeated OSKeyTags baseOSParams = 12;
+  repeated OSKeyTags baseOSParams = 12;
 }
 
 message BaseOSConfig {
-	UUIDandVersion uuidandversion = 1;
-	repeated Drive drives = 3;
-	bool activate = 4;
+  UUIDandVersion uuidandversion = 1;
+  repeated Drive drives = 3;
+  bool activate = 4;
 
-	string baseOSVersion = 10;
-	OSVerDetails baseOSDetails = 11;
+  string baseOSVersion = 10;
+  OSVerDetails baseOSDetails = 11;
 }

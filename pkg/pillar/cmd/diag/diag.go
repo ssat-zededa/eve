@@ -12,7 +12,6 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"mime"
 	"net"
@@ -29,10 +28,10 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
-	pubsublegacy "github.com/lf-edge/eve/pkg/pillar/pubsub/legacy"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
+	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -53,7 +52,7 @@ type diagContext struct {
 	ledCounter              int
 	derivedLedCounter       int // Based on ledCounter + usableAddressCount
 	subGlobalConfig         pubsub.Subscription
-	globalConfig            *types.GlobalConfig
+	globalConfig            *types.ConfigItemValueMap
 	subLedBlinkCounter      pubsub.Subscription
 	subDeviceNetworkStatus  pubsub.Subscription
 	subDevicePortConfigList pubsub.Subscription
@@ -65,6 +64,7 @@ type diagContext struct {
 	zedcloudCtx             *zedcloud.ZedCloudContext
 	cert                    *tls.Certificate
 	usingOnboardCert        bool
+	devUUID                 uuid.UUID
 }
 
 // Set from Makefile
@@ -75,18 +75,17 @@ var debugOverride bool // From command line arg
 var simulateDnsFailure = false
 var simulatePingFailure = false
 var outfile = os.Stdout
+var nilUUID uuid.UUID
 
 func Run(ps *pubsub.PubSub) {
+	var err error
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
-	stdoutPtr := flag.Bool("s", false, "Use stdout")
 	foreverPtr := flag.Bool("f", false, "Forever flag")
 	pacContentsPtr := flag.Bool("p", false, "Print PAC file contents")
 	simulateDnsFailurePtr := flag.Bool("D", false, "simulateDnsFailure flag")
 	simulatePingFailurePtr := flag.Bool("P", false, "simulatePingFailure flag")
 	outputFilePtr := flag.String("o", "", "file or device for output")
-	twoPtr := flag.Bool("2", false, "V2 API (for testing purposes only)")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
@@ -95,8 +94,6 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	curpart := *curpartPtr
-	useStdout := *stdoutPtr
 	simulateDnsFailure = *simulateDnsFailurePtr
 	simulatePingFailure = *simulatePingFailurePtr
 	outputFile := *outputFilePtr
@@ -104,20 +101,7 @@ func Run(ps *pubsub.PubSub) {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
 		return
 	}
-	logf, err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logf.Close()
-
-	if useStdout {
-		if logf == nil {
-			log.SetOutput(os.Stdout)
-		} else {
-			multi := io.MultiWriter(logf, os.Stdout)
-			log.SetOutput(multi)
-		}
-	}
+	agentlog.Init(agentName)
 
 	if outputFile != "" {
 		outfile, err = os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -129,7 +113,7 @@ func Run(ps *pubsub.PubSub) {
 	ctx := diagContext{
 		forever:      *foreverPtr,
 		pacContents:  *pacContentsPtr,
-		globalConfig: &types.GlobalConfigDefaults,
+		globalConfig: types.DefaultConfigItemValueMap(),
 	}
 	ctx.DeviceNetworkStatus = &types.DeviceNetworkStatus{}
 	ctx.DevicePortConfigList = &types.DevicePortConfigList{}
@@ -138,8 +122,12 @@ func Run(ps *pubsub.PubSub) {
 	utils.EnsureGCFile()
 
 	// Look for global config such as log levels
-	subGlobalConfig, err := pubsublegacy.Subscribe("", types.GlobalConfig{},
-		false, &ctx, &pubsub.SubscriptionOptions{
+	subGlobalConfig, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "",
+			TopicImpl:     types.ConfigItemValueMap{},
+			Activate:      false,
+			Ctx:           &ctx,
 			CreateHandler: handleGlobalConfigModify,
 			ModifyHandler: handleGlobalConfigModify,
 			DeleteHandler: handleGlobalConfigDelete,
@@ -159,19 +147,20 @@ func Run(ps *pubsub.PubSub) {
 	ctx.serverNameAndPort = strings.TrimSpace(string(server))
 	ctx.serverName = strings.Split(ctx.serverNameAndPort, ":")[0]
 
-	zedcloudCtx := zedcloud.ZedCloudContext{
-		DeviceNetworkStatus: ctx.DeviceNetworkStatus,
-		FailureFunc:         zedcloud.ZedCloudFailure,
-		SuccessFunc:         zedcloud.ZedCloudSuccess,
-		NetworkSendTimeout:  ctx.globalConfig.NetworkTestTimeout,
-		V2API:               *twoPtr, // XXX for testing purposes
-	}
-
-	// Get device serial number
-	zedcloudCtx.DevSerial = hardware.GetProductSerial()
-	zedcloudCtx.DevSoftSerial = hardware.GetSoftSerial()
-	log.Infof("Diag Get Device Serial %s, Soft Serial %s\n", zedcloudCtx.DevSerial,
+	zedcloudCtx := zedcloud.NewContext(zedcloud.ContextOptions{
+		DevNetworkStatus: ctx.DeviceNetworkStatus,
+		Timeout:          ctx.globalConfig.GlobalValueInt(types.NetworkSendTimeout),
+		NeedStatsFunc:    true,
+		Serial:           hardware.GetProductSerial(),
+		SoftSerial:       hardware.GetSoftSerial(),
+		AgentName:        agentName,
+	})
+	log.Infof("Diag Get Device Serial %s, Soft Serial %s", zedcloudCtx.DevSerial,
 		zedcloudCtx.DevSoftSerial)
+
+	// XXX move to later for Get UUID if available
+
+	log.Infof("diag Run: Use V2 API %v", zedcloudCtx.V2API)
 
 	if fileExists(types.DeviceCertName) {
 		// Load device cert
@@ -198,8 +187,12 @@ func Run(ps *pubsub.PubSub) {
 	}
 	ctx.zedcloudCtx = &zedcloudCtx
 
-	subLedBlinkCounter, err := pubsublegacy.Subscribe("", types.LedBlinkCounter{},
-		false, &ctx, &pubsub.SubscriptionOptions{
+	subLedBlinkCounter, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "",
+			TopicImpl:     types.LedBlinkCounter{},
+			Activate:      false,
+			Ctx:           &ctx,
 			CreateHandler: handleLedBlinkModify,
 			ModifyHandler: handleLedBlinkModify,
 			WarningTime:   warningTime,
@@ -212,8 +205,12 @@ func Run(ps *pubsub.PubSub) {
 	ctx.subLedBlinkCounter = subLedBlinkCounter
 	subLedBlinkCounter.Activate()
 
-	subDeviceNetworkStatus, err := pubsublegacy.Subscribe("nim",
-		types.DeviceNetworkStatus{}, false, &ctx, &pubsub.SubscriptionOptions{
+	subDeviceNetworkStatus, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "nim",
+			TopicImpl:     types.DeviceNetworkStatus{},
+			Activate:      false,
+			Ctx:           &ctx,
 			CreateHandler: handleDNSModify,
 			ModifyHandler: handleDNSModify,
 			DeleteHandler: handleDNSDelete,
@@ -227,8 +224,13 @@ func Run(ps *pubsub.PubSub) {
 	ctx.subDeviceNetworkStatus = subDeviceNetworkStatus
 	subDeviceNetworkStatus.Activate()
 
-	subDevicePortConfigList, err := pubsublegacy.SubscribePersistent("nim",
-		types.DevicePortConfigList{}, false, &ctx, &pubsub.SubscriptionOptions{
+	subDevicePortConfigList, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "nim",
+			Persistent:    true,
+			TopicImpl:     types.DevicePortConfigList{},
+			Activate:      false,
+			Ctx:           &ctx,
 			CreateHandler: handleDPCModify,
 			ModifyHandler: handleDPCModify,
 		})
@@ -238,6 +240,21 @@ func Run(ps *pubsub.PubSub) {
 	}
 	ctx.subDevicePortConfigList = subDevicePortConfigList
 	subDevicePortConfigList.Activate()
+
+	subOnboardStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedclient",
+		CreateHandler: handleOnboardStatusModify,
+		ModifyHandler: handleOnboardStatusModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+		TopicImpl:     types.OnboardingStatus{},
+		Activate:      true,
+		Persistent:    true,
+		Ctx:           &ctx,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	for {
 		select {
@@ -251,6 +268,9 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-subDeviceNetworkStatus.MsgChan():
 			ctx.gotDNS = true
 			subDeviceNetworkStatus.ProcessChange(change)
+
+		case change := <-subOnboardStatus.MsgChan():
+			subOnboardStatus.ProcessChange(change)
 
 		case change := <-subDevicePortConfigList.MsgChan():
 			ctx.gotDPCList = true
@@ -285,7 +305,7 @@ func handleLedBlinkModify(ctxArg interface{}, key string,
 	ctx := ctxArg.(*diagContext)
 
 	if key != "ledconfig" {
-		log.Errorf("handleLedBlinkModify: ignoring %s\n", key)
+		log.Errorf("handleLedBlinkModify: ignoring %s", key)
 		return
 	}
 	// Supress work and logging if no change
@@ -295,7 +315,7 @@ func handleLedBlinkModify(ctxArg interface{}, key string,
 	ctx.ledCounter = config.BlinkCounter
 	ctx.derivedLedCounter = types.DeriveLedCounter(ctx.ledCounter,
 		ctx.UsableAddressCount)
-	log.Infof("counter %d usableAddr %d, derived %d\n",
+	log.Infof("counter %d usableAddr %d, derived %d",
 		ctx.ledCounter, ctx.UsableAddressCount, ctx.derivedLedCounter)
 	// XXX wait in case we get another handle call?
 	// XXX set output sched in ctx; print one second later?
@@ -308,25 +328,25 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	status := statusArg.(types.DeviceNetworkStatus)
 	ctx := ctxArg.(*diagContext)
 	if key != "global" {
-		log.Infof("handleDNSModify: ignoring %s\n", key)
+		log.Infof("handleDNSModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleDNSModify for %s\n", key)
+	log.Infof("handleDNSModify for %s", key)
 	if cmp.Equal(ctx.DeviceNetworkStatus, status) {
-		log.Infof("handleDNSModify unchanged\n")
+		log.Infof("handleDNSModify unchanged")
 		return
 	}
 	log.Infof("handleDNSModify: changed %v",
 		cmp.Diff(ctx.DeviceNetworkStatus, status))
 	*ctx.DeviceNetworkStatus = status
 	newAddrCount := types.CountLocalAddrAnyNoLinkLocal(*ctx.DeviceNetworkStatus)
-	log.Infof("handleDNSModify %d usable addresses\n", newAddrCount)
+	log.Infof("handleDNSModify %d usable addresses", newAddrCount)
 	if (ctx.UsableAddressCount == 0 && newAddrCount != 0) ||
 		(ctx.UsableAddressCount != 0 && newAddrCount == 0) {
 		ctx.UsableAddressCount = newAddrCount
 		ctx.derivedLedCounter = types.DeriveLedCounter(ctx.ledCounter,
 			ctx.UsableAddressCount)
-		log.Infof("counter %d usableAddr %d, derived %d\n",
+		log.Infof("counter %d usableAddr %d, derived %d",
 			ctx.ledCounter, ctx.UsableAddressCount, ctx.derivedLedCounter)
 	}
 
@@ -338,34 +358,34 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	// XXX wait in case we get another handle call?
 	// XXX set output sched in ctx; print one second later?
 	printOutput(ctx)
-	log.Infof("handleDNSModify done for %s\n", key)
+	log.Infof("handleDNSModify done for %s", key)
 }
 
 func handleDNSDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleDNSDelete for %s\n", key)
+	log.Infof("handleDNSDelete for %s", key)
 	ctx := ctxArg.(*diagContext)
 
 	if key != "global" {
-		log.Infof("handleDNSDelete: ignoring %s\n", key)
+		log.Infof("handleDNSDelete: ignoring %s", key)
 		return
 	}
 	*ctx.DeviceNetworkStatus = types.DeviceNetworkStatus{}
 	newAddrCount := types.CountLocalAddrAnyNoLinkLocal(*ctx.DeviceNetworkStatus)
-	log.Infof("handleDNSDelete %d usable addresses\n", newAddrCount)
+	log.Infof("handleDNSDelete %d usable addresses", newAddrCount)
 	if (ctx.UsableAddressCount == 0 && newAddrCount != 0) ||
 		(ctx.UsableAddressCount != 0 && newAddrCount == 0) {
 		ctx.UsableAddressCount = newAddrCount
 		ctx.derivedLedCounter = types.DeriveLedCounter(ctx.ledCounter,
 			ctx.UsableAddressCount)
-		log.Infof("counter %d usableAddr %d, derived %d\n",
+		log.Infof("counter %d usableAddr %d, derived %d",
 			ctx.ledCounter, ctx.UsableAddressCount, ctx.derivedLedCounter)
 	}
 	// XXX wait in case we get another handle call?
 	// XXX set output sched in ctx; print one second later?
 	printOutput(ctx)
-	log.Infof("handleDNSDelete done for %s\n", key)
+	log.Infof("handleDNSDelete done for %s", key)
 }
 
 // Handles both create and modify events
@@ -374,10 +394,10 @@ func handleDPCModify(ctxArg interface{}, key string, statusArg interface{}) {
 	status := statusArg.(types.DevicePortConfigList)
 	ctx := ctxArg.(*diagContext)
 	if key != "global" {
-		log.Infof("handleDPCModify: ignoring %s\n", key)
+		log.Infof("handleDPCModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleDPCModify for %s\n", key)
+	log.Infof("handleDPCModify for %s", key)
 	if cmp.Equal(ctx.DevicePortConfigList, status) {
 		return
 	}
@@ -389,7 +409,20 @@ func handleDPCModify(ctxArg interface{}, key string, statusArg interface{}) {
 	// XXX wait in case we get another handle call?
 	// XXX set output sched in ctx; print one second later?
 	printOutput(ctx)
-	log.Infof("handleDPCModify done for %s\n", key)
+	log.Infof("handleDPCModify done for %s", key)
+}
+
+// Handles UUID change from process client
+func handleOnboardStatusModify(ctxArg interface{}, key string, statusArg interface{}) {
+	status := statusArg.(types.OnboardingStatus)
+	ctx := ctxArg.(*diagContext)
+	if cmp.Equal(ctx.devUUID, status.DeviceUUID) {
+		log.Infof("handleOnboardStatusModify no change to %v", ctx.devUUID)
+		return
+	}
+	ctx.devUUID = status.DeviceUUID
+	log.Infof("handleOnboardStatusModify changed to %v", ctx.devUUID)
+	printOutput(ctx)
 }
 
 // Print output for all interfaces
@@ -529,20 +562,20 @@ func printOutput(ctx *diagContext) {
 		}
 
 		fmt.Fprintf(outfile, "INFO: %s: DNS servers: ", ifname)
-		for _, ds := range port.DnsServers {
+		for _, ds := range port.NetworkXConfig.DnsServers {
 			fmt.Fprintf(outfile, "%s, ", ds.String())
 		}
 		fmt.Fprintf(outfile, "\n")
 		// If static print static config
-		if port.Dhcp == types.DT_STATIC {
+		if port.NetworkXConfig.Dhcp == types.DT_STATIC {
 			fmt.Fprintf(outfile, "INFO: %s: Static IP subnet: %s\n",
-				ifname, port.Subnet.String())
+				ifname, port.NetworkXConfig.Subnet.String())
 			fmt.Fprintf(outfile, "INFO: %s: Static IP router: %s\n",
-				ifname, port.Gateway.String())
+				ifname, port.NetworkXConfig.Gateway.String())
 			fmt.Fprintf(outfile, "INFO: %s: Static Domain Name: %s\n",
-				ifname, port.DomainName)
+				ifname, port.NetworkXConfig.DomainName)
 			fmt.Fprintf(outfile, "INFO: %s: Static NTP server: %s\n",
-				ifname, port.NtpServer.String())
+				ifname, port.NetworkXConfig.NtpServer.String())
 		}
 		printProxy(ctx, port, ifname)
 
@@ -622,8 +655,9 @@ func printProxy(ctx *diagContext, port types.NetworkPortStatus,
 		fmt.Fprintf(outfile, "INFO: %s: proxy exceptions %s\n",
 			ifname, port.ProxyConfig.Exceptions)
 	}
-	if port.Error != "" {
-		fmt.Fprintf(outfile, "ERROR: %s: from WPAD? %s\n", ifname, port.Error)
+	if port.HasError() {
+		fmt.Fprintf(outfile, "ERROR: %s: from WPAD? %s\n",
+			ifname, port.LastError)
 	}
 	if port.ProxyConfig.NetworkProxyEnable {
 		if port.ProxyConfig.NetworkProxyURL == "" {
@@ -739,7 +773,7 @@ func tryPing(ctx *diagContext, ifname string, reqURL string) bool {
 	zedcloudCtx := ctx.zedcloudCtx
 	// Set the TLS config on each attempt in case it has changed due to proxies etc
 	if reqURL == "" {
-		reqURL = ctx.serverNameAndPort + "/api/v1/edgedevice/ping"
+		reqURL = zedcloud.URLPathString(ctx.serverNameAndPort, zedcloudCtx.V2API, false, nilUUID, "ping")
 		err := zedcloud.UpdateTLSConfig(zedcloudCtx, ctx.serverName, ctx.cert)
 		if err != nil {
 			errStr := fmt.Sprintf("ERROR: %s: internal UpdateTLSConfig failed %s\n",
@@ -798,7 +832,8 @@ func tryPostUUID(ctx *diagContext, ifname string) bool {
 		return false
 	}
 	zedcloudCtx := ctx.zedcloudCtx
-	reqURL := ctx.serverNameAndPort + "/api/v1/edgedevice/config"
+
+	reqURL := zedcloud.URLPathString(ctx.serverNameAndPort, zedcloudCtx.V2API, false, ctx.devUUID, "config")
 	// Set the TLS config on each attempt in case it has changed due to proxies etc
 	err = zedcloud.UpdateTLSConfig(zedcloudCtx, ctx.serverName, ctx.cert)
 	if err != nil {
@@ -810,16 +845,28 @@ func tryPostUUID(ctx *diagContext, ifname string) bool {
 	zedcloudCtx.NoLedManager = true
 	retryCount := 0
 	done := false
+	rtf := types.SenderStatusNone
 	var delay time.Duration
 	for !done {
 		time.Sleep(delay)
 		var resp *http.Response
 		var buf []byte
-		done, resp, buf = myPost(zedcloudCtx, reqURL, ifname, retryCount,
+		done, resp, rtf, buf = myPost(zedcloudCtx, reqURL, ifname, retryCount,
 			int64(len(b)), bytes.NewBuffer(b))
 		if done {
 			parsePrint(reqURL, resp, buf)
 			break
+		}
+		if rtf == types.SenderStatusCertMiss {
+			// currently only three places we need to verify envelope data
+			// 1) client
+			// 2) zedagent
+			// 3) diag here for getting /config
+			// 1) is the initial getting cloud certs, 2) rely on zedagent to refetch the cloud certs
+			// if zedcloud has cert change. 3) only need to zero out the cache in zedcloudCtx and
+			// it will reacquire from the updated cert file. zedagent is the only one resposible for refetching certs.
+			zedcloud.ClearCloudCert(zedcloudCtx)
+			return false
 		}
 		retryCount += 1
 		if maxRetries != 0 && retryCount > maxRetries {
@@ -839,11 +886,7 @@ func parsePrint(configURL string, resp *http.Response, contents []byte) {
 	}
 
 	if resp.StatusCode == http.StatusNotModified {
-		log.Infof("StatusNotModified")
-		if len(contents) > 0 {
-			log.Infof("XXX StatusNotModified with len %d",
-				len(contents))
-		}
+		log.Debugf("StatusNotModified len %d", len(contents))
 		return
 	}
 
@@ -854,12 +897,7 @@ func parsePrint(configURL string, resp *http.Response, contents []byte) {
 	}
 	hash := configResponse.GetConfigHash()
 	if hash == prevConfigHash {
-		log.Infof("Same ConfigHash")
-		if len(contents) > 0 {
-			// XXX controller should omit full content
-			log.Infof("XXX len %d hash %s",
-				len(contents), hash)
-		}
+		log.Debugf("Same ConfigHash len %d", len(contents))
 		return
 	}
 	log.Infof("Change in ConfigHash from %s to %s", prevConfigHash, hash)
@@ -927,10 +965,10 @@ func myGet(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 			ifname, proxyURL.String(), reqURL)
 	}
 	const allowProxy = true
-	resp, contents, rtf, err := zedcloud.SendOnIntf(*zedcloudCtx,
+	resp, contents, rtf, err := zedcloud.SendOnIntf(zedcloudCtx,
 		reqURL, ifname, 0, nil, allowProxy)
 	if err != nil {
-		if rtf {
+		if rtf == types.SenderStatusRemTempFail {
 			fmt.Fprintf(outfile, "ERROR: %s: get %s remote temporary failure: %s\n",
 				ifname, reqURL, err)
 		} else {
@@ -958,7 +996,7 @@ func myGet(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 }
 
 func myPost(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
-	retryCount int, reqlen int64, b *bytes.Buffer) (bool, *http.Response, []byte) {
+	retryCount int, reqlen int64, b *bytes.Buffer) (bool, *http.Response, types.SenderResult, []byte) {
 
 	var preqURL string
 	if strings.HasPrefix(reqURL, "http:") {
@@ -977,33 +1015,33 @@ func myPost(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 			ifname, proxyURL.String(), reqURL)
 	}
 	const allowProxy = true
-	resp, contents, rtf, err := zedcloud.SendOnIntf(*zedcloudCtx,
+	resp, contents, rtf, err := zedcloud.SendOnIntf(zedcloudCtx,
 		reqURL, ifname, reqlen, b, allowProxy)
 	if err != nil {
-		if rtf {
+		if rtf == types.SenderStatusRemTempFail {
 			fmt.Fprintf(outfile, "ERROR: %s: post %s remote temporary failure: %s\n",
 				ifname, reqURL, err)
 		} else {
 			fmt.Fprintf(outfile, "ERROR: %s: get %s failed: %s\n",
 				ifname, reqURL, err)
 		}
-		return false, nil, nil
+		return false, nil, rtf, nil
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK:
 		fmt.Fprintf(outfile, "INFO: %s: %s StatusOK\n", ifname, reqURL)
-		return true, resp, contents
+		return true, resp, rtf, contents
 	case http.StatusNotModified:
 		fmt.Fprintf(outfile, "INFO: %s: %s StatusNotModified\n", ifname, reqURL)
-		return true, resp, contents
+		return true, resp, rtf, contents
 	default:
 		fmt.Fprintf(outfile, "ERROR: %s: %s statuscode %d %s\n",
 			ifname, reqURL, resp.StatusCode,
 			http.StatusText(resp.StatusCode))
 		fmt.Fprintf(outfile, "ERRROR: %s: Received %s\n",
 			ifname, string(contents))
-		return false, nil, nil
+		return false, nil, rtf, nil
 	}
 }
 
@@ -1013,17 +1051,17 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*diagContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigModify: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigModify for %s\n", key)
-	var gcp *types.GlobalConfig
+	log.Infof("handleGlobalConfigModify for %s", key)
+	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
 	if gcp != nil {
 		ctx.globalConfig = gcp
 	}
-	log.Infof("handleGlobalConfigModify done for %s\n", key)
+	log.Infof("handleGlobalConfigModify done for %s", key)
 }
 
 func handleGlobalConfigDelete(ctxArg interface{}, key string,
@@ -1031,12 +1069,12 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*diagContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigDelete: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigDelete for %s\n", key)
+	log.Infof("handleGlobalConfigDelete for %s", key)
 	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
-	*ctx.globalConfig = types.GlobalConfigDefaults
-	log.Infof("handleGlobalConfigDelete done for %s\n", key)
+	*ctx.globalConfig = *types.DefaultConfigItemValueMap()
+	log.Infof("handleGlobalConfigDelete done for %s", key)
 }

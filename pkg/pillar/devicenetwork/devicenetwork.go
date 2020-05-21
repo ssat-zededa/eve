@@ -7,21 +7,20 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/eriknordmark/ipinfo"
-	"github.com/eriknordmark/netlink"
-	"github.com/golang/protobuf/proto"
-	zconfig "github.com/lf-edge/eve/api/go/config"
-	"github.com/lf-edge/eve/pkg/pillar/cmd/tpmmgr"
-	"github.com/lf-edge/eve/pkg/pillar/hardware"
-	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
-	log "github.com/sirupsen/logrus"
 	"io/ioutil"
 	"net"
 	"os"
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/eriknordmark/ipinfo"
+	"github.com/eriknordmark/netlink"
+	"github.com/lf-edge/eve/pkg/pillar/cipher"
+	"github.com/lf-edge/eve/pkg/pillar/hardware"
+	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -46,6 +45,8 @@ func makeDevicePortConfig(ctx *DeviceNetworkContext, ports []string, free []stri
 	config.Ports = make([]types.NetworkPortConfig, len(ports))
 	for ix, u := range ports {
 		config.Ports[ix].IfName = u
+		config.Ports[ix].Phylabel = u
+		config.Ports[ix].Logicallabel = u
 		for _, f := range free {
 			if f == u {
 				config.Ports[ix].Free = true
@@ -53,11 +54,10 @@ func makeDevicePortConfig(ctx *DeviceNetworkContext, ports []string, free []stri
 			}
 		}
 		config.Ports[ix].IsMgmt = true
-		config.Ports[ix].Name = config.Ports[ix].IfName
 		config.Ports[ix].Dhcp = types.DT_CLIENT
-		port, err := ctx.DevicePortConfig.GetPortByIfName(u)
-		if err == nil {
-			config.Ports[ix].WirelessCfg = port.WirelessCfg
+		portPtr := ctx.DevicePortConfig.GetPortByIfName(u)
+		if portPtr != nil {
+			config.Ports[ix].WirelessCfg = portPtr.WirelessCfg
 		}
 	}
 	return config
@@ -75,17 +75,32 @@ func IsProxyConfigEmpty(proxyConfig types.ProxyConfig) bool {
 	return false
 }
 
-// Check if device can talk to outside world via atleast one of the free uplinks
+// VerifyDeviceNetworkStatus
+//  Check if device can talk to outside world via atleast 'successCount' of the
+//  uplinks
+// Return Values:
+//  Success / Failure
+//  error - Overall Error
+//  PerInterfaceErrorMap - Key: ifname
+//    Includes entries for all interfaces that were tested.
+//    For each interface verified
+//      set Error ( If success, set to "")
+//      set ErrorTime to time of testing ( Even if verify Successful )
 func VerifyDeviceNetworkStatus(status types.DeviceNetworkStatus,
-	retryCount int, timeout uint32) (bool, error) {
+	successCount uint, iteration int, timeout uint32) (bool, types.IntfStatusMap, error) {
 
-	log.Infof("VerifyDeviceNetworkStatus() %d\n", retryCount)
+	log.Debugf("VerifyDeviceNetworkStatus() successCount %d, iteration %d",
+		successCount, iteration)
+
+	// Map of per-interface errors
+	intfStatusMap := *types.NewIntfStatusMap()
+
 	// Check if it is 1970 in which case we declare success since
 	// our certificates will not work until NTP has brought the time
 	// forward.
 	if time.Now().Year() == 1970 {
 		log.Infof("VerifyDeviceNetworkStatus skip due to 1970")
-		return false, nil
+		return false, intfStatusMap, nil
 	}
 
 	server, err := ioutil.ReadFile(types.ServerFileName)
@@ -94,20 +109,18 @@ func VerifyDeviceNetworkStatus(status types.DeviceNetworkStatus,
 	}
 	serverNameAndPort := strings.TrimSpace(string(server))
 	serverName := strings.Split(serverNameAndPort, ":")[0]
-	testUrl := serverNameAndPort + "/api/v1/edgedevice/ping"
 
-	// XXX set by caller?
-	v2api := false
-	zedcloudCtx := zedcloud.ZedCloudContext{
-		DeviceNetworkStatus: &status,
-		NetworkSendTimeout:  timeout,
-		V2API:               v2api,
-	}
+	zedcloudCtx := zedcloud.NewContext(zedcloud.ContextOptions{
+		DevNetworkStatus: &status,
+		Timeout:          timeout,
+		Serial:           hardware.GetProductSerial(),
+		SoftSerial:       hardware.GetSoftSerial(),
+		AgentName:        "devicenetwork",
+	})
+	log.Infof("VerifyDeviceNetworkStatus: Use V2 API %v\n", zedcloud.UseV2API())
+	testURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, false, nilUUID, "ping")
 
-	// Get device serial number
-	zedcloudCtx.DevSerial = hardware.GetProductSerial()
-	zedcloudCtx.DevSoftSerial = hardware.GetSoftSerial()
-	log.Infof("NIM Get Device Serial %s, Soft Serial %s\n", zedcloudCtx.DevSerial,
+	log.Debugf("NIM Get Device Serial %s, Soft Serial %s\n", zedcloudCtx.DevSerial,
 		zedcloudCtx.DevSoftSerial)
 
 	tlsConfig, err := zedcloud.GetTlsConfig(zedcloudCtx.DeviceNetworkStatus, serverName,
@@ -121,28 +134,33 @@ func VerifyDeviceNetworkStatus(status types.DeviceNetworkStatus,
 		if err != nil {
 			errStr := "Onboarding certificate cannot be found"
 			log.Infof("VerifyDeviceNetworkStatus: %s\n", errStr)
-			return false, errors.New(errStr)
+			return false, intfStatusMap, errors.New(errStr)
 		}
 		clientCert := &onboardingCert
 		tlsConfig, err = zedcloud.GetTlsConfig(zedcloudCtx.DeviceNetworkStatus,
 			serverName, clientCert, &zedcloudCtx)
 		if err != nil {
-			errStr := "TLS configuration for talking to Zedcloud cannot be found"
-
+			errStr := fmt.Sprintf("TLS configuration for talking to Zedcloud cannot be found: %s", err)
 			log.Infof("VerifyDeviceNetworkStatus: %s\n", errStr)
-			return false, errors.New(errStr)
+			return false, intfStatusMap, errors.New(errStr)
 		}
 	}
 	zedcloudCtx.TlsConfig = tlsConfig
 	for ix := range status.Ports {
 		err = CheckAndGetNetworkProxy(&status, &status.Ports[ix])
 		if err != nil {
-			errStr := fmt.Sprintf("GetNetworkProxy failed %s", err)
-			log.Errorf("VerifyDeviceNetworkStatus: %s\n", errStr)
-			return false, errors.New(errStr)
+			ifName := status.Ports[ix].IfName
+			errStr := fmt.Sprintf("ifName: %s. Failed to get NetworkProxy. Err:%s",
+				ifName, err)
+			log.Errorf("VerifyDeviceNetworkStatus: %s", errStr)
+			intfStatusMap.RecordFailure(ifName, errStr)
+			return false, intfStatusMap, errors.New(errStr)
 		}
 	}
-	cloudReachable, rtf, err := zedcloud.VerifyAllIntf(zedcloudCtx, testUrl, retryCount, 1)
+	cloudReachable, rtf, tempIntfStatusMap, err := zedcloud.VerifyAllIntf(
+		&zedcloudCtx, testURL, successCount, iteration)
+	intfStatusMap.SetOrUpdateFromMap(tempIntfStatusMap)
+	log.Debugf("VerifyDeviceNetworkStatus: intfStatusMap - %+v", intfStatusMap)
 	if err != nil {
 		if rtf {
 			log.Errorf("VerifyDeviceNetworkStatus: VerifyAllIntf remoteTemporaryFailure %s",
@@ -151,16 +169,17 @@ func VerifyDeviceNetworkStatus(status types.DeviceNetworkStatus,
 			log.Errorf("VerifyDeviceNetworkStatus: VerifyAllIntf failed %s",
 				err)
 		}
-		return rtf, err
+		return rtf, intfStatusMap, err
 	}
 
 	if cloudReachable {
-		log.Infof("Uplink test SUCCESS to URL: %s", testUrl)
-		return false, nil
+		log.Infof("Uplink test SUCCESS to URL: %s", testURL)
+		return false, intfStatusMap, nil
 	}
-	errStr := fmt.Sprintf("Uplink test FAIL to URL: %s", testUrl)
-	log.Errorf("VerifyDeviceNetworkStatus: %s\n", errStr)
-	return rtf, errors.New(errStr)
+	errStr := fmt.Sprintf("Uplink test FAIL to URL: %s", testURL)
+	log.Errorf("VerifyDeviceNetworkStatus: %s, intfStatusMap: %+v",
+		errStr, intfStatusMap)
+	return rtf, intfStatusMap, err
 }
 
 // Calculate local IP addresses to make a types.DeviceNetworkStatus
@@ -173,31 +192,29 @@ func MakeDeviceNetworkStatus(globalConfig types.DevicePortConfig, oldStatus type
 		len(globalConfig.Ports))
 	for ix, u := range globalConfig.Ports {
 		globalStatus.Ports[ix].IfName = u.IfName
-		globalStatus.Ports[ix].Name = u.Name
+		globalStatus.Ports[ix].Phylabel = u.Phylabel
+		globalStatus.Ports[ix].Logicallabel = u.Logicallabel
+		globalStatus.Ports[ix].Alias = u.Alias
 		globalStatus.Ports[ix].IsMgmt = u.IsMgmt
 		globalStatus.Ports[ix].Free = u.Free
 		globalStatus.Ports[ix].ProxyConfig = u.ProxyConfig
 		// Set fields from the config...
-		globalStatus.Ports[ix].Dhcp = u.Dhcp
+		globalStatus.Ports[ix].NetworkXConfig.Dhcp = u.Dhcp
 		_, subnet, _ := net.ParseCIDR(u.AddrSubnet)
 		if subnet != nil {
-			globalStatus.Ports[ix].Subnet = *subnet
+			globalStatus.Ports[ix].NetworkXConfig.Subnet = *subnet
 		}
-		globalStatus.Ports[ix].Gateway = u.Gateway
-		globalStatus.Ports[ix].DomainName = u.DomainName
-		globalStatus.Ports[ix].NtpServer = u.NtpServer
-		globalStatus.Ports[ix].DnsServers = u.DnsServers
-		if u.ParseError != "" {
-			globalStatus.Ports[ix].Error = u.ParseError
-			globalStatus.Ports[ix].ErrorTime = u.ParseErrorTime
-		}
+		globalStatus.Ports[ix].NetworkXConfig.Gateway = u.Gateway
+		globalStatus.Ports[ix].NetworkXConfig.DomainName = u.DomainName
+		globalStatus.Ports[ix].NetworkXConfig.NtpServer = u.NtpServer
+		globalStatus.Ports[ix].NetworkXConfig.DnsServers = u.DnsServers
+		globalStatus.Ports[ix].TestResults = u.TestResults
 		ifindex, err := IfnameToIndex(u.IfName)
 		if err != nil {
 			errStr := fmt.Sprintf("Port %s does not exist - ignored",
 				u.IfName)
 			log.Errorf("MakeDeviceNetworkStatus: %s\n", errStr)
-			globalStatus.Ports[ix].Error = errStr
-			globalStatus.Ports[ix].ErrorTime = time.Now()
+			globalStatus.Ports[ix].RecordFailure(errStr)
 			continue
 		}
 		addrs, err := GetIPAddrs(ifindex)
@@ -222,12 +239,7 @@ func MakeDeviceNetworkStatus(globalConfig types.DevicePortConfig, oldStatus type
 			globalStatus.Ports[ix].AddrInfoList[i].Addr = addr
 		}
 		// Get DNS etc info from dhcpcd. Updates DomainName and DnsServers
-		err = GetDhcpInfo(&globalStatus.Ports[ix])
-		if err != nil {
-			errStr := fmt.Sprintf("GetDhcpInfo failed %s", err)
-			globalStatus.Ports[ix].Error = errStr
-			globalStatus.Ports[ix].ErrorTime = time.Now()
-		}
+		GetDhcpInfo(&globalStatus.Ports[ix])
 		GetDNSInfo(&globalStatus.Ports[ix])
 
 		// Attempt to get a wpad.dat file if so configured
@@ -237,9 +249,11 @@ func MakeDeviceNetworkStatus(globalConfig types.DevicePortConfig, oldStatus type
 		err = CheckAndGetNetworkProxy(&globalStatus,
 			&globalStatus.Ports[ix])
 		if err != nil {
-			errStr := fmt.Sprintf("GetNetworkProxy failed %s", err)
-			globalStatus.Ports[ix].Error = errStr
-			globalStatus.Ports[ix].ErrorTime = time.Now()
+			errStr := fmt.Sprintf("GetNetworkProxy failed for %s: %s",
+				u.IfName, err)
+			// XXX where can we return this failure?
+			// Already have TestResults set from above
+			log.Error(errStr)
 		}
 	}
 	// Preserve geo info for existing interface and IP address
@@ -266,7 +280,7 @@ func MakeDeviceNetworkStatus(globalConfig types.DevicePortConfig, oldStatus type
 	return globalStatus
 }
 
-// write the access-point name into /run/cccesspoint directory
+// write the access-point name into /run/accesspoint directory
 // the filenames are the physical ports with access-point address/name in content
 func devPortInstallAPname(ifname string, wconfig types.WirelessConfig) {
 	if _, err := os.Stat(apDirname); err != nil {
@@ -303,7 +317,8 @@ func devPortInstallAPname(ifname string, wconfig types.WirelessConfig) {
 	log.Infof("devPortInstallAPname: write file %s for name %v", filepath, wconfig.Cellular)
 }
 
-func devPortInstallWifiConfig(ifname string, wconfig types.WirelessConfig) bool {
+func devPortInstallWifiConfig(ctx *DeviceNetworkContext,
+	ifname string, wconfig types.WirelessConfig) bool {
 	if _, err := os.Stat(runwlanDir); os.IsNotExist(err) {
 		err = os.Mkdir(runwlanDir, 600)
 		if err != nil {
@@ -333,7 +348,7 @@ func devPortInstallWifiConfig(ifname string, wconfig types.WirelessConfig) bool 
 	} else {
 		tmpfile.WriteString("# Automatically generated\n")
 		for _, wifi := range wconfig.Wifi {
-			cred, err := getWifiCredential(wifi)
+			decBlock, err := getWifiCredential(ctx, wifi)
 			if err != nil {
 				continue
 			}
@@ -345,18 +360,18 @@ func devPortInstallWifiConfig(ifname string, wconfig types.WirelessConfig) bool 
 			case types.KeySchemeWpaPsk: // WPA-PSK
 				tmpfile.WriteString("        key_mgmt=WPA-PSK\n")
 				// this assumes a hashed passphrase, otherwise need "" around string
-				if len(cred.Password) > 0 {
-					s = fmt.Sprintf("        psk=%s\n", cred.Password)
+				if len(decBlock.WifiPassword) > 0 {
+					s = fmt.Sprintf("        psk=%s\n", decBlock.WifiPassword)
 					tmpfile.WriteString(s)
 				}
 			case types.KeySchemeWpaEap: // EAP PEAP
 				tmpfile.WriteString("        key_mgmt=WPA-EAP\n        eap=PEAP\n")
-				if len(cred.Identity) > 0 {
-					s = fmt.Sprintf("        identity=\"%s\"\n", cred.Identity)
+				if len(decBlock.WifiUserName) > 0 {
+					s = fmt.Sprintf("        identity=\"%s\"\n", decBlock.WifiUserName)
 					tmpfile.WriteString(s)
 				}
-				if len(cred.Password) > 0 {
-					s = fmt.Sprintf("        password=hash:%s\n", cred.Password)
+				if len(decBlock.WifiPassword) > 0 {
+					s = fmt.Sprintf("        password=hash:%s\n", decBlock.WifiPassword)
 					tmpfile.WriteString(s)
 				}
 				// comment out the certifacation verify. file.WriteString("        ca_cert=\"/config/ca.pem\"\n")
@@ -384,30 +399,27 @@ func devPortInstallWifiConfig(ifname string, wconfig types.WirelessConfig) bool 
 	return true
 }
 
-func getWifiCredential(wifi types.WifiConfig) (zconfig.CredentialBlock, error) {
-	cred := zconfig.CredentialBlock{}
-	if !wifi.IsCipher {
-		cred.Identity = wifi.Identity
-		cred.Password = wifi.Password
-		return cred, nil
+func getWifiCredential(ctx *DeviceNetworkContext,
+	wifi types.WifiConfig) (types.EncryptionBlock, error) {
+	if wifi.CipherBlockStatus.IsCipher {
+		status, decBlock, err := cipher.GetCipherCredentials(&ctx.DecryptCipherContext,
+			"devicenetwork", wifi.CipherBlockStatus)
+		ctx.PubCipherBlockStatus.Publish(status.Key(), status)
+		if err != nil {
+			log.Errorf("%s, wifi config cipherblock decryption unsuccessful, falling back to cleartext: %v\n",
+				wifi.SSID, err)
+			decBlock.WifiUserName = wifi.Identity
+			decBlock.WifiPassword = wifi.Password
+			return decBlock, nil
+		}
+		log.Infof("%s, wifi config cipherblock decryption successful\n", wifi.SSID)
+		return decBlock, nil
 	}
-	if !wifi.IsValidCipher {
-		errStr := fmt.Sprintf("%s, Cipher Block is not ready", wifi.SSID)
-		log.Errorln(errStr)
-		return cred, errors.New(errStr)
-	}
-	clearData, err := tpmmgr.DecryptCipherBlock(wifi.CipherBlock)
-	if err != nil {
-		log.Errorf("%s, wifi CipherData decryption failed, %v\n",
-			wifi.SSID, err)
-		return cred, err
-	}
-	if err := proto.Unmarshal(clearData, &cred); err != nil {
-		log.Errorf("%s, wifi credential unmarshall failed, %v\n",
-			wifi.SSID, err)
-		return cred, err
-	}
-	return cred, nil
+	log.Infof("%s, wifi config cipherblock not present\n", wifi.SSID)
+	decBlock := types.EncryptionBlock{}
+	decBlock.WifiUserName = wifi.Identity
+	decBlock.WifiPassword = wifi.Password
+	return decBlock, nil
 }
 
 // CheckDNSUpdate sees if we should update based on DNS

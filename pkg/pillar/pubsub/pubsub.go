@@ -105,6 +105,7 @@ func (p *PubSub) NewSubscription(options SubscriptionOptions) (Subscription, err
 		SynchronizedHandler: options.SyncHandler,
 		MaxProcessTimeWarn:  options.WarningTime,
 		MaxProcessTimeError: options.ErrorTime,
+		Persistent:          options.Persistent,
 	}
 	name := sub.nameString()
 	global := options.AgentName == ""
@@ -160,7 +161,7 @@ func (p *PubSub) NewPublication(options PublicationOptions) (Publication, error)
 	// create the driver
 	name := pub.nameString()
 	global := options.AgentName == ""
-	log.Infof("publishImpl agentName(%s), agentScope(%s), topic(%s), nameString(%s), global(%v), persistent(%v)\n",
+	log.Debugf("publishImpl agentName(%s), agentScope(%s), topic(%s), nameString(%s), global(%v), persistent(%v)\n",
 		options.AgentName, options.AgentScope, topic, name, global, options.Persistent)
 	driver, err := p.driver.Publisher(global, name, topic, options.Persistent, p.updaterList, pub, pub)
 	if err != nil {
@@ -172,7 +173,7 @@ func (p *PubSub) NewPublication(options PublicationOptions) (Publication, error)
 	if log.GetLevel() == log.DebugLevel {
 		pub.dump("after populate")
 	}
-	log.Infof("Publish(%s)\n", name)
+	log.Debugf("Publish(%s)\n", name)
 
 	pub.publisher()
 

@@ -14,13 +14,11 @@ import (
 	"net"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	zconfig "github.com/lf-edge/eve/api/go/config"
-	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/ssh"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
@@ -46,7 +44,7 @@ func parseConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigContext,
 	ctx := getconfigCtx.zedagentCtx
 
 	// XXX - DO NOT LOG entire config till secrets are in encrypted blobs
-	//log.Debugf("parseConfig: EdgeDevConfig: %v\n", *config)
+	//log.Debugf("parseConfig: EdgeDevConfig: %v", *config)
 
 	// Look for timers and other settings in configItems
 	// Process Config items even when rebootFlag is set.. Allows us to
@@ -54,8 +52,9 @@ func parseConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigContext,
 	parseConfigItems(config, getconfigCtx)
 
 	if getconfigCtx.rebootFlag || ctx.deviceReboot {
-		log.Debugf("parseConfig: Ignoring config as rebootFlag set\n")
+		log.Debugf("parseConfig: Ignoring config as rebootFlag set")
 	} else {
+		parseCipherContext(getconfigCtx, config)
 		parseDatastoreConfig(config, getconfigCtx)
 		// DeviceIoList has some defaults for Usage and UsagePolicy
 		// used by systemAdapters
@@ -66,7 +65,6 @@ func parseConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigContext,
 		// on Physio configuration and Networks configuration. If either of
 		// Physio or Networks change, we should re-parse system adapters and
 		// publish updated configuration.
-		parseCipherContextConfig(getconfigCtx, config)
 		forceSystemAdaptersParse := physioChanged || networksChanged
 		parseSystemAdapterConfig(config, getconfigCtx, forceSystemAdaptersParse)
 		parseBaseOsConfig(getconfigCtx, config)
@@ -84,7 +82,7 @@ func shutdownApps(getconfigCtx *getconfigContext) {
 	for _, c := range items {
 		config := c.(types.AppInstanceConfig)
 		if config.Activate {
-			log.Infof("shutdownApps: clearing Activate for %s uuid %s\n",
+			log.Infof("shutdownApps: clearing Activate for %s uuid %s",
 				config.DisplayName, config.Key())
 			config.Activate = false
 			pub.Publish(config.Key(), config)
@@ -111,10 +109,10 @@ func parseBaseOsConfig(getconfigCtx *getconfigContext,
 	if same {
 		return
 	}
-	log.Infof("parseBaseOsConfig: Applying updated config\n"+
-		"prevSha: % x\n"+
-		"NewSha : % x\n"+
-		"cfgOsList: %v\n",
+	log.Infof("parseBaseOsConfig: Applying updated config "+
+		"prevSha: % x, "+
+		"NewSha : % x, "+
+		"cfgOsList: %v",
 		baseosPrevConfigHash, configHash, cfgOsList)
 
 	baseosPrevConfigHash = configHash
@@ -131,7 +129,7 @@ func parseBaseOsConfig(getconfigCtx *getconfigContext,
 		}
 		// baseOS instance not found, delete
 		if !found {
-			log.Infof("parseBaseOsConfig: deleting %s\n", uuidStr)
+			log.Infof("parseBaseOsConfig: deleting %s", uuidStr)
 			getconfigCtx.pubBaseOsConfig.Unpublish(uuidStr)
 
 			unpublishCertObjConfig(getconfigCtx, uuidStr)
@@ -141,7 +139,7 @@ func parseBaseOsConfig(getconfigCtx *getconfigContext,
 	for _, cfgOs := range cfgOsList {
 		if cfgOs.GetBaseOSVersion() == "" {
 			// Empty slot - silently ignore
-			log.Debugf("parseBaseOsConfig ignoring empty %s\n",
+			log.Debugf("parseBaseOsConfig ignoring empty %s",
 				cfgOs.Uuidandversion.Uuid)
 			continue
 		}
@@ -170,7 +168,7 @@ func parseBaseOsConfig(getconfigCtx *getconfigContext,
 
 		certInstance := getCertObjects(baseOs.UUIDandVersion,
 			baseOs.ConfigSha256, baseOs.StorageConfigList)
-		log.Debugf("parseBaseOsConfig publishing %v\n",
+		log.Debugf("parseBaseOsConfig publishing %v",
 			baseOs)
 		publishBaseOsConfig(getconfigCtx, baseOs)
 		if certInstance != nil {
@@ -195,10 +193,10 @@ func parseNetworkXObjectConfig(config *zconfig.EdgeDevConfig,
 	if same {
 		return false
 	}
-	log.Infof("parseNetworkXObjectConfig: Applying updated config.\n"+
-		"prevSha: % x\n"+
-		"NewSha : % x\n"+
-		"networks: %v\n",
+	log.Infof("parseNetworkXObjectConfig: Applying updated config "+
+		"prevSha: % x, "+
+		"NewSha : % x, "+
+		"networks: %v",
 		networkConfigPrevConfigHash, configHash, nets)
 	networkConfigPrevConfigHash = configHash
 	// Export NetworkXObjectConfig for ourselves; systemAdapter
@@ -219,13 +217,13 @@ func unpublishDeletedNetworkInstanceConfig(ctx *getconfigContext,
 		networkInstanceEntry := lookupNetworkInstanceById(key, networkInstances)
 		if networkInstanceEntry != nil {
 			// Entry not deleted.
-			log.Infof("NetworkInstance %s (Name: %s) still exists\n",
+			log.Infof("NetworkInstance %s (Name: %s) still exists",
 				key, networkInstanceEntry.Displayname)
 			continue
 		}
 
 		config := entry.(types.NetworkInstanceConfig)
-		log.Infof("unpublishing NetworkInstance %s (Name: %s) \n",
+		log.Infof("unpublishing NetworkInstance %s (Name: %s)",
 			key, config.DisplayName)
 		if err := ctx.pubNetworkInstanceConfig.Unpublish(key); err != nil {
 			log.Fatalf("Network Instance UnPublish (key:%s, name:%s) FAILED: %s",
@@ -253,7 +251,7 @@ func parseDnsNameToIpList(
 			if ip != nil {
 				ips = append(ips, ip)
 			} else {
-				log.Errorf("Bad dnsEntry %s ignored\n",
+				log.Errorf("Bad dnsEntry %s ignored",
 					strAddr)
 			}
 		}
@@ -288,7 +286,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 	}
 
 	if vpnCount > 1 {
-		log.Errorf("publishNetworkInstanceConfig(): more than one VPN instance configuration\n")
+		log.Errorf("publishNetworkInstanceConfig(): more than one VPN instance configuration")
 		return
 	}
 
@@ -296,7 +294,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 		id, err := uuid.FromString(apiConfigEntry.Uuidandversion.Uuid)
 		version := apiConfigEntry.Uuidandversion.Version
 		if err != nil {
-			log.Errorf("NetworkInstanceConfig: Malformed UUID %s. ignored. Err: %s\n",
+			log.Errorf("NetworkInstanceConfig: Malformed UUID %s. ignored. Err: %s",
 				apiConfigEntry.Uuidandversion.Uuid, err)
 			// XXX - We should propagate this error to Cloud.
 			// Why ignore only for this specific Check?
@@ -311,12 +309,12 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			Type:           types.NetworkInstanceType(apiConfigEntry.InstType),
 			Activate:       apiConfigEntry.Activate,
 		}
-		log.Infof("publishNetworkInstanceConfig: processing %s %s type %d activate %v\n",
+		log.Infof("publishNetworkInstanceConfig: processing %s %s type %d activate %v",
 			networkInstanceConfig.UUID.String(), networkInstanceConfig.DisplayName,
 			networkInstanceConfig.Type, networkInstanceConfig.Activate)
 
 		if apiConfigEntry.Port != nil {
-			networkInstanceConfig.Port = apiConfigEntry.Port.Name
+			networkInstanceConfig.Logicallabel = apiConfigEntry.Port.Name
 		}
 		networkInstanceConfig.IpType = types.AddressType(apiConfigEntry.IpType)
 
@@ -325,7 +323,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			// XXX controller should send AddressTypeNone type for switch
 			// network instances
 			if networkInstanceConfig.IpType != types.AddressTypeNone {
-				log.Errorf("Switch network instance %s %s with invalid IpType %d should be %d\n",
+				log.Errorf("Switch network instance %s %s with invalid IpType %d should be %d",
 					networkInstanceConfig.UUID.String(),
 					networkInstanceConfig.DisplayName,
 					networkInstanceConfig.IpType,
@@ -341,7 +339,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			networkInstanceConfig.HasEncap = true
 			// if not cryptoIPv4/IPv6 type, flag it
 			if networkInstanceConfig.IpType != types.AddressTypeCryptoIPV4 && networkInstanceConfig.IpType != types.AddressTypeCryptoIPV6 {
-				log.Errorf("Network instance %s %s, %v not crypto type\n",
+				log.Errorf("Network instance %s %s, %v not crypto type",
 					networkInstanceConfig.UUID.String(),
 					networkInstanceConfig.DisplayName,
 					networkInstanceConfig.IpType)
@@ -353,14 +351,14 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 		case types.NetworkInstanceTypeCloud:
 			// if opaque config not set, flag it
 			if apiConfigEntry.Cfg == nil {
-				log.Errorf("Network instance %s %s, %v, opaque not set\n",
+				log.Errorf("Network instance %s %s, %v, opaque not set",
 					networkInstanceConfig.UUID.String(),
 					networkInstanceConfig.DisplayName,
 					networkInstanceConfig.IpType)
 			} else {
 				ocfg := apiConfigEntry.Cfg
 				if ocfg.Type != zconfig.ZNetworkOpaqueConfigType_ZNetOConfigVPN {
-					log.Errorf("Network instance %s %s, %v invalid config \n",
+					log.Errorf("Network instance %s %s, %v invalid config",
 						networkInstanceConfig.UUID.String(),
 						networkInstanceConfig.DisplayName,
 						networkInstanceConfig.IpType)
@@ -369,7 +367,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			}
 			// if not IPv4 type, flag it
 			if networkInstanceConfig.IpType != types.AddressTypeIPV4 {
-				log.Errorf("Network instance %s %s, %v not IPv4 type\n",
+				log.Errorf("Network instance %s %s, %v not IPv4 type",
 					networkInstanceConfig.UUID.String(),
 					networkInstanceConfig.DisplayName,
 					networkInstanceConfig.IpType)
@@ -435,10 +433,10 @@ func parseNetworkInstanceConfig(config *zconfig.EdgeDevConfig,
 	if same {
 		return
 	}
-	log.Infof("parseNetworkInstanceConfig: Applying updated config\n"+
-		"prevSha: % x\n"+
-		"NewSha : % x\n"+
-		"networkInstances: %v\n",
+	log.Infof("parseNetworkInstanceConfig: Applying updated config "+
+		"prevSha: % x, "+
+		"NewSha : % x, "+
+		"networkInstances: %v",
 		networkInstancePrevConfigHash, configHash, networkInstances)
 	networkInstancePrevConfigHash = configHash
 	// Export NetworkInstanceConfig to zedrouter
@@ -460,10 +458,10 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 	if same {
 		return
 	}
-	log.Infof("parseAppInstanceConfig: Applying updated config\n"+
-		"prevSha: % x\n"+
-		"NewSha : % x\n"+
-		"Apps: %v\n",
+	log.Infof("parseAppInstanceConfig: Applying updated config "+
+		"prevSha: % x, "+
+		"NewSha : % x, "+
+		"Apps: %v",
 		appinstancePrevConfigHash, configHash, Apps)
 	appinstancePrevConfigHash = configHash
 
@@ -478,7 +476,7 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 			}
 		}
 		if !found {
-			log.Infof("Remove app config %s\n", uuidStr)
+			log.Infof("Remove app config %s", uuidStr)
 			getconfigCtx.pubAppInstanceConfig.Unpublish(uuidStr)
 
 			unpublishCertObjConfig(getconfigCtx, uuidStr)
@@ -488,7 +486,7 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 	for _, cfgApp := range Apps {
 		// Note that we repeat this even if the app config didn't
 		// change but something else in the EdgeDeviceConfig did
-		log.Debugf("New/updated app instance %v\n", cfgApp)
+		log.Debugf("New/updated app instance %v", cfgApp)
 		var appInstance types.AppInstanceConfig
 
 		appInstance.UUIDandVersion.UUID, _ = uuid.FromString(cfgApp.Uuidandversion.Uuid)
@@ -520,13 +518,13 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 		// I/O adapters
 		appInstance.IoAdapterList = nil
 		for _, adapter := range cfgApp.Adapters {
-			log.Debugf("Processing adapter type %d name %s\n",
+			log.Debugf("Processing adapter type %d name %s",
 				adapter.Type, adapter.Name)
 			appInstance.IoAdapterList = append(appInstance.IoAdapterList,
 				types.IoAdapter{Type: types.IoType(adapter.Type),
 					Name: adapter.Name})
 		}
-		log.Infof("Got adapters %v\n", appInstance.IoAdapterList)
+		log.Infof("Got adapters %v", appInstance.IoAdapterList)
 
 		cmd := cfgApp.GetRestart()
 		if cmd != nil {
@@ -543,9 +541,21 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 			appInstance.CloudInitUserData = &userData
 		}
 		appInstance.RemoteConsole = cfgApp.GetRemoteConsole()
+		appInstance.CipherBlockStatus = parseCipherBlock(getconfigCtx, appInstance.Key(),
+			cfgApp.GetCipherData())
 		// get the certs for image sha verification
 		certInstance := getCertObjects(appInstance.UUIDandVersion,
 			appInstance.ConfigSha256, appInstance.StorageConfigList)
+
+		// Pretend that the controller specified purgeCounter for the first
+		// disk. Then StorageStatus will start with that value below.
+		if len(appInstance.StorageConfigList) > 0 &&
+			appInstance.StorageConfigList[0].PurgeCounter != appInstance.PurgeCmd.Counter {
+			sc := &appInstance.StorageConfigList[0]
+			log.Infof("Setting purgeCounter to %d for %s",
+				appInstance.PurgeCmd.Counter, appInstance.Key())
+			sc.PurgeCounter = appInstance.PurgeCmd.Counter
+		}
 
 		// write to zedmanager config directory
 		uuidStr := cfgApp.Uuidandversion.Uuid
@@ -574,11 +584,11 @@ func parseSystemAdapterConfig(config *zconfig.EdgeDevConfig,
 	}
 	// XXX secrets like wifi credentials in here
 	if false {
-		log.Infof("parseSystemAdapterConfig: Applying updated config\n"+
-			"prevSha: % x\n"+
-			"NewSha : % x\n"+
-			"sysAdapters: %v\n"+
-			"Forced parsing: %v\n",
+		log.Infof("parseSystemAdapterConfig: Applying updated config "+
+			"prevSha: % x, "+
+			"NewSha : % x, "+
+			"sysAdapters: %v, "+
+			"Forced parsing: %v",
 			systemAdaptersPrevConfigHash, configHash, sysAdapters, forceParse)
 	}
 	systemAdaptersPrevConfigHash = configHash
@@ -610,7 +620,7 @@ func parseSystemAdapterConfig(config *zconfig.EdgeDevConfig,
 	portConfig.Ports = newPorts
 
 	// Any content change?
-	// Even if only ParseError or ParseErrorTime changed we publish so
+	// Even if only ErrorAndTime changed we publish so
 	// the change can be sent back to the controller using ctx.devicePortConfigList
 	if cmp.Equal(getconfigCtx.devicePortConfig.Ports, portConfig.Ports) &&
 		getconfigCtx.devicePortConfig.Version == portConfig.Version {
@@ -632,36 +642,62 @@ func parseSystemAdapterConfig(config *zconfig.EdgeDevConfig,
 }
 
 // Returns a port if it should be added to the list; some errors result in
-// adding an port to to DevicePortConfig with ParseError set.
+// adding a port to to DevicePortConfig with ErrorAndTime set.
 func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 	sysAdapter *zconfig.SystemAdapter,
 	version types.DevicePortConfigVersion) *types.NetworkPortConfig {
 	var isMgmt, isFree bool = false, false
 
+	log.Infof("XXX parseOneSystemAdapterConfig name %s lowerLayerName %s",
+		sysAdapter.Name, sysAdapter.LowerLayerName)
 	port := new(types.NetworkPortConfig)
 
-	// XXX - There seems to be an implicit Assumption here that
-	// sysAdapter.Name is same as Port.IfName
-	// CHANGE this to: port.IfName = sysAdapter.getIfname()
-	port.IfName = sysAdapter.Name
-	port.Name = sysAdapter.Name
-
-	// XXX - Make the change after LowerLayerName starts to get used.
-	//  Look up using LowerLayerName ( PhysicalLabel).
-	// If LowerLayerName is not found, use sysAdapter.Name to do the lookup
-	//  Currently, lookupDeviceIo looks up using LogicalLabel. But it should
-	//  Really be physical Label.
-	phyio := lookupDeviceIo(getconfigCtx, sysAdapter.Name)
+	port.Logicallabel = sysAdapter.Name
+	port.Alias = sysAdapter.Alias
+	// Look up using LowerLayerName which should match a phyio PhysicalLabel.
+	// If LowerLayerName was not set we use Name
+	if sysAdapter.LowerLayerName == "" {
+		port.Phylabel = sysAdapter.Name
+	} else {
+		port.Phylabel = sysAdapter.LowerLayerName
+	}
+	phyio := lookupDeviceIoLogicallabel(getconfigCtx, port.Logicallabel)
+	if phyio == nil {
+		phyio = lookupDeviceIoPhylabel(getconfigCtx, port.Phylabel)
+	}
 	if phyio == nil {
 		// We will re-check when phyio changes.
-		errStr := fmt.Sprintf("Missing phyio for %s; ignored",
-			sysAdapter.Name)
+		errStr := fmt.Sprintf("Missing phyio for %s lower %s; ignored",
+			sysAdapter.Name, sysAdapter.LowerLayerName)
 		log.Error(errStr)
 		// Report error but set Dhcp, isMgmt, and isFree to sane values
-		port.ParseError = errStr
-		port.ParseErrorTime = time.Now()
+		port.RecordFailure(errStr)
+		port.IfName = sysAdapter.Name
 		isFree = true
+	} else if !types.IoType(phyio.Ptype).IsNet() {
+		errStr := fmt.Sprintf("phyio for %s lower %s not IsNet; ignored",
+			sysAdapter.Name, sysAdapter.LowerLayerName)
+		log.Error(errStr)
+		return nil
 	} else {
+		if port.Logicallabel != phyio.Logicallabel {
+			errStr := fmt.Sprintf("phyio for %s lower %s mismatched logicallabel %s vs %s",
+				sysAdapter.Name, sysAdapter.LowerLayerName,
+				port.Logicallabel, phyio.Logicallabel)
+			log.Warn(errStr)
+		}
+		port.Phylabel = phyio.Phylabel
+		port.IfName = phyio.Phyaddr.Ifname
+		if port.IfName == "" {
+			// Might not be set for all models
+			log.Warnf("Phyio for phylabel %s logicallabel %s has no ifname",
+				phyio.Phylabel, phyio.Logicallabel)
+			if phyio.Logicallabel != "" {
+				port.IfName = phyio.Logicallabel
+			} else {
+				port.IfName = phyio.Phylabel
+			}
+		}
 		isFree = phyio.UsagePolicy.FreeUplink
 		log.Infof("Found phyio for %s: isFree: %t",
 			sysAdapter.Name, isFree)
@@ -692,12 +728,11 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 	if sysAdapter.Addr != "" {
 		ip = net.ParseIP(sysAdapter.Addr)
 		if ip == nil {
-			errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s has Bad "+
-				"sysAdapter.Addr %s - ignored",
-				sysAdapter.Name, sysAdapter.Addr)
-			log.Error(errStr)
-			port.ParseError = errStr
-			port.ParseErrorTime = time.Now()
+			errStr := fmt.Sprintf("Device Config Error. Port %s has Bad "+
+				"SysAdapter.Addr %s. The IP address is ignored. Please fix the "+
+				"device configuration.", sysAdapter.Name, sysAdapter.Addr)
+			log.Errorf("parseSystemAdapterConfig: %s", errStr)
+			port.RecordFailure(errStr)
 			// IP will not be set below
 		}
 		// Note that ip is not used unless we have a network UUID
@@ -710,19 +745,22 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 		networkXObject, err := getconfigCtx.pubNetworkXObjectConfig.Get(sysAdapter.NetworkUUID)
 		if err != nil {
 			// XXX when do we retry looking for the networkXObject?
-			errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s Network with UUID %s not found: %s",
+			errStr := fmt.Sprintf("Device Config Error. Port %s configured with "+
+				"UNKNOWN Network UUID (%s). Err: %s. Please fix the "+
+				"device configuration.",
 				port.IfName, sysAdapter.NetworkUUID, err)
-			log.Error(errStr)
-			port.ParseError = errStr
-			port.ParseErrorTime = time.Now()
+			log.Errorf("parseSystemAdapterConfig: %s", errStr)
+			port.RecordFailure(errStr)
 		} else {
 			net := networkXObject.(types.NetworkXObjectConfig)
+			port.NetworkUUID = net.UUID
 			network = &net
-			if network.Error != "" {
-				errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s Network error: %v",
-					port.IfName, network.Error)
-				port.ParseError = errStr
-				port.ParseErrorTime = network.ErrorTime
+			if network.HasError() {
+				errStr := fmt.Sprintf("Port %s configured with a network "+
+					"(UUID: %s) which has an error (%s).",
+					port.IfName, port.NetworkUUID, network.Error)
+				log.Errorf("parseSystemAdapterConfig: %s", errStr)
+				port.RecordFailure(errStr)
 			}
 		}
 
@@ -743,39 +781,40 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 		switch port.Dhcp {
 		case types.DT_STATIC:
 			if port.AddrSubnet == "" {
-				errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s DT_STATIC but missing "+
-					"subnet address in %+v; ignored", port.IfName, port)
-				log.Error(errStr)
-				port.ParseError = errStr
-				port.ParseErrorTime = time.Now()
+				errStr := fmt.Sprintf("Port %s Configured as DT_STATIC but "+
+					"missing subnet address. SysAdapter - Name: %s, Addr:%s",
+					port.IfName, sysAdapter.Name, sysAdapter.Addr)
+				log.Errorf("parseSystemAdapterConfig: %s", errStr)
+				port.RecordFailure(errStr)
 			}
 		case types.DT_CLIENT:
 			// Do nothing
 		case types.DT_NONE:
 			if isMgmt {
-				errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s: isMgmt with DT_NONE not supported",
-					port.IfName)
-				log.Error(errStr)
-				port.ParseError = errStr
-				port.ParseErrorTime = time.Now()
+				errStr := fmt.Sprintf("Port %s configured as Management port "+
+					"with an unsupported DHCP type %d. Client and static are "+
+					"the only allowed DHCP modes for management ports.",
+					port.IfName, types.DT_NONE)
+
+				log.Errorf("parseSystemAdapterConfig: %s", errStr)
+				port.RecordFailure(errStr)
 			}
 		default:
-			errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s: ignore unsupported dhcp type %v",
+			errStr := fmt.Sprintf("Port %s configured with unknown DHCP type %v",
 				port.IfName, network.Dhcp)
-			log.Error(errStr)
-			port.ParseError = errStr
-			port.ParseErrorTime = time.Now()
+			log.Errorf("parseSystemAdapterConfig: %s", errStr)
+			port.RecordFailure(errStr)
 		}
 		// XXX use DnsNameToIpList?
 		if network != nil && network.Proxy != nil {
 			port.ProxyConfig = *network.Proxy
 		}
 	} else if isMgmt {
-		errStr := fmt.Sprintf("parseSystemAdapterConfig: Port %s isMgmt without networkUUID not supported",
+		errStr := fmt.Sprintf("Port %s Configured as Management port without "+
+			"configuring a Network. Network is required for Management ports",
 			port.IfName)
-		log.Error(errStr)
-		port.ParseError = errStr
-		port.ParseErrorTime = time.Now()
+		log.Errorf("parseSystemAdapterConfig: %s", errStr)
+		port.RecordFailure(errStr)
 	}
 	return port
 }
@@ -797,10 +836,10 @@ func parseDeviceIoListConfig(config *zconfig.EdgeDevConfig,
 	}
 	// XXX secrets like wifi credentials in here
 	if false {
-		log.Infof("parseDeviceIoListConfig: Applying updated config\n"+
-			"prevSha: % x\n"+
-			"NewSha : % x\n"+
-			"deviceIoList: %v\n",
+		log.Infof("parseDeviceIoListConfig: Applying updated config "+
+			"prevSha: % x, "+
+			"NewSha : % x, "+
+			"deviceIoList: %v",
 			deviceIoListPrevConfigHash, configHash, deviceIoList)
 	}
 
@@ -811,7 +850,7 @@ func parseDeviceIoListConfig(config *zconfig.EdgeDevConfig,
 
 	for indx, ioDevicePtr := range deviceIoList {
 		if ioDevicePtr == nil {
-			log.Errorf("parseDeviceIoListConfig: nil ioDevicePtr at indx %d\n",
+			log.Errorf("parseDeviceIoListConfig: nil ioDevicePtr at indx %d",
 				indx)
 			continue
 		}
@@ -856,9 +895,18 @@ func parseDeviceIoListConfig(config *zconfig.EdgeDevConfig,
 	return true
 }
 
-func lookupDeviceIo(getconfigCtx *getconfigContext, logicalLabel string) *types.PhysicalIOAdapter {
+func lookupDeviceIoPhylabel(getconfigCtx *getconfigContext, label string) *types.PhysicalIOAdapter {
 	for _, port := range getconfigCtx.zedagentCtx.physicalIoAdapterMap {
-		if port.Logicallabel == logicalLabel {
+		if port.Phylabel == label {
+			return &port
+		}
+	}
+	return nil
+}
+
+func lookupDeviceIoLogicallabel(getconfigCtx *getconfigContext, label string) *types.PhysicalIOAdapter {
+	for _, port := range getconfigCtx.zedagentCtx.physicalIoAdapterMap {
+		if port.Logicallabel == label {
 			return &port
 		}
 	}
@@ -896,10 +944,10 @@ func parseDatastoreConfig(config *zconfig.EdgeDevConfig,
 	// individual fields. The next commit should separate the sensitive
 	// information into a separate structure - linked by a reference. That
 	//  way, accidental print / log statements won't expose the secrets.
-	log.Infof("parseDatastoreConfig: Applying updated datastore config\n"+
-		"prevSha: % x\n"+
-		"NewSha : % x\n"+
-		"Num Stores: %d\n",
+	log.Infof("parseDatastoreConfig: Applying updated datastore config "+
+		"prevSha: % x, "+
+		"NewSha : % x, "+
+		"Num Stores: %d",
 		datastoreConfigPrevConfigHash, configHash, len(stores))
 	datastoreConfigPrevConfigHash = configHash
 	publishDatastoreConfig(getconfigCtx, stores)
@@ -915,7 +963,7 @@ func publishDatastoreConfig(ctx *getconfigContext,
 		if ds != nil {
 			continue
 		}
-		log.Debugf("publishDatastoresConfig: unpublishing %s\n", k)
+		log.Debugf("publishDatastoresConfig: unpublishing %s", k)
 		ctx.pubDatastoreConfig.Unpublish(k)
 	}
 	for _, ds := range cfgDatastores {
@@ -932,7 +980,8 @@ func publishDatastoreConfig(ctx *getconfigContext,
 		if datastore.Region == "" {
 			datastore.Region = "us-west-2"
 		}
-		datastore.CipherBlock = parseCipherBlock(ctx, ds.GetCipherData())
+		datastore.CipherBlockStatus = parseCipherBlock(ctx, datastore.Key(),
+			ds.GetCipherData())
 		ctx.pubDatastoreConfig.Publish(datastore.Key(), *datastore)
 	}
 }
@@ -945,7 +994,7 @@ func parseStorageConfigList(objType string,
 	for _, drive := range drives {
 		image := new(types.StorageConfig)
 		if drive.Image == nil {
-			log.Errorf("No drive.Image for drive %v\n",
+			log.Errorf("No drive.Image for drive %v",
 				drive)
 			// Pass on for error reporting
 			image.DatastoreID = nilUUID
@@ -1020,7 +1069,7 @@ func publishNetworkXObjectConfig(ctx *getconfigContext,
 		if netEnt != nil {
 			continue
 		}
-		log.Debugf("publishNetworkXObjectConfig: unpublishing %s\n", k)
+		log.Debugf("publishNetworkXObjectConfig: unpublishing %s", k)
 		ctx.pubNetworkXObjectConfig.Unpublish(k)
 	}
 
@@ -1044,8 +1093,8 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 	if err != nil {
 		errStr := fmt.Sprintf("parseOneNetworkXObjectConfig: Malformed UUID ignored: %s",
 			err)
-		config.Error = errStr
-		config.ErrorTime = time.Now()
+		log.Error(errStr)
+		config.SetErrorNow(errStr)
 		return config
 	}
 	config.UUID = id
@@ -1096,7 +1145,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 	}
 
 	// wireless property configuration
-	config.WirelessCfg = parseNetworkWirelessConfig(ctx, netEnt)
+	config.WirelessCfg = parseNetworkWirelessConfig(ctx, config.Key(), netEnt)
 
 	ipspec := netEnt.GetIp()
 	switch config.Type {
@@ -1105,8 +1154,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 			errStr := fmt.Sprintf("parseOneNetworkXObjectConfig: Missing ipspec for %s in %v",
 				config.Key(), netEnt)
 			log.Error(errStr)
-			config.Error = errStr
-			config.ErrorTime = time.Now()
+			config.SetErrorNow(errStr)
 			return config
 		}
 		err := parseIpspecNetworkXObject(ipspec, config)
@@ -1114,8 +1162,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 			errStr := fmt.Sprintf("parseOneNetworkXObjectConfig: parseIpspec failed for %s: %s",
 				config.Key(), err)
 			log.Error(errStr)
-			config.Error = errStr
-			config.ErrorTime = time.Now()
+			config.SetErrorNow(errStr)
 			return config
 		}
 	case types.NT_NOOP:
@@ -1128,8 +1175,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 				errStr := fmt.Sprintf("parseOneNetworkXObjectConfig: parseIpspec ignored for %s: %s",
 					config.Key(), err)
 				log.Error(errStr)
-				config.Error = errStr
-				config.ErrorTime = time.Now()
+				config.SetErrorNow(errStr)
 				return config
 			}
 		}
@@ -1138,8 +1184,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 		errStr := fmt.Sprintf("parseOneNetworkXObjectConfig: Unknown NetworkConfig type %d for %s in %v; ignored",
 			config.Type, id.String(), netEnt)
 		log.Error(errStr)
-		config.Error = errStr
-		config.ErrorTime = time.Now()
+		config.SetErrorNow(errStr)
 		return config
 	}
 
@@ -1161,8 +1206,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 				errStr := fmt.Sprintf("parseOneNetworkXObjectConfig: bad dnsEntry %s for %s",
 					strAddr, config.Key())
 				log.Error(errStr)
-				config.Error = errStr
-				config.ErrorTime = time.Now()
+				config.SetErrorNow(errStr)
 				return config
 			}
 		}
@@ -1177,7 +1221,7 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 	return config
 }
 
-func parseNetworkWirelessConfig(ctx *getconfigContext, netEnt *zconfig.NetworkConfig) types.WirelessConfig {
+func parseNetworkWirelessConfig(ctx *getconfigContext, key string, netEnt *zconfig.NetworkConfig) types.WirelessConfig {
 	var wconfig types.WirelessConfig
 
 	netWireless := netEnt.GetWireless()
@@ -1214,7 +1258,9 @@ func parseNetworkWirelessConfig(ctx *getconfigContext, netEnt *zconfig.NetworkCo
 			wifi.Identity = wificfg.GetIdentity()
 			wifi.Password = wificfg.GetPassword()
 			wifi.Priority = wificfg.GetPriority()
-			wifi.CipherBlock = parseCipherBlock(ctx, wificfg.GetCipherData())
+			key = fmt.Sprintf("%s-%s", key, wifi.SSID)
+			wifi.CipherBlockStatus = parseCipherBlock(ctx, key,
+				wificfg.GetCipherData())
 
 			wconfig.Wifi = append(wconfig.Wifi, wifi)
 		}
@@ -1422,13 +1468,13 @@ func parseUnderlayNetworkConfigEntry(
 		log.Errorf("%s", ulCfg.Error)
 		return ulCfg
 	}
-	log.Infof("NetworkInstance(%s-%s): InstType %v\n",
+	log.Infof("NetworkInstance(%s-%s): InstType %v",
 		cfgApp.Displayname, cfgApp.Uuidandversion.Uuid,
 		networkInstanceEntry.InstType)
 
 	ulCfg.Network = uuid
 	if intfEnt.MacAddress != "" {
-		log.Infof("parseUnderlayNetworkConfig: got static MAC %s\n",
+		log.Infof("parseUnderlayNetworkConfig: got static MAC %s",
 			intfEnt.MacAddress)
 		ulCfg.AppMacAddr, err = net.ParseMAC(intfEnt.MacAddress)
 		if err != nil {
@@ -1440,7 +1486,7 @@ func parseUnderlayNetworkConfigEntry(
 		}
 	}
 	if intfEnt.Addr != "" {
-		log.Infof("parseUnderlayNetworkConfig: got static IP %s\n",
+		log.Infof("parseUnderlayNetworkConfig: got static IP %s",
 			intfEnt.Addr)
 		ulCfg.AppIPAddr = net.ParseIP(intfEnt.Addr)
 		if ulCfg.AppIPAddr == nil {
@@ -1534,7 +1580,7 @@ func parseOverlayNetworkConfigEntry(
 		log.Errorf("%s", olCfg.Error)
 		return olCfg
 	}
-	log.Infof("NetworkInstance(%s-%s): InstType %v\n",
+	log.Infof("NetworkInstance(%s-%s): InstType %v",
 		cfgApp.Displayname, uuid.String(),
 		networkInstanceEntry.InstType)
 
@@ -1677,266 +1723,43 @@ func parseConfigItems(config *zconfig.EdgeDevConfig, ctx *getconfigContext) {
 	if same {
 		return
 	}
-	log.Infof("parseConfigItems: Applying updated config\n"+
-		"prevSha: % x\n"+
-		"NewSha : % x\n"+
-		"items: %v\n",
+	log.Infof("parseConfigItems: Applying updated config "+
+		"prevSha: % x, "+
+		"NewSha : % x, "+
+		"items: %v",
 		itemsPrevConfigHash, configHash, items)
 
 	// Start with the defaults so that we revert to default when no data
-	// If there is Error Value for an item, we use the Default value
-	// instead - NOT the current value. This guarantees a known state for the
-	// Config item:
-	//      1) Use the specified Value if no Errors
-	//      2) Use the Default value if Value cannot be parsed.
-	//      3) Use the Min. Value if the specified value < Min ( For Ints )
-	//      4) Use the Max. Value if the specified value > Max ( For Ints )
+	// 1) Use the specified Value if no Errors
+	// 2) Is there are Errors ( Parse Errors or > Max or  < Min errors),
+	//  retain the previous value with Error set. In case of val > Max
+	//  or val < Min, Do not try to correct it. Either take the specified
+	//  value or retain the previous value.
 	gcPtr := &ctx.zedagentCtx.globalConfig
-	newGlobalConfig := types.GlobalConfigDefaults
+	newGlobalConfig := types.DefaultConfigItemValueMap()
+	// Note: UsbAccess is special in that it has two defaults.
+	// When the device first boots the default is "true" as specified
+	// in the DefaultConfigItemValueMap. But when connecting to the
+	// controller, if the controller does not include the item, it
+	// should default to "false".
+	// That way bringup of new hardware models can be done using an
+	// attached keyboard.
+	newGlobalConfig.SetGlobalValueBool(types.UsbAccess, false)
+	newGlobalStatus := types.NewGlobalStatus()
 
-	newGlobalStatus := types.GlobalStatus{}
-	newGlobalStatus.ConfigItems = make(map[string]types.ConfigItemStatus)
-	newGlobalStatus.UnknownConfigItems = make(map[string]types.ConfigItemStatus)
-
-	unknownConfigItem := false
-	var err error
 	for _, item := range items {
-		key := item.Key
-		log.Infof("parseConfigItems key %s value %s\n", key, item.Value)
-		switch key {
-		case "timer.config.interval":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.ConfigInterval = uint32(i64)
-			}
-
-		case "timer.metric.interval":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.MetricInterval = uint32(i64)
-			}
-
-		case "timer.send.timeout":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkSendTimeout = uint32(i64)
-			}
-
-		case "timer.reboot.no.network":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.ResetIfCloudGoneTime = uint32(i64)
-			}
-
-		case "timer.update.fallback.no.network":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.FallbackIfCloudGoneTime = uint32(i64)
-			}
-
-		case "timer.test.baseimage.update":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.MintimeUpdateSuccess = uint32(i64)
-			}
-
-		case "timer.port.georedo":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkGeoRedoTime = uint32(i64)
-			}
-
-		case "timer.port.georetry":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkGeoRetryTime = uint32(i64)
-			}
-
-		case "timer.port.testduration":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkTestDuration = uint32(i64)
-			}
-
-		case "timer.port.testinterval":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkTestInterval = uint32(i64)
-			}
-
-		case "timer.port.timeout":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkTestTimeout = uint32(i64)
-			}
-
-		case "timer.port.testbetterinterval":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.NetworkTestBetterInterval = uint32(i64)
-			}
-
-		case "network.fallback.any.eth":
-			newTs, err := types.ParseTriState(item.Value)
-			if err == nil {
-				newGlobalConfig.NetworkFallbackAnyEth = newTs
-			}
-
-		case "debug.enable.usb":
-			newBool, err := strconv.ParseBool(item.Value)
-			if err == nil {
-				newGlobalConfig.UsbAccess = newBool
-			}
-
-		case "debug.enable.ssh":
-			if strings.HasPrefix(item.Value, "ssh") {
-				newGlobalConfig.SshAuthorizedKeys = item.Value
-				newGlobalConfig.SshAccess = true
-			} else {
-				err = fmt.Errorf("Invalid value for debug.enable.ssh. "+
-					"Not starting with prefix ssh. Value: %s", item.Value)
-			}
-
-		case "app.allow.vnc":
-			newBool, err := strconv.ParseBool(item.Value)
-			if err == nil {
-				newGlobalConfig.AllowAppVnc = newBool
-			}
-
-		case "timer.use.config.checkpoint":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.StaleConfigTime = uint32(i64)
-			}
-
-		case "timer.gc.download":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.DownloadGCTime = uint32(i64)
-			}
-
-		case "timer.gc.vdisk":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.VdiskGCTime = uint32(i64)
-			}
-
-		case "timer.gc.rkt.graceperiod":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.RktGCGracePeriod = uint32(i64)
-			}
-
-		case "timer.download.retry":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.DownloadRetryTime = uint32(i64)
-			}
-
-		case "timer.boot.retry":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.DomainBootRetryTime = uint32(i64)
-			}
-
-		case "network.allow.wwan.app.download":
-			newTs, err := types.ParseTriState(item.Value)
-			if err == nil {
-				newGlobalConfig.AllowNonFreeAppImages = newTs
-			}
-
-		case "network.allow.wwan.baseos.download":
-			newTs, err := types.ParseTriState(item.Value)
-			if err == nil {
-				newGlobalConfig.AllowNonFreeBaseImages = newTs
-			}
-
-		case "debug.default.loglevel":
-			newGlobalConfig.DefaultLogLevel = item.Value
-
-		case "debug.default.remote.loglevel":
-			newGlobalConfig.DefaultRemoteLogLevel = item.Value
-
-		case "storage.dom0.disk.minusage.percent":
-			i64, err := strconv.ParseUint(item.Value, 10, 32)
-			if err == nil {
-				newGlobalConfig.Dom0MinDiskUsagePercent = uint32(i64)
-			}
-			// Max diskspace for dom0 is 80%.
-			if newGlobalConfig.Dom0MinDiskUsagePercent > 80 {
-				err = fmt.Errorf("dom0MinDiskUsagePercent (%d) "+
-					"> maxAllowed (80). Setting it to 80.",
-					newGlobalConfig.Dom0MinDiskUsagePercent)
-				log.Errorf("parseConfigItems: %s", err)
-				newGlobalConfig.Dom0MinDiskUsagePercent = 80
-			}
-			log.Infof("Set storage.dom0MinDiskUsagePercent to %d",
-				newGlobalConfig.Dom0MinDiskUsagePercent)
-
-		case "storage.apps.ignore.disk.check":
-			newBool, err := strconv.ParseBool(item.Value)
-			if err != nil {
-				log.Errorf("parseConfigItems: bad bool value %s for %s: %s\n",
-					item.Value, key, err)
-				continue
-			}
-			newGlobalConfig.IgnoreDiskCheckForApps = newBool
-
-		default:
-			// Handle agentname items for loglevels
-			newString := item.Value
-			components := strings.Split(key, ".")
-			if len(components) == 3 && components[0] == "debug" &&
-				components[2] == "loglevel" {
-
-				agentName := components[1]
-				current := agentlog.LogLevel(gcPtr, agentName)
-				if current != newString && newString != "" {
-					log.Infof("parseConfigItems: %s change from %v to %v\n",
-						key, current, newString)
-					agentlog.SetLogLevel(&newGlobalConfig,
-						agentName, newString)
-				} else {
-					agentlog.SetLogLevel(&newGlobalConfig,
-						agentName, current)
-				}
-			} else if len(components) == 4 && components[0] == "debug" &&
-				components[2] == "remote" && components[3] == "loglevel" {
-				agentName := components[1]
-				current := agentlog.RemoteLogLevel(gcPtr, agentName)
-				if current != newString && newString != "" {
-					log.Infof("parseConfigItems: %s change from %v to %v\n",
-						key, current, newString)
-					agentlog.SetRemoteLogLevel(&newGlobalConfig,
-						agentName, newString)
-				} else {
-					agentlog.SetRemoteLogLevel(&newGlobalConfig,
-						agentName, current)
-				}
-			} else {
-				unknownConfigItem = true
-				err = fmt.Errorf("Unknown configItem %s value %s\n",
-					key, item.Value)
-				log.Errorf("parseConfigItems: %s", err)
-			}
+		itemValue, err := ctx.zedagentCtx.specMap.ParseItem(newGlobalConfig,
+			gcPtr, item.Key, item.Value)
+		newGlobalStatus.ConfigItems[item.Key] = types.ConfigItemStatus{
+			Err:   err,
+			Value: itemValue.StringValue(),
 		}
-		if err != nil {
-			if unknownConfigItem {
-				newGlobalStatus.UnknownConfigItems[key] =
-					types.ConfigItemStatus{Value: item.Value, Err: err}
-			} else {
-				err = fmt.Errorf("bad value %s for %s. Error: %s\n",
-					item.Value, key, err)
-				newGlobalStatus.ConfigItems[key] =
-					types.ConfigItemStatus{Err: err}
-				log.Errorf("parseConfigItems: %s", err)
-			}
-			unknownConfigItem = false
-			err = nil
-		}
+		log.Debugf("Processed ConfigItem: key: %s, Value: %s, itemValue: %+v",
+			item.Key, item.Value, itemValue)
 	}
-	ctx.zedagentCtx.globalStatus = newGlobalStatus
-	newGlobalConfig = types.ApplyGlobalConfig(newGlobalConfig)
+	log.Debugf("Done with Parsing ConfigItems. globalStatus: %+v",
+		*newGlobalStatus)
+	ctx.zedagentCtx.globalStatus = *newGlobalStatus
 	// XXX - Should we also not call EnforceGlobalConfigMinimums on
 	// newGlobalConfig here before checking if anything changed??
 	// Also - if we changed the Config Value based on Min / Max, we should
@@ -1944,39 +1767,42 @@ func parseConfigItems(config *zconfig.EdgeDevConfig, ctx *getconfigContext) {
 	if !cmp.Equal(*gcPtr, newGlobalConfig) {
 		log.Infof("parseConfigItems: change %v",
 			cmp.Diff(*gcPtr, newGlobalConfig))
-
 		oldGlobalConfig := *gcPtr
-		*gcPtr = types.EnforceGlobalConfigMinimums(newGlobalConfig)
+		*gcPtr = *newGlobalConfig
 
 		// Set GlobalStatus Values from GlobalConfig.
-		newGlobalStatus.UpdateItemValuesFromGlobalConfig(*gcPtr)
+		oldConfigInterval := oldGlobalConfig.GlobalValueInt(types.ConfigInterval)
+		newConfigInterval := newGlobalConfig.GlobalValueInt(types.ConfigInterval)
 
-		if gcPtr.ConfigInterval != oldGlobalConfig.ConfigInterval {
-			log.Infof("parseConfigItems: %s change from %d to %d\n",
-				"ConfigInterval",
-				oldGlobalConfig.ConfigInterval, gcPtr.ConfigInterval)
-			updateConfigTimer(gcPtr.ConfigInterval, ctx.configTickerHandle)
+		oldMetricInterval := oldGlobalConfig.GlobalValueInt(types.MetricInterval)
+		newMetricInterval := newGlobalConfig.GlobalValueInt(types.MetricInterval)
+
+		oldSSHAuthorizedKeys := oldGlobalConfig.GlobalValueString(types.SSHAuthorizedKeys)
+		newSSHAuthorizedKeys := newGlobalConfig.GlobalValueString(types.SSHAuthorizedKeys)
+
+		if newConfigInterval != oldConfigInterval {
+			log.Infof("parseConfigItems: %s change from %d to %d",
+				"ConfigInterval", oldConfigInterval, newConfigInterval)
+			updateConfigTimer(newConfigInterval, ctx.configTickerHandle)
 		}
-		if gcPtr.MetricInterval != oldGlobalConfig.MetricInterval {
-			log.Infof("parseConfigItems: %s change from %d to %d\n",
-				"MetricInterval",
-				oldGlobalConfig.MetricInterval, gcPtr.MetricInterval)
-			updateMetricsTimer(gcPtr.MetricInterval, ctx.metricsTickerHandle)
+		if newMetricInterval != oldMetricInterval {
+			log.Infof("parseConfigItems: %s change from %d to %d",
+				"MetricInterval", oldMetricInterval, newMetricInterval)
+			updateMetricsTimer(newMetricInterval, ctx.metricsTickerHandle)
 		}
-		if gcPtr.SshAuthorizedKeys != oldGlobalConfig.SshAuthorizedKeys {
-			log.Infof("parseConfigItems: %v change from %v to %v",
-				"SshAuthorizedKeys",
-				oldGlobalConfig.SshAuthorizedKeys, gcPtr.SshAuthorizedKeys)
-			ssh.UpdateSshAuthorizedKeys(gcPtr.SshAuthorizedKeys)
+		if newSSHAuthorizedKeys != oldSSHAuthorizedKeys {
+			log.Infof("parseConfigItems: %s changed from %v to %v",
+				"SshAuthorizedKeys", oldSSHAuthorizedKeys, newSSHAuthorizedKeys)
+			ssh.UpdateSshAuthorizedKeys(newSSHAuthorizedKeys)
 		}
 		pub := ctx.zedagentCtx.pubGlobalConfig
 		err := pub.Publish("global", *gcPtr)
 		if err != nil {
 			// XXX - IS there a valid reason for this to Fail? If not, we should
 			//  fo log.Fatalf here..
-			log.Errorf("PublishToDir for globalConfig failed %s\n",
-				err)
+			log.Errorf("PublishToDir for globalConfig failed %s", err)
 		}
+		triggerPublishDevInfo(ctx.zedagentCtx)
 	}
 }
 
@@ -1984,7 +1810,7 @@ func publishAppInstanceConfig(getconfigCtx *getconfigContext,
 	config types.AppInstanceConfig) {
 
 	key := config.Key()
-	log.Debugf("publishAppInstanceConfig UUID %s\n", key)
+	log.Debugf("publishAppInstanceConfig UUID %s", key)
 	pub := getconfigCtx.pubAppInstanceConfig
 	pub.Publish(key, config)
 }
@@ -1993,7 +1819,7 @@ func publishBaseOsConfig(getconfigCtx *getconfigContext,
 	config *types.BaseOsConfig) {
 
 	key := config.Key()
-	log.Debugf("publishBaseOsConfig UUID %s, %s, activate %v\n",
+	log.Debugf("publishBaseOsConfig UUID %s, %s, activate %v",
 		key, config.BaseOsVersion, config.Activate)
 	pub := getconfigCtx.pubBaseOsConfig
 	pub.Publish(key, *config)
@@ -2073,7 +1899,7 @@ func publishCertObjConfig(getconfigCtx *getconfigContext,
 	config *types.CertObjConfig, uuidStr string) {
 
 	key := uuidStr // XXX vs. config.Key()?
-	log.Debugf("publishCertObjConfig(%s) key %s\n", uuidStr, config.Key())
+	log.Debugf("publishCertObjConfig(%s) key %s", uuidStr, config.Key())
 	pub := getconfigCtx.pubCertObjConfig
 	pub.Publish(key, *config)
 }
@@ -2081,11 +1907,11 @@ func publishCertObjConfig(getconfigCtx *getconfigContext,
 func unpublishCertObjConfig(getconfigCtx *getconfigContext, uuidStr string) {
 
 	key := uuidStr
-	log.Debugf("unpublishCertObjConfig(%s)\n", key)
+	log.Debugf("unpublishCertObjConfig(%s)", key)
 	pub := getconfigCtx.pubCertObjConfig
 	c, _ := pub.Get(key)
 	if c == nil {
-		log.Errorf("unpublishCertObjConfig(%s) not found\n", key)
+		log.Errorf("unpublishCertObjConfig(%s) not found", key)
 		return
 	}
 	pub.Unpublish(key)
@@ -2096,7 +1922,7 @@ func unpublishCertObjConfig(getconfigCtx *getconfigContext, uuidStr string) {
 func computeConfigSha(msg interface{}) []byte {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Fatalf("computeConfigSha: proto.Marshal: %s\n", err)
+		log.Fatalf("computeConfigSha: proto.Marshal: %s", err)
 	}
 	h := sha256.New()
 	h.Write(data)
@@ -2108,7 +1934,7 @@ func computeConfigSha(msg interface{}) []byte {
 func computeConfigElementSha(h hash.Hash, msg interface{}) {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Fatalf("computeConfigItemSha: json.Marshal: %s\n", err)
+		log.Fatalf("computeConfigItemSha: json.Marshal: %s", err)
 	}
 	h.Write(data)
 }
@@ -2121,6 +1947,40 @@ func parseOpCmds(config *zconfig.EdgeDevConfig,
 	return scheduleReboot(config.GetReboot(), getconfigCtx)
 }
 
+func readRebootConfig() types.DeviceOpsCmd {
+	rebootConfig := types.DeviceOpsCmd{}
+
+	log.Debugf("readRebootConfigCounter - reading %s", rebootConfigFilename)
+
+	bytes, err := ioutil.ReadFile(rebootConfigFilename)
+	if err == nil {
+		err = json.Unmarshal(bytes, &rebootConfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		// Check if the file exists - if not, create one with
+		// default rebootConfig
+		log.Infof("readRebootConfigCounter - %s doesn't exist. Creating it. "+
+			"rebootConfig.Counter: %d",
+			rebootConfigFilename, rebootConfig.Counter)
+		saveRebootConfig(rebootConfig)
+	}
+	return rebootConfig
+}
+
+func saveRebootConfig(reboot types.DeviceOpsCmd) {
+	log.Infof("saveRebootConfig - reboot.Counter: %d", reboot.Counter)
+	bytes, err := json.Marshal(reboot)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = fileutils.WriteRename(rebootConfigFilename, bytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 var rebootPrevConfigHash []byte
 var rebootPrevReturn bool
 
@@ -2128,7 +1988,7 @@ var rebootPrevReturn bool
 func scheduleReboot(reboot *zconfig.DeviceOpsCmd,
 	getconfigCtx *getconfigContext) bool {
 	if reboot == nil {
-		log.Infof("scheduleReboot - removing %s\n",
+		log.Infof("scheduleReboot - removing %s",
 			rebootConfigFilename)
 		// remove the existing file
 		os.Remove(rebootConfigFilename)
@@ -2142,55 +2002,27 @@ func scheduleReboot(reboot *zconfig.DeviceOpsCmd,
 		return rebootPrevReturn
 	}
 
-	log.Infof("scheduleReboot: Applying updated config %v\n", reboot)
-
-	if _, err := os.Stat(rebootConfigFilename); err != nil {
-		// Take received as current and store in file
-		log.Infof("scheduleReboot - writing initial %s\n",
-			rebootConfigFilename)
-		bytes, err := json.Marshal(reboot)
-		if err != nil {
-			log.Fatal(err)
-		}
-		err = fileutils.WriteRename(rebootConfigFilename, bytes)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-	rebootConfig := &zconfig.DeviceOpsCmd{}
-
-	log.Infof("scheduleReboot - reading %s\n",
-		rebootConfigFilename)
-	// read old reboot config
-	bytes, err := ioutil.ReadFile(rebootConfigFilename)
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = json.Unmarshal(bytes, rebootConfig)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Infof("scheduleReboot read %v\n", rebootConfig)
+	log.Infof("scheduleReboot: Applying updated config %v", reboot)
+	rebootConfig := readRebootConfig()
+	log.Infof("scheduleReboot - CurrentRebootConfig %v", rebootConfig)
 
 	// If counter value has changed it means new reboot event
 	if rebootConfig.Counter != reboot.Counter {
 
-		log.Infof("scheduleReboot: old %d new %d\n",
+		log.Infof("scheduleReboot: old %d new %d",
 			rebootConfig.Counter, reboot.Counter)
-
 		// store current config, persistently
-		bytes, err = json.Marshal(reboot)
-		if err == nil {
-			err := fileutils.WriteRename(rebootConfigFilename, bytes)
-			if err != nil {
-				log.Errorf("scheduleReboot: failed %s\n",
-					err)
-			}
+		rebootCmd := types.DeviceOpsCmd{
+			Counter:      reboot.Counter,
+			DesiredState: reboot.DesiredState,
+			OpsTime:      reboot.OpsTime,
 		}
+		saveRebootConfig(rebootCmd)
+		getconfigCtx.zedagentCtx.rebootConfigCounter = reboot.Counter
 
 		// if device reboot is set, ignore op-command
 		if getconfigCtx.zedagentCtx.deviceReboot {
-			log.Warnf("device reboot is set\n")
+			log.Warnf("device reboot is set")
 			return false
 		}
 
@@ -2198,7 +2030,7 @@ func scheduleReboot(reboot *zconfig.DeviceOpsCmd,
 		ctx := getconfigCtx.zedagentCtx
 		if getconfigCtx.updateInprogress {
 			// Wait until TestComplete
-			log.Warnf("Rebooting even though testing inprogress; defer\n")
+			log.Warnf("Rebooting even though testing inprogress; defer")
 			ctx.rebootCmdDeferred = true
 			return false
 		}
@@ -2225,8 +2057,8 @@ func scheduleBackup(backup *zconfig.DeviceOpsCmd) {
 	if same {
 		return
 	}
-	log.Infof("scheduleBackup: Applying updated config %v\n", backup)
-	log.Errorf("XXX handle Backup Config: %v\n", backup)
+	log.Infof("scheduleBackup: Applying updated config %v", backup)
+	log.Errorf("XXX handle Backup Config: %v", backup)
 }
 
 // user driven reboot command,

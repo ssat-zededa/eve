@@ -66,6 +66,23 @@ type DronaRequest struct {
 
 	// Download counter
 	retry int
+
+	// Image Sha256
+	ImageSha256 string
+
+	// used by Multipart upload
+	Adata  []byte
+	PartID int64
+	SasURI string
+
+	// used by azure and s3 while Multipart Upload
+	Blocks []string
+	// generated SasURI TTL
+	Duration time.Duration
+	// generated while creating multipart file
+	UploadID string
+	// generated after uploading the part to the multipart file
+	EtagID string
 }
 
 // Return object local name
@@ -195,6 +212,13 @@ func (req *DronaRequest) GetStatus() string {
 	req.Lock()
 	defer req.Unlock()
 	return req.status
+}
+
+// GetSha256 returns an image sha256
+func (req *DronaRequest) GetSha256() string {
+	req.Lock()
+	defer req.Unlock()
+	return req.ImageSha256
 }
 
 type SyncMetaFile struct {

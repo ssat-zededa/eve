@@ -14,9 +14,14 @@ import (
 	"fmt"
 	etpm "github.com/lf-edge/eve/pkg/pillar/evetpm"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ocsp"
 	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,16 +84,22 @@ func GetTlsConfig(dns *types.DeviceNetworkStatus, serverName string, clientCert 
 		clientCert = &deviceTLSCert
 	}
 
-	var v2api bool
-	if ctx != nil {
-		v2api = ctx.V2API
-	} else {
-		// XXX wstunnel currently not passing ctx, assume v1 for now
-		v2api = false
-	}
 	// Load CA certificates
+	// The RootCA will have both wellknown signed CA and private root CA
+	// This allows the V2 API transition to be decoupled from the server
+	// certificate transition.
+	// - First the cloud server move to support V2
+	// - Then edge devices move to new image with V2 support and start to use
+	//   V2 API
+	// - When all the remote edge devices are on V2 API capable image, the server
+	//   can switch the certificate from private CA to well-known signed CA
+	// Thus V1 device can only talk to server with private Root-CA, V2
+	// device can talk to V2 enabled server with either private or well-known Root-CAs
+	// and only V2 includes proxy Cert CA
 	caCertPool := x509.NewCertPool()
-	if v2api {
+
+	if ctx != nil && ctx.V2API {
+		// Load the well-known CAs
 		line, err := ioutil.ReadFile(types.V2TLSCertShaFilename)
 		if err != nil {
 			return nil, err
@@ -105,10 +116,10 @@ func GetTlsConfig(dns *types.DeviceNetworkStatus, serverName string, clientCert 
 			log.Errorf(errStr)
 			return nil, errors.New(errStr)
 		}
+
 		// Append any proxy certs from any interface/port to caCertPool
 		for _, port := range dns.Ports {
 			for _, pem := range port.ProxyConfig.ProxyCertPEM {
-				log.Infof("XXX adding proxycerts from %s", port.IfName)
 				if !caCertPool.AppendCertsFromPEM(pem) {
 					errStr := fmt.Sprintf("Failed to append ProxyCertPEM %s for %s",
 						string(pem), port.IfName)
@@ -117,22 +128,26 @@ func GetTlsConfig(dns *types.DeviceNetworkStatus, serverName string, clientCert 
 				}
 			}
 		}
-		if ctx != nil {
-			// save the proxy certs in zedcloud Context, could be empty
-			ctx.PrevCertPEM = cacheProxyCerts(dns)
-		}
-	} else {
-		caCert, err := ioutil.ReadFile(types.RootCertFileName)
-		if err != nil {
-			return nil, err
-		}
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			errStr := fmt.Sprintf("Failed to append certs from %s",
-				types.RootCertFileName)
-			log.Errorf(errStr)
-			return nil, errors.New(errStr)
-		}
 	}
+
+	// Also append the v1's private signed root-cert
+	caCert1, err := ioutil.ReadFile(types.RootCertFileName)
+	if err != nil {
+		return nil, err
+	}
+	if !caCertPool.AppendCertsFromPEM(caCert1) {
+		errStr := fmt.Sprintf("Failed to append certs from %s",
+			types.RootCertFileName)
+		log.Errorf(errStr)
+		return nil, errors.New(errStr)
+	}
+
+	// Add on proxy certs if any
+	if ctx != nil && ctx.V2API {
+		// save the proxy certs in zedcloud Context, could be empty
+		ctx.PrevCertPEM = cacheProxyCerts(dns)
+	}
+
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{*clientCert},
 		ServerName:   serverName,
@@ -193,17 +208,17 @@ func checkProxyCertsChanged(ctx *ZedCloudContext, dns *types.DeviceNetworkStatus
 }
 
 // UpdateTLSProxyCerts - Update when DeviceNetworkStatus changes
-func UpdateTLSProxyCerts(ctx *ZedCloudContext) {
+func UpdateTLSProxyCerts(ctx *ZedCloudContext) bool {
 	tlsCfg := ctx.TlsConfig
 	devNS := ctx.DeviceNetworkStatus
 	if tlsCfg == nil || devNS == nil {
 		log.Errorln("UpdateTLSProxyCerts: tlsconfig or dev NS missing")
-		return
+		return false
 	}
 
 	if checkProxyCertsChanged(ctx, devNS) {
 		// we have the proxy certs already or both empty, no change
-		return
+		return false
 	}
 
 	var caCertPool *x509.CertPool
@@ -215,7 +230,7 @@ func UpdateTLSProxyCerts(ctx *ZedCloudContext) {
 		if err != nil {
 			errStr := fmt.Sprintf("Failed to read V2TLSCertShaFilename")
 			log.Errorf(errStr)
-			return
+			return false
 		}
 		sha := strings.TrimSpace(string(line))
 		v2RootFilename := types.CertificateDirname + "/" + sha
@@ -223,12 +238,12 @@ func UpdateTLSProxyCerts(ctx *ZedCloudContext) {
 		if err != nil {
 			errStr := fmt.Sprintf("Failed to read v2RootFilename")
 			log.Errorf(errStr)
-			return
+			return false
 		}
 		if !caCertPool.AppendCertsFromPEM(caCert) {
 			errStr := fmt.Sprintf("Failed to append certs from %s", v2RootFilename)
 			log.Errorf(errStr)
-			return
+			return false
 		}
 		log.Infof("UpdateTLSProxyCerts: rebuild root CA\n")
 	} else {
@@ -241,15 +256,19 @@ func UpdateTLSProxyCerts(ctx *ZedCloudContext) {
 			if !caCertPool.AppendCertsFromPEM(pem) {
 				errStr := fmt.Sprintf("Failed to append certs from proxy pem")
 				log.Errorf(errStr)
-				return
+				return false
 			}
 		}
 	}
+
+	// May updating the /etc/ssl/certs for proxy certs in /usr/local/share/ca-certificates directory
+	updateEtcSSLforProxyCerts(ctx, devNS)
 
 	log.Infof("UpdateTLSProxyCerts: root CA updated")
 	ctx.TlsConfig.RootCAs = caCertPool
 	// save the new proxy Certs, or null it out
 	ctx.PrevCertPEM = cacheProxyCerts(devNS)
+	return true
 }
 
 func stapledCheck(connState *tls.ConnectionState) bool {
@@ -284,4 +303,51 @@ func stapledCheck(connState *tls.ConnectionState) bool {
 		log.Errorln("Certificate Status Revoked")
 	}
 	return resp.Status == ocsp.Good
+}
+
+func updateEtcSSLforProxyCerts(ctx *ZedCloudContext, dns *types.DeviceNetworkStatus) {
+	// Only zedagent is to update the host ca-certificates
+	if !ctx.V2API || ctx.AgentName != "zedagent" {
+		log.Infof("updateEtcSSLforProxyCerts: skip agent %s", ctx.AgentName)
+		return
+	}
+
+	proxyCertPrefix := "/proxy-cert-"
+	proxyCertDirFile := types.ShareCertDirname + proxyCertPrefix
+	err := filepath.Walk(types.ShareCertDirname, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Error(err)
+		}
+		if path != types.ShareCertDirname && info.IsDir() {
+			return filepath.SkipDir
+		}
+		if strings.HasPrefix(path, proxyCertDirFile) {
+			log.Infof("updateEtcSSLforProxyCerts: remove file %s", path)
+			os.Remove(path)
+		}
+		return err
+	})
+	if err != nil {
+		log.Errorf("updateEtcSSLforProxyCerts: reomove proxy certs (%s)", err)
+	}
+
+	newCerts := cacheProxyCerts(dns)
+	for i, pem := range newCerts {
+		proxyFilename := proxyCertDirFile + strconv.Itoa(i) + ".pem"
+		err = fileutils.WriteRename(proxyFilename, pem)
+		if err != nil {
+			log.Errorf("updateEtcSSLforProxyCerts: file %s save err %v", proxyFilename, err)
+		}
+		log.Infof("updateEtcSSLforProxyCerts: file saved to %s", proxyFilename)
+	}
+
+	cmdName := "/usr/sbin/update-ca-certificates"
+	cmd := exec.Command(cmdName)
+	log.Infof("updateEtcSSLforProxyCerts: Calling command %s", cmdName)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Errorf("updateEtcSSLforProxyCerts: update-ca-certificates, certs num %d, (%s)", len(newCerts), err)
+	} else {
+		log.Infof("updateEtcSSLforProxyCerts: update-ca-certificates %s, certs num %d", out, len(newCerts))
+	}
 }

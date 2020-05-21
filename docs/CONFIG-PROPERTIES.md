@@ -12,7 +12,6 @@
 | timer.use.config.checkpoint | integer in seconds | 600 | use checkpointed config if no cloud connectivity |
 | timer.gc.download | integer in seconds |  600 | garbage collect unused downloaded objects |
 | timer.gc.vdisk | integer in seconds | 1 hour | garbage collect unused instance virtual disk |
-| timer.gc.rkt.graceperiod | integer in seconds | 3600 | grace period to be used in rkt gc command |
 | timer.download.retry | integer in seconds | 600 | retry a failed download |
 | timer.boot.retry | integer in seconds | 600 | retry a failed domain boot |
 | timer.port.georedo | integer in seconds | 1 hour | redo IP geolocation |
@@ -31,9 +30,12 @@
 | storage.dom0.disk.minusage.percent | integer percent | 20 | min. percent of persist partition reserved for dom0 |
 | storage.apps.ignore.disk.check | boolean | false | Ignore disk usage check for Apps. Allows apps to create images bigger than available disk|
 
-In addition, for each agentname, there are specific overrides for the default ones with the names:
+
+In addition, there can be per-agent settings.
+The Per-agent settings begin with "agent.*agentame*.*setting*"
+The following per-agent settings override the corresponding default ones:
 
 | Name | Type | Description |
 | ---- | ---- | ----------- |
-| debug.*agentname*.loglevel | string | if set overrides debug.default.loglevel |
-| debug.*agentname*.remote.loglevel | string | if set overrides debug.default.remote.loglevel |
+| agent.*agentname*.loglevel | string | if set overrides debug.default.loglevel | (Legacy setting debug.*agentname*.loglevel still supported)
+| agent.*agentname*.remote.loglevel | string | if set overrides debug.default.remote.loglevel | (Legacy setting debug.*agentname*.remote.loglevel)

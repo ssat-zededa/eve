@@ -17,24 +17,35 @@ import (
 func handlePersistCreate(ctx *verifierContext, objType string,
 	config *types.PersistImageConfig) {
 
-	log.Infof("handlePersistCreate(%s) objType %s for %s\n",
+	log.Infof("handlePersistCreate(%s) objType %s for %s",
 		config.ImageSha256, objType, config.Name)
 	if objType == "" {
-		log.Fatalf("handlePersistCreate: No ObjType for %s\n",
+		log.Fatalf("handlePersistCreate: No ObjType for %s",
 			config.ImageSha256)
 	}
-
-	status := types.PersistImageStatus{
-		VerifyStatus: types.VerifyStatus{
-			Name:        config.Name,
-			ObjType:     objType,
-			ImageSha256: config.ImageSha256,
-		},
-		RefCount: config.RefCount,
-		LastUse:  time.Now(),
+	// Require a status since we otherwise don't have a FileLocation
+	var status *types.PersistImageStatus
+	status = lookupPersistImageStatus(ctx, objType, config.ImageSha256)
+	if status == nil {
+		status = &types.PersistImageStatus{
+			VerifyStatus: types.VerifyStatus{
+				Name:         config.Name,
+				ObjType:      objType,
+				FileLocation: config.FileLocation,
+				ImageSha256:  config.ImageSha256,
+				Size:         config.Size,
+			},
+			LastUse:  time.Now(),
+			RefCount: config.RefCount,
+		}
+	} else {
+		// Update
+		status.Name = config.Name
+		status.RefCount = config.RefCount
+		status.LastUse = time.Now()
 	}
-	publishPersistImageStatus(ctx, &status)
-	log.Infof("handlePersistCreate done for %s\n", config.Name)
+	publishPersistImageStatus(ctx, status)
+	log.Infof("handlePersistCreate done for %s", config.Name)
 }
 
 // Track RefCount on persistent object
@@ -48,13 +59,13 @@ func handlePersistModify(ctx *verifierContext, config *types.PersistImageConfig,
 		status.RefCount)
 
 	if status.ObjType == "" {
-		log.Fatalf("handlePersistModify: No ObjType for %s\n",
+		log.Fatalf("handlePersistModify: No ObjType for %s",
 			status.ImageSha256)
 	}
 
 	// Always update RefCount
 	if status.RefCount != config.RefCount {
-		log.Infof("handlePersistModify RefCount change %s from %d to %d Expired %v\n",
+		log.Infof("handlePersistModify RefCount change %s from %d to %d Expired %v",
 			config.Name, status.RefCount, config.RefCount,
 			status.Expired)
 		status.RefCount = config.RefCount
@@ -65,7 +76,7 @@ func handlePersistModify(ctx *verifierContext, config *types.PersistImageConfig,
 	if status.RefCount == 0 {
 		// GC timer will clean up by marking status Expired
 		// and some point in time.
-		// Then user (zedmanager/baseosmgr) will delete config.
+		// Then user (volumemgr) will delete config.
 		status.LastUse = time.Now()
 		changed = true
 	}
@@ -79,12 +90,12 @@ func handlePersistModify(ctx *verifierContext, config *types.PersistImageConfig,
 
 func handlePersistDelete(ctx *verifierContext, status *types.PersistImageStatus) {
 
-	log.Infof("handlePersistDelete(%s) objType %s refcount %d lastUse %v Expired %v\n",
+	log.Infof("handlePersistDelete(%s) objType %s refcount %d lastUse %v Expired %v",
 		status.ImageSha256, status.ObjType, status.RefCount,
 		status.LastUse, status.Expired)
 
 	if status.ObjType == "" {
-		log.Fatalf("handlePersistDelete: No ObjType for %s\n",
+		log.Fatalf("handlePersistDelete: No ObjType for %s",
 			status.ImageSha256)
 	}
 
@@ -93,15 +104,15 @@ func handlePersistDelete(ctx *verifierContext, status *types.PersistImageStatus)
 	_, err := os.Stat(verifiedDirname)
 	if err == nil {
 		if _, err := os.Stat(preserveFilename); err != nil {
-			log.Infof("handlePersistDelete removing %s\n", verifiedDirname)
+			log.Infof("handlePersistDelete removing %s", verifiedDirname)
 			if err := os.RemoveAll(verifiedDirname); err != nil {
 				log.Fatal(err)
 			}
 		} else {
-			log.Infof("handlePersistDelete preserving %s\n", verifiedDirname)
+			log.Infof("handlePersistDelete preserving %s", verifiedDirname)
 		}
 	}
 
 	unpublishPersistImageStatus(ctx, status)
-	log.Infof("handlePersistDelete done for %s\n", status.ImageSha256)
+	log.Infof("handlePersistDelete done for %s", status.ImageSha256)
 }

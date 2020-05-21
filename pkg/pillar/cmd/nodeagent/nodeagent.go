@@ -17,8 +17,8 @@ package nodeagent
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
+	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -29,9 +29,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/iptables"
-	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
-	pubsublegacy "github.com/lf-edge/eve/pkg/pillar/pubsub/legacy"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zboot"
@@ -63,9 +61,10 @@ const (
 var Version = "No version specified"
 
 type nodeagentContext struct {
+	agentBaseContext       agentbase.Context
 	GCInitialized          bool // Received initial GlobalConfig
 	DNSinitialized         bool // Received DeviceNetworkStatus
-	globalConfig           *types.GlobalConfig
+	globalConfig           *types.ConfigItemValueMap
 	subGlobalConfig        pubsub.Subscription
 	subZbootStatus         pubsub.Subscription
 	subZedAgentStatus      pubsub.Subscription
@@ -93,6 +92,7 @@ type nodeagentContext struct {
 	deviceReboot           bool
 	currentRebootReason    string    // Reason we are rebooting
 	rebootReason           string    // From last reboot
+	rebootImage            string    // Image from which the last reboot happened
 	rebootStack            string    // From last reboot
 	rebootTime             time.Time // From last reboot
 	restartCounter         uint32
@@ -113,7 +113,7 @@ func newNodeagentContext() nodeagentContext {
 	nodeagentCtx.domainHaltWaitIncrement = domainHaltWaitIncrement
 
 	nodeagentCtx.sshAccess = true // Kernel default - no iptables filters
-	nodeagentCtx.globalConfig = &types.GlobalConfigDefaults
+	nodeagentCtx.globalConfig = types.DefaultConfigItemValueMap()
 
 	// start the watchdog process timer tick
 	duration := time.Duration(watchdogInterval) * time.Second
@@ -123,40 +123,34 @@ func newNodeagentContext() nodeagentContext {
 	duration = time.Duration(timeTickInterval) * time.Second
 	nodeagentCtx.tickerTimer = time.NewTicker(duration)
 	nodeagentCtx.configGetStatus = types.ConfigGetFail
+
+	nodeagentCtx.agentBaseContext.ErrorTime = errorTime
+	nodeagentCtx.agentBaseContext.AgentName = agentName
+	nodeagentCtx.agentBaseContext.WarningTime = warningTime
+
+	curpart := agentlog.EveCurrentPartition()
+	nodeagentCtx.curPart = strings.TrimSpace(curpart)
+	nodeagentCtx.agentBaseContext.NeedWatchdog = true
 	return nodeagentCtx
+}
+
+func (ctxPtr *nodeagentContext) AgentBaseContext() *agentbase.Context {
+	return &ctxPtr.agentBaseContext
+}
+
+func (ctxPtr *nodeagentContext) AddAgentSpecificCLIFlags() {
+	return
+}
+
+func (ctxPtr *nodeagentContext) ProcessAgentSpecificCLIFlags() {
+	return
 }
 
 // Run : nodeagent run entry function
 func Run(ps *pubsub.PubSub) {
-	versionPtr := flag.Bool("v", false, "Version")
-	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
-	flag.Parse()
-	debug = *debugPtr
-	debugOverride = debug
-	if debugOverride {
-		log.SetLevel(log.DebugLevel)
-	} else {
-		log.SetLevel(log.InfoLevel)
-	}
-	if *versionPtr {
-		fmt.Printf("%s: %s\n", os.Args[0], Version)
-		return
-	}
-	curpart := *curpartPtr
-	logf, err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logf.Close()
-	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Infof("Starting %s, on %s\n", agentName, curpart)
-
 	nodeagentCtx := newNodeagentContext()
-	nodeagentCtx.curPart = strings.TrimSpace(curpart)
+
+	agentbase.Run(&nodeagentCtx)
 
 	// Make sure we have a GlobalConfig file with defaults
 	utils.EnsureGCFile()
@@ -165,8 +159,11 @@ func Run(ps *pubsub.PubSub) {
 	handleLastRebootReason(&nodeagentCtx)
 
 	// publisher of NodeAgent Status
-	pubNodeAgentStatus, err := pubsublegacy.Publish(agentName,
-		types.NodeAgentStatus{})
+	pubNodeAgentStatus, err := ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.NodeAgentStatus{},
+		})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -174,7 +171,11 @@ func Run(ps *pubsub.PubSub) {
 	nodeagentCtx.pubNodeAgentStatus = pubNodeAgentStatus
 
 	// publisher of Zboot Config
-	pubZbootConfig, err := pubsublegacy.Publish(agentName, types.ZbootConfig{})
+	pubZbootConfig, err := ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.ZbootConfig{},
+		})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -182,14 +183,17 @@ func Run(ps *pubsub.PubSub) {
 	nodeagentCtx.pubZbootConfig = pubZbootConfig
 
 	// Look for global config such as log levels
-	subGlobalConfig, err := pubsublegacy.Subscribe("", types.GlobalConfig{},
-		false, &nodeagentCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleGlobalConfigModify,
-			DeleteHandler: handleGlobalConfigDelete,
-			SyncHandler:   handleGlobalConfigSynchronized,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "",
+		TopicImpl:     types.ConfigItemValueMap{},
+		Activate:      false,
+		Ctx:           &nodeagentCtx,
+		ModifyHandler: handleGlobalConfigModify,
+		DeleteHandler: handleGlobalConfigDelete,
+		SyncHandler:   handleGlobalConfigSynchronized,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -201,14 +205,17 @@ func Run(ps *pubsub.PubSub) {
 
 	// access the zboot APIs directly, baseosmgr is still not ready
 	nodeagentCtx.updateInprogress = zboot.IsCurrentPartitionStateInProgress()
-	log.Infof("Current partition: %s, inProgress: %v\n", nodeagentCtx.curPart,
+	log.Infof("Current partition: %s, inProgress: %v", nodeagentCtx.curPart,
 		nodeagentCtx.updateInprogress)
 	publishNodeAgentStatus(&nodeagentCtx)
 
 	// Get DomainStatus from domainmgr
-	subDomainStatus, err := pubsublegacy.Subscribe("domainmgr",
-		types.DomainStatus{}, false, &nodeagentCtx,
-		&pubsub.SubscriptionOptions{})
+	subDomainStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName: "domainmgr",
+		TopicImpl: types.DomainStatus{},
+		Activate:  false,
+		Ctx:       &nodeagentCtx,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -216,7 +223,7 @@ func Run(ps *pubsub.PubSub) {
 	subDomainStatus.Activate()
 
 	// Pick up debug aka log level before we start real work
-	log.Infof("Waiting for GCInitialized\n")
+	log.Infof("Waiting for GCInitialized")
 	for !nodeagentCtx.GCInitialized {
 		log.Infof("waiting for GCInitialized")
 		select {
@@ -235,7 +242,7 @@ func Run(ps *pubsub.PubSub) {
 	// when the partition status is inprogress state
 	// check network connectivity for 300 seconds
 	if nodeagentCtx.updateInprogress {
-		checkNetworkConnectivity(&nodeagentCtx)
+		checkNetworkConnectivity(ps, &nodeagentCtx)
 	}
 
 	// if current partition state is not in-progress,
@@ -252,7 +259,7 @@ func Run(ps *pubsub.PubSub) {
 	// These timer functions will be tracked using
 	// cloud connectionnectivity status.
 
-	log.Infof("Waiting for device registration check\n")
+	log.Infof("Waiting for device registration check")
 	for !nodeagentCtx.deviceRegistered {
 		select {
 		case change := <-subGlobalConfig.MsgChan():
@@ -270,13 +277,16 @@ func Run(ps *pubsub.PubSub) {
 	}
 
 	// subscribe to zboot status events
-	subZbootStatus, err := pubsublegacy.Subscribe("baseosmgr",
-		types.ZbootStatus{}, false, &nodeagentCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleZbootStatusModify,
-			DeleteHandler: handleZbootStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subZbootStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "baseosmgr",
+		TopicImpl:     types.ZbootStatus{},
+		Activate:      false,
+		Ctx:           &nodeagentCtx,
+		ModifyHandler: handleZbootStatusModify,
+		DeleteHandler: handleZbootStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -284,24 +294,30 @@ func Run(ps *pubsub.PubSub) {
 	subZbootStatus.Activate()
 
 	// subscribe to zedagent status events
-	subZedAgentStatus, err := pubsublegacy.Subscribe("zedagent",
-		types.ZedAgentStatus{}, false, &nodeagentCtx, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleZedAgentStatusModify,
-			DeleteHandler: handleZedAgentStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subZedAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		TopicImpl:     types.ZedAgentStatus{},
+		Activate:      false,
+		Ctx:           &nodeagentCtx,
+		ModifyHandler: handleZedAgentStatusModify,
+		DeleteHandler: handleZedAgentStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	nodeagentCtx.subZedAgentStatus = subZedAgentStatus
 	subZedAgentStatus.Activate()
 
-	log.Infof("zedbox event loop\n")
+	log.Infof("zedbox event loop")
 	for {
 		select {
 		case change := <-subGlobalConfig.MsgChan():
 			subGlobalConfig.ProcessChange(change)
+
+		case change := <-subDomainStatus.MsgChan():
+			subDomainStatus.ProcessChange(change)
 
 		case change := <-subZbootStatus.MsgChan():
 			subZbootStatus.ProcessChange(change)
@@ -322,7 +338,7 @@ func Run(ps *pubsub.PubSub) {
 func handleGlobalConfigSynchronized(ctxArg interface{}, done bool) {
 	ctxPtr := ctxArg.(*nodeagentContext)
 
-	log.Infof("handleGlobalConfigSynchronized(%v)\n", done)
+	log.Infof("handleGlobalConfigSynchronized(%v)", done)
 	if done {
 		first := !ctxPtr.GCInitialized
 		if first {
@@ -337,24 +353,18 @@ func handleGlobalConfigModify(ctxArg interface{},
 
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigModify: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigModify for %s\n", key)
-	var gcp *types.GlobalConfig
+	log.Infof("handleGlobalConfigModify for %s", key)
+	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(ctxPtr.subGlobalConfig, agentName,
 		debugOverride)
 	if gcp != nil && !ctxPtr.GCInitialized {
-		updated := types.ApplyGlobalConfig(*gcp)
-		log.Infof("handleGlobalConfigModify setting initials to %+v\n",
-			updated)
-		sane := types.EnforceGlobalConfigMinimums(updated)
-		log.Infof("handleGlobalConfigModify: enforced minimums %v\n",
-			cmp.Diff(updated, sane))
-		ctxPtr.globalConfig = &sane
+		ctxPtr.globalConfig = gcp
 		ctxPtr.GCInitialized = true
 	}
-	log.Infof("handleGlobalConfigModify(%s): done\n", key)
+	log.Infof("handleGlobalConfigModify(%s): done", key)
 }
 
 func handleGlobalConfigDelete(ctxArg interface{},
@@ -362,14 +372,14 @@ func handleGlobalConfigDelete(ctxArg interface{},
 
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigDelete: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigDelete for %s\n", key)
+	log.Infof("handleGlobalConfigDelete for %s", key)
 	debug, _ = agentlog.HandleGlobalConfig(ctxPtr.subGlobalConfig, agentName,
 		debugOverride)
-	ctxPtr.globalConfig = &types.GlobalConfigDefaults
-	log.Infof("handleGlobalConfigDelete done for %s\n", key)
+	ctxPtr.globalConfig = types.DefaultConfigItemValueMap()
+	log.Infof("handleGlobalConfigDelete done for %s", key)
 }
 
 // handle zedagent status events, for cloud connectivity
@@ -379,13 +389,13 @@ func handleZedAgentStatusModify(ctxArg interface{},
 	status := statusArg.(types.ZedAgentStatus)
 	handleRebootCmd(ctxPtr, status)
 	updateZedagentCloudConnectStatus(ctxPtr, status)
-	log.Debugf("handleZedAgentStatusModify(%s) done\n", key)
+	log.Debugf("handleZedAgentStatusModify(%s) done", key)
 }
 
 func handleZedAgentStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	// do nothing
-	log.Infof("handleZedAgentStatusDelete(%s) done\n", key)
+	log.Infof("handleZedAgentStatusDelete(%s) done", key)
 }
 
 // zboot status event handlers
@@ -395,7 +405,7 @@ func handleZbootStatusModify(ctxArg interface{},
 	status := statusArg.(types.ZbootStatus)
 	if status.CurrentPartition && ctxPtr.updateInprogress &&
 		status.PartitionState == "active" {
-		log.Infof("CurPart(%s) transitioned to \"active\" state\n",
+		log.Infof("CurPart(%s) transitioned to \"active\" state",
 			status.PartitionLabel)
 		ctxPtr.updateInprogress = false
 		ctxPtr.testComplete = false
@@ -404,7 +414,7 @@ func handleZbootStatusModify(ctxArg interface{},
 	}
 	doZbootBaseOsInstallationComplete(ctxPtr, key, status)
 	doZbootBaseOsTestValidationComplete(ctxPtr, key, status)
-	log.Debugf("handleZbootStatusModify(%s) done\n", key)
+	log.Debugf("handleZbootStatusModify(%s) done", key)
 }
 
 func handleZbootStatusDelete(ctxArg interface{},
@@ -412,21 +422,24 @@ func handleZbootStatusDelete(ctxArg interface{},
 
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if status := lookupZbootStatus(ctxPtr, key); status == nil {
-		log.Infof("handleZbootStatusDelete: unknown %s\n", key)
+		log.Infof("handleZbootStatusDelete: unknown %s", key)
 		return
 	}
-	log.Infof("handleZbootStatusDelete(%s) done\n", key)
+	log.Infof("handleZbootStatusDelete(%s) done", key)
 }
 
-func checkNetworkConnectivity(ctxPtr *nodeagentContext) {
+func checkNetworkConnectivity(ps *pubsub.PubSub, ctxPtr *nodeagentContext) {
 	// for device network status
-	subDeviceNetworkStatus, err := pubsublegacy.Subscribe("nim",
-		types.DeviceNetworkStatus{}, false, ctxPtr, &pubsub.SubscriptionOptions{
-			ModifyHandler: handleDNSModify,
-			DeleteHandler: handleDNSDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
+	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "nim",
+		TopicImpl:     types.DeviceNetworkStatus{},
+		Activate:      false,
+		Ctx:           ctxPtr,
+		ModifyHandler: handleDNSModify,
+		DeleteHandler: handleDNSDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -435,10 +448,10 @@ func checkNetworkConnectivity(ctxPtr *nodeagentContext) {
 
 	ctxPtr.deviceNetworkStatus = &types.DeviceNetworkStatus{}
 	ctxPtr.usableAddressCount = types.CountLocalAddrAnyNoLinkLocal(*ctxPtr.deviceNetworkStatus)
-	log.Infof("Waiting until we have some uplinks with usable addresses\n")
+	log.Infof("Waiting until we have some uplinks with usable addresses")
 
 	for !ctxPtr.DNSinitialized {
-		log.Infof("Waiting for DeviceNetworkStatus: %v\n",
+		log.Infof("Waiting for DeviceNetworkStatus: %v",
 			ctxPtr.DNSinitialized)
 		select {
 		case change := <-ctxPtr.subGlobalConfig.MsgChan():
@@ -454,7 +467,7 @@ func checkNetworkConnectivity(ctxPtr *nodeagentContext) {
 		}
 		agentlog.StillRunning(agentName, warningTime, errorTime)
 	}
-	log.Infof("DeviceNetworkStatus: %v\n", ctxPtr.DNSinitialized)
+	log.Infof("DeviceNetworkStatus: %v", ctxPtr.DNSinitialized)
 
 	// reset timer tick, for all timer functions
 	ctxPtr.timeTickCount = 0
@@ -465,12 +478,12 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	status := statusArg.(types.DeviceNetworkStatus)
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if key != "global" {
-		log.Infof("handleDNSModify: ignoring %s\n", key)
+		log.Infof("handleDNSModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleDNSModify for %s\n", key)
+	log.Infof("handleDNSModify for %s", key)
 	if cmp.Equal(*ctxPtr.deviceNetworkStatus, status) {
-		log.Infof("handleDNSModify no change\n")
+		log.Infof("handleDNSModify no change")
 		ctxPtr.DNSinitialized = true
 		return
 	}
@@ -481,29 +494,29 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 	// XXX should we also trigger if the count increases?
 	newAddrCount := types.CountLocalAddrAnyNoLinkLocal(*ctxPtr.deviceNetworkStatus)
 	if newAddrCount != 0 && ctxPtr.usableAddressCount == 0 {
-		log.Infof("DeviceNetworkStatus from %d to %d addresses\n",
+		log.Infof("DeviceNetworkStatus from %d to %d addresses",
 			ctxPtr.usableAddressCount, newAddrCount)
 	}
 	ctxPtr.DNSinitialized = true
 	ctxPtr.usableAddressCount = newAddrCount
-	log.Infof("handleDNSModify done for %s\n", key)
+	log.Infof("handleDNSModify done for %s", key)
 }
 
 func handleDNSDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleDNSDelete for %s\n", key)
+	log.Infof("handleDNSDelete for %s", key)
 	ctxPtr := ctxArg.(*nodeagentContext)
 
 	if key != "global" {
-		log.Infof("handleDNSDelete: ignoring %s\n", key)
+		log.Infof("handleDNSDelete: ignoring %s", key)
 		return
 	}
 	*ctxPtr.deviceNetworkStatus = types.DeviceNetworkStatus{}
 	newAddrCount := types.CountLocalAddrAnyNoLinkLocal(*ctxPtr.deviceNetworkStatus)
 	ctxPtr.DNSinitialized = false
 	ctxPtr.usableAddressCount = newAddrCount
-	log.Infof("handleDNSDelete done for %s\n", key)
+	log.Infof("handleDNSDelete done for %s", key)
 }
 
 // check whether zedagent module is alive
@@ -526,15 +539,17 @@ func handleLastRebootReason(ctx *nodeagentContext) {
 	// until after truncation.
 	var rebootStack = ""
 	ctx.rebootReason, ctx.rebootTime, rebootStack =
-		agentlog.GetCurrentRebootReason()
+		agentlog.GetCommonRebootReason()
 	if ctx.rebootReason != "" {
-		log.Warnf("Current partition RebootReason: %s\n",
+		log.Warnf("Current partition RebootReason: %s",
 			ctx.rebootReason)
-		agentlog.DiscardCurrentRebootReason()
+		agentlog.DiscardCommonRebootReason()
 	}
+	// XXX We'll retain this block of code for some time to support having older
+	// versions of code in the other partition.
 	otherRebootReason, otherRebootTime, otherRebootStack := agentlog.GetOtherRebootReason()
 	if otherRebootReason != "" {
-		log.Warnf("Other partition RebootReason: %s\n",
+		log.Warnf("Other partition RebootReason: %s",
 			otherRebootReason)
 		// if other partition state is "inprogress"
 		// do not erase the reboot reason, going to
@@ -543,23 +558,11 @@ func handleLastRebootReason(ctx *nodeagentContext) {
 			agentlog.DiscardOtherRebootReason()
 		}
 	}
-	commonRebootReason, commonRebootTime, commonRebootStack := agentlog.GetCommonRebootReason()
-	if commonRebootReason != "" {
-		log.Warnf("Common RebootReason: %s\n",
-			commonRebootReason)
-		agentlog.DiscardCommonRebootReason()
-	}
 	// first, pick up from other partition
 	if ctx.rebootReason == "" {
 		ctx.rebootReason = otherRebootReason
 		ctx.rebootTime = otherRebootTime
 		rebootStack = otherRebootStack
-	}
-	// if still not found, pick up the common
-	if ctx.rebootReason == "" {
-		ctx.rebootReason = commonRebootReason
-		ctx.rebootTime = commonRebootTime
-		rebootStack = commonRebootStack
 	}
 
 	// still nothing, fillup the default
@@ -593,6 +596,11 @@ func handleLastRebootReason(ctx *nodeagentContext) {
 		rebootStack = fmt.Sprintf("Truncated stack: %v", string(runes))
 	}
 	ctx.rebootStack = rebootStack
+	rebootImage := agentlog.GetRebootImage()
+	if rebootImage != "" {
+		ctx.rebootImage = rebootImage
+		agentlog.DiscardRebootImage()
+	}
 	// Read and increment restartCounter
 	ctx.restartCounter = incrementRestartCounter()
 }
@@ -605,21 +613,21 @@ func incrementRestartCounter() uint32 {
 	if _, err := os.Stat(restartCounterFile); err == nil {
 		b, err := ioutil.ReadFile(restartCounterFile)
 		if err != nil {
-			log.Errorf("incrementRestartCounter: %s\n", err)
+			log.Errorf("incrementRestartCounter: %s", err)
 		} else {
 			c, err := strconv.Atoi(string(b))
 			if err != nil {
-				log.Errorf("incrementRestartCounter: %s\n", err)
+				log.Errorf("incrementRestartCounter: %s", err)
 			} else {
 				restartCounter = uint32(c)
-				log.Infof("incrementRestartCounter: read %d\n", restartCounter)
+				log.Infof("incrementRestartCounter: read %d", restartCounter)
 			}
 		}
 	}
 	b := []byte(fmt.Sprintf("%d", restartCounter+1))
 	err := ioutil.WriteFile(restartCounterFile, b, 0644)
 	if err != nil {
-		log.Errorf("incrementRestartCounter write: %s\n", err)
+		log.Errorf("incrementRestartCounter write: %s", err)
 	}
 	return restartCounter
 }
@@ -641,6 +649,7 @@ func publishNodeAgentStatus(ctxPtr *nodeagentContext) {
 		RebootReason:      ctxPtr.rebootReason,
 		RebootStack:       ctxPtr.rebootStack,
 		RebootTime:        ctxPtr.rebootTime,
+		RebootImage:       ctxPtr.rebootImage,
 		RestartCounter:    ctxPtr.restartCounter,
 	}
 	pub.Publish(agentName, status)

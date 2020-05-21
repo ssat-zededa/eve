@@ -10,7 +10,10 @@
 # First log to /persist in case zboot/kernel is hung on disk
 
 DATE=$(date -Is)
-echo "Watchdog report at $DATE: $*" >>/persist/reboot-reason
+CURPART=$(cat /run/eve.id)
+EVE_VERSION=$(cat /run/eve-release)
+echo "Watchdog report for $CURPART EVE version $EVE_VERSION at $DATE: $*" >>/persist/reboot-reason
+echo "$CURPART" > /persist/reboot-image
 sync
 
 # If a /run/<agent.touch> then try sending a SIGUSR1 to get a stack trace
@@ -26,12 +29,9 @@ if [ $# -ge 2 ]; then
     fi
 fi
 
-echo "Watchdog report at $DATE: $*" >>/persist/log/watchdog.log
+echo "Watchdog report for $CURPART EVE version $EVE_VERSION at $DATE: $*" >>/persist/log/watchdog.log
 ps >>/persist/log/watchdog.log
 echo "Watchdog report done" >>/persist/log/watchdog.log
-
-CURPART=$(zboot curpart)
-echo "Watchdog report at $DATE: $*" >>/persist/"$CURPART"/reboot-reason
 
 # If a /run/<agent.pid> then look for an oom message in dmesg for that agent
 # and always record <agent> in reboot-reason
@@ -52,28 +52,23 @@ if [ -z "$oom" ]; then
     oom=$(dmesg | grep "Out of memory")
 fi
 if [ -n "$oom" ]; then
-   echo "$oom" >>/persist/"$CURPART"/reboot-reason
+   echo "$oom" >>/persist/reboot-reason
 fi
 if [ -n "$agent" ]; then
-    echo "$agent crashed" >>/persist/"$CURPART"/reboot-reason
+    echo "$agent crashed" >>/persist/reboot-reason
     panic=$(grep panic /persist/rsyslog/syslog.txt)
     if [ -n "$panic" ]; then
-        echo "$panic" >>/persist/"$CURPART"/reboot-reason
+        echo "$panic" >>/persist/reboot-reason
         # Note that panic stack trace might exist tagged with e.g. pillar.err
         # in /persist/rsyslog/syslog.txt but can't extract from other .err
         # files.
     fi
 fi
 
-# Check if it is rsyslogd that crashed.
-# Tar the contents inside /persist/rsyslog directory and reboot.
+# Check if it is monitor-rsyslog.sh that crashed/stopped.
 if [ $# -ge 2 ]; then
     agent=$(echo "$2" | grep '/run/.*\.pid' | sed 's,/run/\(.*\)\.pid,\1,')
-    if [ "$agent" = "rsyslogd" ]; then
-        mkdir -p /persist/rsyslog-backup
-        # Tar contents of /persist/rsyslog
-        NAME="rsyslogd-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz"
-        tar -cvzf "/persist/rsyslog-backup/$NAME" /persist/rsyslog/*
+    if [ "$agent" = "monitor-rsyslogd" ]; then
         rm -rf /persist/rsyslog
     fi
 fi

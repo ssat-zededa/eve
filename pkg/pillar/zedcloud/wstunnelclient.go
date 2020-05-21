@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -77,7 +78,7 @@ func (t *WSTunnelClient) Start() {
 // TestConnection validates the configured parameters for correctness
 // and further attempts an actual connection request to confirm
 // if the client can successfully connect to remote backend server.
-func (t *WSTunnelClient) TestConnection(devNetStatus *types.DeviceNetworkStatus, proxyURL *url.URL, localAddr net.IP) error {
+func (t *WSTunnelClient) TestConnection(devNetStatus *types.DeviceNetworkStatus, proxyURL *url.URL, localAddr net.IP, devUUID uuid.UUID) error {
 
 	if t.Tunnel == "" {
 		return fmt.Errorf("Must specify tunnel server ws://hostname:port")
@@ -96,10 +97,15 @@ func (t *WSTunnelClient) TestConnection(devNetStatus *types.DeviceNetworkStatus,
 	t.LocalRelayServer = strings.TrimSuffix(t.LocalRelayServer, "/")
 
 	log.Debugf("Testing connection to %s on local address: %v, proxy: %v", t.Tunnel, localAddr, proxyURL)
+	log.Infof("Testing connection to %s on local address: %v, proxy: %v", t.Tunnel, localAddr, proxyURL)
 
 	serverName := strings.Split(t.TunnelServerNameAndPort, ":")[0]
-	// XXX assume v1 API for now
-	tlsConfig, err := GetTlsConfig(devNetStatus, serverName, nil, nil)
+
+	zedcloudCtx := ZedCloudContext{
+		V2API: UseV2API(),
+	}
+	// zedcloudCtx V2API UseV2API()
+	tlsConfig, err := GetTlsConfig(devNetStatus, serverName, nil, &zedcloudCtx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -117,14 +123,16 @@ func (t *WSTunnelClient) TestConnection(devNetStatus *types.DeviceNetworkStatus,
 		dialer.Proxy = http.ProxyURL(proxyURL)
 	}
 
-	pingURL := fmt.Sprintf("%s/api/v1/edgedevice/connection/ping", t.Tunnel)
-	log.Debugf("Testing connection to ping url: %s", pingURL)
+	pingURL := URLPathString(t.Tunnel, zedcloudCtx.V2API, false, devUUID, "connection/ping")
 	_, resp, err := dialer.Dial(pingURL, nil)
-
+	if resp == nil { // this can get error, but with resp code is still 200
+		log.Infof("TestConnection: url %s, resp %v, err %v", pingURL, resp, err)
+		return err
+	}
 	log.Debugf("Read ping response status code: %v for ping url: %s", resp.StatusCode, pingURL)
 
 	if resp.StatusCode == http.StatusOK {
-		url := fmt.Sprintf("%s/api/v1/edgedevice/connection/tunnel", t.Tunnel)
+		url := URLPathString(t.Tunnel, zedcloudCtx.V2API, false, devUUID, "connection/tunnel")
 		t.DestURL = url
 		t.Dialer = dialer
 		log.Infof("Connection test succeeded for url: %s on local address: %v, proxy: %v", url, localAddr, proxyURL)

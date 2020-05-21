@@ -4,46 +4,60 @@
 package types
 
 import (
+	"encoding/hex"
+
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	zcommon "github.com/lf-edge/eve/api/go/evecommon"
 )
 
-// CipherContext : Contains the decryption information
-// supplied by controller, for sensitive encrypted data
+// CipherContext : a pair of device and controller certificate
+// published by controller along with some attributes
+// part of EdgeDevConfig block, received from controller
 type CipherContext struct {
-	ID                 string
-	HashScheme         zconfig.CipherHashAlgorithm
+	ContextID          string
+	HashScheme         zcommon.HashAlgorithm
 	KeyExchangeScheme  zconfig.KeyExchangeScheme
 	EncryptionScheme   zconfig.EncryptionScheme
 	ControllerCertHash []byte
 	DeviceCertHash     []byte
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 // Key :
-func (cipherContext *CipherContext) Key() string {
-	return cipherContext.ID
+func (status *CipherContext) Key() string {
+	return status.ContextID
 }
 
-// CipherBlock : Object specific encryption information
-type CipherBlock struct {
-	ID                string
-	KeyExchangeScheme zconfig.KeyExchangeScheme
-	EncryptionScheme  zconfig.EncryptionScheme
-	InitialValue      []byte
-	ControllerCert    []byte
-	DeviceCert        []byte
-	CipherData        []byte
-	ClearTextHash     []byte
-	IsCipher          bool
-	IsValidCipher     bool
+// ControllerCertKey :
+func (status *CipherContext) ControllerCertKey() string {
+	return hex.EncodeToString(status.ControllerCertHash)
+}
+
+// CipherBlockStatus : Object specific encryption information
+type CipherBlockStatus struct {
+	CipherBlockID   string // constructed using individual reference
+	CipherContextID string // cipher context id
+	InitialValue    []byte
+	CipherData      []byte
+	ClearTextHash   []byte
+	IsCipher        bool
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 // Key :
-func (cipherBlock *CipherBlock) Key() string {
-	return cipherBlock.ID
+func (status *CipherBlockStatus) Key() string {
+	return status.CipherBlockID
 }
 
-// CredentialBlock : Credential Information
-type CredentialBlock struct {
-	Identity string
-	Password string
+// EncryptionBlock - This is a Mirror of
+// api/proto/config/acipherinfo.proto - EncryptionBlock
+// Always need to keep these two consistent.
+type EncryptionBlock struct {
+	DsAPIKey          string
+	DsPassword        string
+	WifiUserName      string // If the authentication type is EAP
+	WifiPassword      string
+	ProtectedUserData string
 }

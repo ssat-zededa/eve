@@ -25,6 +25,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	zconfig "github.com/lf-edge/eve/api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
@@ -32,7 +33,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -76,8 +77,12 @@ var simulateDnsFailure = false
 var simulatePingFailure = false
 var outfile = os.Stdout
 var nilUUID uuid.UUID
+var logger *logrus.Logger
+var log *base.LogObject
 
-func Run(ps *pubsub.PubSub) {
+func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
+	logger = loggerArg
+	log = logArg
 	var err error
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
@@ -90,19 +95,17 @@ func Run(ps *pubsub.PubSub) {
 	debug = *debugPtr
 	debugOverride = debug
 	if debugOverride {
-		log.SetLevel(log.DebugLevel)
+		logger.SetLevel(logrus.TraceLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		logger.SetLevel(logrus.InfoLevel)
 	}
 	simulateDnsFailure = *simulateDnsFailurePtr
 	simulatePingFailure = *simulatePingFailurePtr
 	outputFile := *outputFilePtr
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
-		return
+		return 0
 	}
-	agentlog.Init(agentName)
-
 	if outputFile != "" {
 		outfile, err = os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
@@ -115,16 +118,18 @@ func Run(ps *pubsub.PubSub) {
 		pacContents:  *pacContentsPtr,
 		globalConfig: types.DefaultConfigItemValueMap(),
 	}
+	ctx.AgentName = agentName
 	ctx.DeviceNetworkStatus = &types.DeviceNetworkStatus{}
 	ctx.DevicePortConfigList = &types.DevicePortConfigList{}
 
 	// Make sure we have a GlobalConfig file with defaults
-	utils.EnsureGCFile()
+	utils.EnsureGCFile(log)
 
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "",
+			MyAgentName:   agentName,
 			TopicImpl:     types.ConfigItemValueMap{},
 			Activate:      false,
 			Ctx:           &ctx,
@@ -147,12 +152,12 @@ func Run(ps *pubsub.PubSub) {
 	ctx.serverNameAndPort = strings.TrimSpace(string(server))
 	ctx.serverName = strings.Split(ctx.serverNameAndPort, ":")[0]
 
-	zedcloudCtx := zedcloud.NewContext(zedcloud.ContextOptions{
+	zedcloudCtx := zedcloud.NewContext(log, zedcloud.ContextOptions{
 		DevNetworkStatus: ctx.DeviceNetworkStatus,
 		Timeout:          ctx.globalConfig.GlobalValueInt(types.NetworkSendTimeout),
 		NeedStatsFunc:    true,
-		Serial:           hardware.GetProductSerial(),
-		SoftSerial:       hardware.GetSoftSerial(),
+		Serial:           hardware.GetProductSerial(log),
+		SoftSerial:       hardware.GetSoftSerial(log),
 		AgentName:        agentName,
 	})
 	log.Infof("Diag Get Device Serial %s, Soft Serial %s", zedcloudCtx.DevSerial,
@@ -183,13 +188,14 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		fmt.Fprintf(outfile, "ERROR: no device cert and no onboarding cert at %v\n",
 			time.Now().Format(time.RFC3339Nano))
-		os.Exit(1)
+		return 1
 	}
 	ctx.zedcloudCtx = &zedcloudCtx
 
 	subLedBlinkCounter, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "",
+			MyAgentName:   agentName,
 			TopicImpl:     types.LedBlinkCounter{},
 			Activate:      false,
 			Ctx:           &ctx,
@@ -208,6 +214,7 @@ func Run(ps *pubsub.PubSub) {
 	subDeviceNetworkStatus, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "nim",
+			MyAgentName:   agentName,
 			TopicImpl:     types.DeviceNetworkStatus{},
 			Activate:      false,
 			Ctx:           &ctx,
@@ -227,6 +234,7 @@ func Run(ps *pubsub.PubSub) {
 	subDevicePortConfigList, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "nim",
+			MyAgentName:   agentName,
 			Persistent:    true,
 			TopicImpl:     types.DevicePortConfigList{},
 			Activate:      false,
@@ -243,6 +251,7 @@ func Run(ps *pubsub.PubSub) {
 
 	subOnboardStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "zedclient",
+		MyAgentName:   agentName,
 		CreateHandler: handleOnboardStatusModify,
 		ModifyHandler: handleOnboardStatusModify,
 		WarningTime:   warningTime,
@@ -290,6 +299,7 @@ func Run(ps *pubsub.PubSub) {
 			ctx.usingOnboardCert = false
 		}
 	}
+	return 0
 }
 
 func fileExists(filename string) bool {
@@ -332,6 +342,7 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 		return
 	}
 	log.Infof("handleDNSModify for %s", key)
+	// Since we report test status we compare all fields
 	if cmp.Equal(ctx.DeviceNetworkStatus, status) {
 		log.Infof("handleDNSModify unchanged")
 		return
@@ -511,6 +522,11 @@ func printOutput(ctx *diagContext) {
 	if testing {
 		fmt.Fprintf(outfile, "WARNING: The configuration below is under test hence might report failures\n")
 	}
+	if ctx.DeviceNetworkStatus.State != types.DPC_SUCCESS {
+		fmt.Fprintf(outfile, "WARNING: state %s not SUCCESS\n",
+			ctx.DeviceNetworkStatus.State.String())
+	}
+
 	numPorts := len(ctx.DeviceNetworkStatus.Ports)
 	mgmtPorts := 0
 	passPorts := 0
@@ -562,20 +578,22 @@ func printOutput(ctx *diagContext) {
 		}
 
 		fmt.Fprintf(outfile, "INFO: %s: DNS servers: ", ifname)
-		for _, ds := range port.NetworkXConfig.DnsServers {
+		for _, ds := range port.DNSServers {
 			fmt.Fprintf(outfile, "%s, ", ds.String())
 		}
 		fmt.Fprintf(outfile, "\n")
 		// If static print static config
-		if port.NetworkXConfig.Dhcp == types.DT_STATIC {
+		if port.Dhcp == types.DT_STATIC {
 			fmt.Fprintf(outfile, "INFO: %s: Static IP subnet: %s\n",
-				ifname, port.NetworkXConfig.Subnet.String())
-			fmt.Fprintf(outfile, "INFO: %s: Static IP router: %s\n",
-				ifname, port.NetworkXConfig.Gateway.String())
+				ifname, port.Subnet.String())
+			for _, r := range port.DefaultRouters {
+				fmt.Fprintf(outfile, "INFO: %s: Static IP router: %s\n",
+					ifname, r.String())
+			}
 			fmt.Fprintf(outfile, "INFO: %s: Static Domain Name: %s\n",
-				ifname, port.NetworkXConfig.DomainName)
+				ifname, port.DomainName)
 			fmt.Fprintf(outfile, "INFO: %s: Static NTP server: %s\n",
-				ifname, port.NetworkXConfig.NtpServer.String())
+				ifname, port.NtpServer.String())
 		}
 		printProxy(ctx, port, ifname)
 
@@ -773,7 +791,7 @@ func tryPing(ctx *diagContext, ifname string, reqURL string) bool {
 	zedcloudCtx := ctx.zedcloudCtx
 	// Set the TLS config on each attempt in case it has changed due to proxies etc
 	if reqURL == "" {
-		reqURL = zedcloud.URLPathString(ctx.serverNameAndPort, zedcloudCtx.V2API, false, nilUUID, "ping")
+		reqURL = zedcloud.URLPathString(ctx.serverNameAndPort, zedcloudCtx.V2API, nilUUID, "ping")
 		err := zedcloud.UpdateTLSConfig(zedcloudCtx, ctx.serverName, ctx.cert)
 		if err != nil {
 			errStr := fmt.Sprintf("ERROR: %s: internal UpdateTLSConfig failed %s\n",
@@ -833,7 +851,7 @@ func tryPostUUID(ctx *diagContext, ifname string) bool {
 	}
 	zedcloudCtx := ctx.zedcloudCtx
 
-	reqURL := zedcloud.URLPathString(ctx.serverNameAndPort, zedcloudCtx.V2API, false, ctx.devUUID, "config")
+	reqURL := zedcloud.URLPathString(ctx.serverNameAndPort, zedcloudCtx.V2API, ctx.devUUID, "config")
 	// Set the TLS config on each attempt in case it has changed due to proxies etc
 	err = zedcloud.UpdateTLSConfig(zedcloudCtx, ctx.serverName, ctx.cert)
 	if err != nil {
@@ -880,13 +898,13 @@ func tryPostUUID(ctx *diagContext, ifname string) bool {
 }
 
 func parsePrint(configURL string, resp *http.Response, contents []byte) {
-	if err := validateConfigMessage(configURL, resp); err != nil {
-		log.Errorln("validateConfigMessage: ", err)
+	if resp.StatusCode == http.StatusNotModified {
+		log.Debugf("StatusNotModified len %d", len(contents))
 		return
 	}
 
-	if resp.StatusCode == http.StatusNotModified {
-		log.Debugf("StatusNotModified len %d", len(contents))
+	if err := validateConfigMessage(configURL, resp); err != nil {
+		log.Errorln("validateConfigMessage: ", err)
 		return
 	}
 
@@ -956,7 +974,7 @@ func myGet(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 	} else {
 		preqURL = "https://" + reqURL
 	}
-	proxyURL, err := zedcloud.LookupProxy(zedcloudCtx.DeviceNetworkStatus,
+	proxyURL, err := zedcloud.LookupProxy(log, zedcloudCtx.DeviceNetworkStatus,
 		ifname, preqURL)
 	if err != nil {
 		fmt.Fprintf(outfile, "ERROR: %s: LookupProxy failed: %s\n", ifname, err)
@@ -968,10 +986,20 @@ func myGet(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 	resp, contents, rtf, err := zedcloud.SendOnIntf(zedcloudCtx,
 		reqURL, ifname, 0, nil, allowProxy)
 	if err != nil {
-		if rtf == types.SenderStatusRemTempFail {
-			fmt.Fprintf(outfile, "ERROR: %s: get %s remote temporary failure: %s\n",
-				ifname, reqURL, err)
-		} else {
+		switch rtf {
+		case types.SenderStatusUpgrade:
+			fmt.Fprintf(outfile, "ERROR: %s: get %s Controller upgrade in progress\n",
+				ifname, reqURL)
+		case types.SenderStatusRefused:
+			fmt.Fprintf(outfile, "ERROR: %s: get %s Controller returned ECONNREFUSED\n",
+				ifname, reqURL)
+		case types.SenderStatusCertInvalid:
+			fmt.Fprintf(outfile, "ERROR: %s: get %s Controller certificate invalid time\n",
+				ifname, reqURL)
+		case types.SenderStatusCertMiss:
+			fmt.Fprintf(outfile, "ERROR: %s: get %s Controller certificate miss\n",
+				ifname, reqURL)
+		default:
 			fmt.Fprintf(outfile, "ERROR: %s: get %s failed: %s\n",
 				ifname, reqURL, err)
 		}
@@ -1006,7 +1034,7 @@ func myPost(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 	} else {
 		preqURL = "https://" + reqURL
 	}
-	proxyURL, err := zedcloud.LookupProxy(zedcloudCtx.DeviceNetworkStatus,
+	proxyURL, err := zedcloud.LookupProxy(log, zedcloudCtx.DeviceNetworkStatus,
 		ifname, preqURL)
 	if err != nil {
 		fmt.Fprintf(outfile, "ERROR: %s: LookupProxy failed: %s\n", ifname, err)
@@ -1018,11 +1046,21 @@ func myPost(zedcloudCtx *zedcloud.ZedCloudContext, reqURL string, ifname string,
 	resp, contents, rtf, err := zedcloud.SendOnIntf(zedcloudCtx,
 		reqURL, ifname, reqlen, b, allowProxy)
 	if err != nil {
-		if rtf == types.SenderStatusRemTempFail {
-			fmt.Fprintf(outfile, "ERROR: %s: post %s remote temporary failure: %s\n",
-				ifname, reqURL, err)
-		} else {
-			fmt.Fprintf(outfile, "ERROR: %s: get %s failed: %s\n",
+		switch rtf {
+		case types.SenderStatusUpgrade:
+			fmt.Fprintf(outfile, "ERROR: %s: post %s Controller upgrade in progress\n",
+				ifname, reqURL)
+		case types.SenderStatusRefused:
+			fmt.Fprintf(outfile, "ERROR: %s: post %s Controller returned ECONNREFUSED\n",
+				ifname, reqURL)
+		case types.SenderStatusCertInvalid:
+			fmt.Fprintf(outfile, "ERROR: %s: post %s Controller certificate invalid time\n",
+				ifname, reqURL)
+		case types.SenderStatusCertMiss:
+			fmt.Fprintf(outfile, "ERROR: %s: post %s Controller certificate miss\n",
+				ifname, reqURL)
+		default:
+			fmt.Fprintf(outfile, "ERROR: %s: post %s failed: %s\n",
 				ifname, reqURL, err)
 		}
 		return false, nil, rtf, nil
@@ -1056,8 +1094,8 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 	}
 	log.Infof("handleGlobalConfigModify for %s", key)
 	var gcp *types.ConfigItemValueMap
-	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, gcp = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	if gcp != nil {
 		ctx.globalConfig = gcp
 	}
@@ -1073,8 +1111,8 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigDelete for %s", key)
-	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, _ = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	*ctx.globalConfig = *types.DefaultConfigItemValueMap()
 	log.Infof("handleGlobalConfigDelete done for %s", key)
 }

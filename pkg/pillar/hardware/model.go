@@ -6,7 +6,8 @@
 // would have an API between a domU and dom0
 
 // Implements GetHardwareModel() string
-// We have no dmidecode on ARM. Can only report compatible string
+// We have no dmidecode on ARM, so we use /proc/cpuinfo and look for Serial
+// We also report compatible string:
 // Note that we replace any intermediate nul characters with '.' since
 // /proc/device-tree/compatible contains nuls to separate different strings.
 
@@ -17,54 +18,53 @@ package hardware
 
 import (
 	"bytes"
-	log "github.com/sirupsen/logrus"
 	"io/ioutil"
 	"os"
-	"os/exec"
+	"regexp"
 	"strings"
 
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 )
 
 const (
 	compatibleFile = "/proc/device-tree/compatible"
+	cpuInfoFile    = "/proc/cpuinfo"
 	overrideFile   = types.IdentityDirname + "/hardwaremodel"
 	softSerialFile = types.IdentityDirname + "/soft_serial"
 )
 
 // XXX Note that this function (and the ones below) log if there is an
 // error. That's impolite for a library to do.
-func GetHardwareModel() string {
-	model := getOverride(overrideFile)
+func GetHardwareModel(log *base.LogObject) string {
+	model := getOverride(log, overrideFile)
 	if model != "" {
 		return model
 	}
-	return GetHardwareModelNoOverride()
+	return GetHardwareModelNoOverride(log)
 }
 
-func GetHardwareModelOverride() string {
-	return getOverride(overrideFile)
+func GetHardwareModelOverride(log *base.LogObject) string {
+	return getOverride(log, overrideFile)
 }
 
-func GetHardwareModelNoOverride() string {
+func GetHardwareModelNoOverride(log *base.LogObject) string {
 	product := ""
 	manufacturer := ""
 
-	cmd := exec.Command("dmidecode", "-s", "system-product-name")
-	pname, err := cmd.Output()
+	pname, err := base.Exec(log, "dmidecode", "-s", "system-product-name").Output()
 	if err != nil {
 		log.Errorln("dmidecode system-product-name:", err)
 	} else {
 		product = string(pname)
 	}
-	cmd = exec.Command("dmidecode", "-s", "system-manufacturer")
-	manu, err := cmd.Output()
+	manu, err := base.Exec(log, "dmidecode", "-s", "system-manufacturer").Output()
 	if err != nil {
 		log.Errorln("dmidecode system-manufacturer:", err)
 	} else {
 		manufacturer = string(manu)
 	}
-	compatible := GetCompatible()
+	compatible := GetCompatible(log)
 	return FormatModel(manufacturer, product, compatible)
 }
 
@@ -94,7 +94,7 @@ func FormatModel(manufacturer, product, compatible string) string {
 }
 
 // If the file exists return its content
-func getOverride(filename string) string {
+func getOverride(log *base.LogObject, filename string) string {
 	if _, err := os.Stat(filename); err != nil {
 		return ""
 	}
@@ -108,7 +108,7 @@ func getOverride(filename string) string {
 
 const controlChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
 
-func GetCompatible() string {
+func GetCompatible(log *base.LogObject) string {
 	compatible := ""
 	if _, err := os.Stat(compatibleFile); err == nil {
 		contents, err := ioutil.ReadFile(compatibleFile)
@@ -120,6 +120,23 @@ func GetCompatible() string {
 		}
 	}
 	return compatible
+}
+
+func getCPUSerial(log *base.LogObject) string {
+	serial := ""
+	if _, err := os.Stat(cpuInfoFile); err == nil {
+		contents, err := ioutil.ReadFile(cpuInfoFile)
+		if err != nil {
+			log.Errorf("getCPUSerial(%s) failed %s\n",
+				cpuInfoFile, err)
+		} else {
+			match := regexp.MustCompile(`(?s)Serial\s*:\s*(\S+)`).FindStringSubmatch(string(contents))
+			if match != nil && len(match) == 2 {
+				serial = match[1]
+			}
+		}
+	}
+	return serial
 }
 
 func massageCompatible(contents []byte) []byte {
@@ -140,84 +157,73 @@ func massageCompatible(contents []byte) []byte {
 }
 
 // GetSoftSerial returns software defined product serial number
-func GetSoftSerial() string {
-	return strings.TrimSuffix(getOverride(softSerialFile), "\n")
+func GetSoftSerial(log *base.LogObject) string {
+	return strings.TrimSuffix(getOverride(log, softSerialFile), "\n")
 }
 
-func GetProductSerial() string {
-	cmd := exec.Command("dmidecode", "-s", "system-serial-number")
-	serial, err := cmd.Output()
+func GetProductSerial(log *base.LogObject) string {
+	serial, err := base.Exec(log, "dmidecode", "-s", "system-serial-number").Output()
 	if err != nil {
 		log.Errorf("GetProductSerial system-serial-number failed %s\n",
 			err)
 		serial = []byte{}
 	}
-	return strings.TrimSuffix(string(serial), "\n")
+	if string(serial) != "" {
+		return strings.TrimSuffix(string(serial), "\n")
+	} else {
+		return getCPUSerial(log)
+	}
 }
 
 // Returns productManufacturer, productName, productVersion, productSerial, productUuid
-func GetDeviceManufacturerInfo() (string, string, string, string, string) {
-	cmd := exec.Command("dmidecode", "-s", "system-product-name")
-	pname, err := cmd.Output()
+func GetDeviceManufacturerInfo(log *base.LogObject) (string, string, string, string, string) {
+	pname, err := base.Exec(log, "dmidecode", "-s", "system-product-name").Output()
 	if err != nil {
 		log.Errorf("GetDeviceManufacturerInfo system-product-name failed %s\n",
 			err)
 		pname = []byte{}
 	}
-	cmd = exec.Command("dmidecode", "-s", "system-manufacturer")
-	manufacturer, err := cmd.Output()
+	manufacturer, err := base.Exec(log, "dmidecode", "-s", "system-manufacturer").Output()
 	if err != nil {
 		log.Errorf("GetDeviceManufacturerInfo system-manufacturer failed %s\n",
 			err)
 		manufacturer = []byte{}
 	}
-	cmd = exec.Command("dmidecode", "-s", "system-version")
-	version, err := cmd.Output()
+	version, err := base.Exec(log, "dmidecode", "-s", "system-version").Output()
 	if err != nil {
 		log.Errorf("GetDeviceManufacturerInfo system-version failed %s\n",
 			err)
 		version = []byte{}
 	}
-	cmd = exec.Command("dmidecode", "-s", "system-serial-number")
-	serial, err := cmd.Output()
-	if err != nil {
-		log.Errorf("GetDeviceManufacturerInfo system-serial-number failed %s\n",
-			err)
-		serial = []byte{}
-	}
-	cmd = exec.Command("dmidecode", "-s", "system-uuid")
-	uuid, err := cmd.Output()
+	uuid, err := base.Exec(log, "dmidecode", "-s", "system-uuid").Output()
 	if err != nil {
 		log.Errorf("GetDeviceManufacturerInfo system-uuid failed %s\n",
 			err)
 		uuid = []byte{}
 	}
+	productSerial := GetProductSerial(log)
 	productManufacturer := string(manufacturer)
 	productName := string(pname)
 	productVersion := string(version)
-	productSerial := string(serial)
 	productUuid := string(uuid)
 	return productManufacturer, productName, productVersion, productSerial, productUuid
 }
 
 // Returns BIOS vendor, version, release-date
-func GetDeviceBios() (string, string, string) {
-	cmd := exec.Command("dmidecode", "-s", "bios-vendor")
-	vendor, err := cmd.Output()
+func GetDeviceBios(log *base.LogObject) (string, string, string) {
+	vendor, err := base.Exec(log, "dmidecode", "-s", "bios-vendor").Output()
 	if err != nil {
 		log.Errorf("GetDeviceBios bios-vendor failed %s\n",
 			err)
 		vendor = []byte{}
 	}
-	cmd = exec.Command("dmidecode", "-s", "bios-version")
-	version, err := cmd.Output()
+	version, err := base.Exec(log, "dmidecode", "-s", "bios-version").Output()
 	if err != nil {
 		log.Errorf("GetDeviceBios bios-version failed %s\n",
 			err)
 		version = []byte{}
 	}
-	cmd = exec.Command("dmidecode", "-s", "bios-release-date")
-	releaseDate, err := cmd.Output()
+	releaseDate, err := base.Exec(log, "dmidecode", "-s", "bios-release-date").Output()
 	if err != nil {
 		log.Errorf("GetDeviceBios bios-release-date failed %s\n",
 			err)

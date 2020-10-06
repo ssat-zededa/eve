@@ -4,12 +4,12 @@
 package types
 
 import (
+	"os"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	zconfig "github.com/lf-edge/eve/api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/base"
-	uuid "github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
 )
 
 // The information DomainManager needs to boot and halt domains
@@ -42,20 +42,10 @@ func (config DomainConfig) Key() string {
 	return config.UUIDandVersion.UUID.String()
 }
 
-func (config DomainConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
 // VirtualizationModeOrDefault sets the default to PV
 func (config DomainConfig) VirtualizationModeOrDefault() VmMode {
 	switch config.VirtualizationMode {
-	case PV, HVM, FML:
+	case PV, HVM, FML, NOHYPER:
 		return config.VirtualizationMode
 	default:
 		return PV
@@ -63,25 +53,25 @@ func (config DomainConfig) VirtualizationModeOrDefault() VmMode {
 }
 
 // LogCreate :
-func (config DomainConfig) LogCreate() {
-	logObject := base.NewLogObject(base.DomainConfigLogType, config.DisplayName,
+func (config DomainConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DomainConfigLogType, config.DisplayName,
 		config.UUIDandVersion.UUID, config.LogKey())
 	if logObject == nil {
 		return
 	}
 	logObject.CloneAndAddField("activate", config.Activate).
 		AddField("enable-vnc", config.EnableVnc).
-		Infof("domain config create")
+		Noticef("domain config create")
 }
 
 // LogModify :
-func (config DomainConfig) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.DomainConfigLogType, config.DisplayName,
+func (config DomainConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DomainConfigLogType, config.DisplayName,
 		config.UUIDandVersion.UUID, config.LogKey())
 
 	oldConfig, ok := old.(DomainConfig)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of DomainConfig type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DomainConfig type")
 	}
 	if oldConfig.Activate != config.Activate ||
 		oldConfig.EnableVnc != config.EnableVnc {
@@ -90,20 +80,23 @@ func (config DomainConfig) LogModify(old interface{}) {
 			AddField("enable-vnc", config.EnableVnc).
 			AddField("old-activate", oldConfig.Activate).
 			AddField("old-enable-vnc", oldConfig.EnableVnc).
-			Infof("domain config modify")
+			Noticef("domain config modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("domain config modify other change")
 	}
-
 }
 
 // LogDelete :
-func (config DomainConfig) LogDelete() {
-	logObject := base.EnsureLogObject(base.DomainConfigLogType, config.DisplayName,
+func (config DomainConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DomainConfigLogType, config.DisplayName,
 		config.UUIDandVersion.UUID, config.LogKey())
 	logObject.CloneAndAddField("activate", config.Activate).
 		AddField("enable-vnc", config.EnableVnc).
-		Infof("domain config delete")
+		Noticef("domain config delete")
 
-	base.DeleteLogObject(config.LogKey())
+	base.DeleteLogObject(logBase, config.LogKey())
 }
 
 // LogKey :
@@ -148,7 +141,18 @@ const (
 	HVM
 	Filler
 	FML
+	NOHYPER
 )
+
+// Task represents any runnable entity on EVE
+type Task interface {
+	Setup(DomainStatus, DomainConfig, *AssignableAdapters, *os.File) error
+	Create(string, string, *DomainConfig) (int, error)
+	Start(string, int) error
+	Stop(string, int, bool) error
+	Delete(string, int) error
+	Info(string, int) (int, SwState, error)
+}
 
 type DomainStatus struct {
 	UUIDandVersion     UUIDandVersion
@@ -182,28 +186,6 @@ func (status DomainStatus) Key() string {
 	return status.UUIDandVersion.UUID.String()
 }
 
-func (status DomainStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-func (status DomainStatus) CheckPendingAdd() bool {
-	return status.PendingAdd
-}
-
-func (status DomainStatus) CheckPendingModify() bool {
-	return status.PendingModify
-}
-
-func (status DomainStatus) CheckPendingDelete() bool {
-	return status.PendingDelete
-}
-
 func (status DomainStatus) Pending() bool {
 	return status.PendingAdd || status.PendingModify || status.PendingDelete
 }
@@ -220,25 +202,25 @@ func (status DomainStatus) VifInfoByVif(vif string) *VifInfo {
 }
 
 // LogCreate :
-func (status DomainStatus) LogCreate() {
-	logObject := base.NewLogObject(base.DomainStatusLogType, status.DisplayName,
+func (status DomainStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DomainStatusLogType, status.DisplayName,
 		status.UUIDandVersion.UUID, status.LogKey())
 	if logObject == nil {
 		return
 	}
 	logObject.CloneAndAddField("state", status.State.String()).
 		AddField("activated", status.Activated).
-		Infof("domain status create")
+		Noticef("domain status create")
 }
 
 // LogModify :
-func (status DomainStatus) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.DomainStatusLogType, status.DisplayName,
+func (status DomainStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DomainStatusLogType, status.DisplayName,
 		status.UUIDandVersion.UUID, status.LogKey())
 
 	oldStatus, ok := old.(DomainStatus)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of DomainStatus type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DomainStatus type")
 	}
 	if oldStatus.State != status.State ||
 		oldStatus.Activated != status.Activated {
@@ -247,7 +229,11 @@ func (status DomainStatus) LogModify(old interface{}) {
 			AddField("activated", status.Activated).
 			AddField("old-state", oldStatus.State.String()).
 			AddField("old-activated", oldStatus.Activated).
-			Infof("domain status modify")
+			Noticef("domain status modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+			Noticef("domain status modify other change")
 	}
 
 	if status.HasError() {
@@ -261,14 +247,14 @@ func (status DomainStatus) LogModify(old interface{}) {
 }
 
 // LogDelete :
-func (status DomainStatus) LogDelete() {
-	logObject := base.EnsureLogObject(base.DomainStatusLogType, status.DisplayName,
+func (status DomainStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DomainStatusLogType, status.DisplayName,
 		status.UUIDandVersion.UUID, status.LogKey())
 	logObject.CloneAndAddField("state", status.State.String()).
 		AddField("activated", status.Activated).
-		Infof("domain status delete")
+		Noticef("domain status delete")
 
-	base.DeleteLogObject(status.LogKey())
+	base.DeleteLogObject(logBase, status.LogKey())
 }
 
 // LogKey :
@@ -289,26 +275,20 @@ type VifInfo struct {
 // Note that vdev in general can be hd[x], xvd[x], sd[x] but here we only
 // use xvd
 type DiskConfig struct {
-	ImageID      uuid.UUID // UUID of the image
-	ImageSha256  string    // sha256 of immutable image
-	FileLocation string    // Where to find the volume
+	FileLocation string // Location of the volume
 	ReadOnly     bool
-	Preserve     bool // If set a rw disk will be preserved across
-	// boots (acivate/inactivate)
-	Maxsizebytes uint64 // Resize filesystem to this size if set
 	Format       zconfig.Format
-	Devtype      string // Default ""; could be e.g. "cdrom"
+	MountDir     string
+	DisplayName  string
 }
 
 type DiskStatus struct {
-	ImageID      uuid.UUID // UUID of immutable image
-	ImageSha256  string    // sha256 of immutable image
 	ReadOnly     bool
-	Preserve     bool
 	FileLocation string // From DiskConfig
-	Maxsizebytes uint64 // Resize filesystem to this size if set
 	Format       zconfig.Format
-	Devtype      string // From config
+	MountDir     string
+	DisplayName  string
+	Devtype      string // XXX used internally by hypervisor; deprecate?
 	Vdev         string // Allocated
 }
 
@@ -326,6 +306,44 @@ func (metric DomainMetric) Key() string {
 	return metric.UUIDandVersion.UUID.String()
 }
 
+// LogCreate :
+func (metric DomainMetric) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DomainMetricLogType, "",
+		metric.UUIDandVersion.UUID, metric.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Domain metric create")
+}
+
+// LogModify :
+func (metric DomainMetric) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DomainMetricLogType, "",
+		metric.UUIDandVersion.UUID, metric.LogKey())
+
+	oldMetric, ok := old.(DomainMetric)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DomainMetric type")
+	}
+	// XXX remove? XXX huge?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldMetric, metric)).
+		Metricf("Domain metric modify")
+}
+
+// LogDelete :
+func (metric DomainMetric) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DomainMetricLogType, "",
+		metric.UUIDandVersion.UUID, metric.LogKey())
+	logObject.Metricf("Domain metric delete")
+
+	base.DeleteLogObject(logBase, metric.LogKey())
+}
+
+// LogKey :
+func (metric DomainMetric) LogKey() string {
+	return string(base.DomainMetricLogType) + "-" + metric.Key()
+}
+
 // HostMemory reports global stats. Published under "global" key
 // Note that Ncpus is the set of physical CPUs which is different
 // than the set of CPUs assigned to dom0
@@ -333,4 +351,47 @@ type HostMemory struct {
 	TotalMemoryMB uint64
 	FreeMemoryMB  uint64
 	Ncpus         uint32
+}
+
+// Key returns the key for pubsub
+func (hm HostMemory) Key() string {
+	return "global"
+}
+
+// LogCreate :
+func (hm HostMemory) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.HostMemoryLogType, "",
+		nilUUID, hm.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Host memory create")
+}
+
+// LogModify :
+func (hm HostMemory) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.HostMemoryLogType, "",
+		nilUUID, hm.LogKey())
+
+	oldHm, ok := old.(HostMemory)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of HostMemory type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldHm, hm)).
+		Metricf("Host memory modify")
+}
+
+// LogDelete :
+func (hm HostMemory) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.HostMemoryLogType, "",
+		nilUUID, hm.LogKey())
+	logObject.Metricf("Host memory delete")
+
+	base.DeleteLogObject(logBase, hm.LogKey())
+}
+
+// LogKey :
+func (hm HostMemory) LogKey() string {
+	return string(base.HostMemoryLogType) + "-" + hm.Key()
 }

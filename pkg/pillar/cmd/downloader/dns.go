@@ -1,9 +1,10 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
-	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 )
 
 // Handles both create and modify events
@@ -16,7 +17,8 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 		return
 	}
 	log.Infof("handleDNSModify for %s", key)
-	if cmp.Equal(ctx.deviceNetworkStatus, status) {
+	// Ignore test status and timestamps
+	if ctx.deviceNetworkStatus.MostlyEqual(status) {
 		log.Infof("handleDNSModify unchanged")
 		return
 	}

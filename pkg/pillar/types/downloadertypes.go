@@ -4,18 +4,17 @@
 package types
 
 import (
-	"fmt"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	uuid "github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus" // OK for logrus.Fatal
 )
 
 // The key/index to this is the ImageSha256 which is allocated by the controller or resolver.
 type DownloaderConfig struct {
 	ImageSha256      string
-	ImageID          uuid.UUID // Used for logging
 	DatastoreID      uuid.UUID
 	Name             string
 	Target           string // file path where to download the file
@@ -30,20 +29,10 @@ func (config DownloaderConfig) Key() string {
 	return config.ImageSha256
 }
 
-func (config DownloaderConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained key: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
 // LogCreate :
-func (config DownloaderConfig) LogCreate() {
-	logObject := base.NewLogObject(base.DownloaderConfigLogType, config.Name,
-		config.ImageID, config.LogKey())
+func (config DownloaderConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DownloaderConfigLogType, config.Name,
+		nilUUID, config.LogKey())
 	if logObject == nil {
 		return
 	}
@@ -51,17 +40,17 @@ func (config DownloaderConfig) LogCreate() {
 		AddField("datastore-id", config.DatastoreID).
 		AddField("refcount-int64", config.RefCount).
 		AddField("size-int64", config.Size).
-		Infof("Download config create")
+		Noticef("Download config create")
 }
 
 // LogModify :
-func (config DownloaderConfig) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.DownloaderConfigLogType, config.Name,
-		config.ImageID, config.LogKey())
+func (config DownloaderConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DownloaderConfigLogType, config.Name,
+		nilUUID, config.LogKey())
 
 	oldConfig, ok := old.(DownloaderConfig)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of DownloaderConfig type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DownloaderConfig type")
 	}
 	if oldConfig.Target != config.Target ||
 		oldConfig.DatastoreID != config.DatastoreID ||
@@ -76,21 +65,25 @@ func (config DownloaderConfig) LogModify(old interface{}) {
 			AddField("old-datastore-id", oldConfig.DatastoreID).
 			AddField("old-refcount-int64", oldConfig.RefCount).
 			AddField("old-size-int64", oldConfig.Size).
-			Infof("Download config modify")
+			Noticef("Download config modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("Download config modify other change")
 	}
 }
 
 // LogDelete :
-func (config DownloaderConfig) LogDelete() {
-	logObject := base.EnsureLogObject(base.DownloaderConfigLogType, config.Name,
-		config.ImageID, config.LogKey())
+func (config DownloaderConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DownloaderConfigLogType, config.Name,
+		nilUUID, config.LogKey())
 	logObject.CloneAndAddField("target", config.Target).
 		AddField("datastore-id", config.DatastoreID).
 		AddField("refcount-int64", config.RefCount).
 		AddField("size-int64", config.Size).
-		Infof("Download config delete")
+		Noticef("Download config delete")
 
-	base.DeleteLogObject(config.LogKey())
+	base.DeleteLogObject(logBase, config.LogKey())
 }
 
 // LogKey :
@@ -98,21 +91,12 @@ func (config DownloaderConfig) LogKey() string {
 	return string(base.DownloaderConfigLogType) + "-" + config.Key()
 }
 
-// Cert Object may contain multiple objects
-
-type CertConfig struct {
-	ServerCert DownloaderConfig
-	CertChain  []DownloaderConfig
-}
-
 // The key/index to this is the ImageSha256 which comes from DownloaderConfig.
 type DownloaderStatus struct {
 	ImageSha256      string
-	ImageID          uuid.UUID // Used for logging
 	DatastoreID      uuid.UUID
 	Target           string // file path where we download the file
 	Name             string
-	ObjType          string
 	PendingAdd       bool
 	PendingModify    bool
 	PendingDelete    bool
@@ -124,8 +108,11 @@ type DownloaderStatus struct {
 	State            SwState // DOWNLOADED etc
 	ReservedSpace    uint64  // Contribution to global ReservedSpace
 	Size             uint64  // Once DOWNLOADED; in bytes
-	Progress         uint    // In percent i.e., 0-100
+	TotalSize        int64   // expected size as reported by the downloader, if any
+	CurrentSize      int64   // current total downloaded size as reported by the downloader
+	Progress         uint    // In percent i.e., 0-100, given by CurrentSize/ExpectedSize
 	ModTime          time.Time
+	ContentType      string // content-type header, if provided
 	// ErrorAndTime provides SetErrorNow() and ClearError()
 	ErrorAndTime
 	RetryCount int
@@ -133,28 +120,6 @@ type DownloaderStatus struct {
 
 func (status DownloaderStatus) Key() string {
 	return status.ImageSha256
-}
-
-func (status DownloaderStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained key: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-func (status DownloaderStatus) CheckPendingAdd() bool {
-	return status.PendingAdd
-}
-
-func (status DownloaderStatus) CheckPendingModify() bool {
-	return status.PendingModify
-}
-
-func (status DownloaderStatus) CheckPendingDelete() bool {
-	return status.PendingDelete
 }
 
 func (status DownloaderStatus) Pending() bool {
@@ -178,26 +143,26 @@ func (status *DownloaderStatus) HandleDownloadFail(errStr string) {
 }
 
 // LogCreate :
-func (status DownloaderStatus) LogCreate() {
-	logObject := base.NewLogObject(base.DownloaderStatusLogType, status.Name,
-		status.ImageID, status.LogKey())
+func (status DownloaderStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DownloaderStatusLogType, status.Name,
+		nilUUID, status.LogKey())
 	if logObject == nil {
 		return
 	}
 	logObject.CloneAndAddField("state", status.State.String()).
 		AddField("refcount-int64", status.RefCount).
 		AddField("size-int64", status.Size).
-		Infof("Download status create")
+		Noticef("Download status create")
 }
 
 // LogModify :
-func (status DownloaderStatus) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.DownloaderStatusLogType, status.Name,
-		status.ImageID, status.LogKey())
+func (status DownloaderStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DownloaderStatusLogType, status.Name,
+		nilUUID, status.LogKey())
 
 	oldStatus, ok := old.(DownloaderStatus)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of DownloaderStatus type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DownloaderStatus type")
 	}
 	if oldStatus.State != status.State ||
 		oldStatus.RefCount != status.RefCount ||
@@ -209,7 +174,11 @@ func (status DownloaderStatus) LogModify(old interface{}) {
 			AddField("old-state", oldStatus.State.String()).
 			AddField("old-refcount-int64", oldStatus.RefCount).
 			AddField("old-size-int64", oldStatus.Size).
-			Infof("Download status modify")
+			Noticef("Download status modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+			Noticef("Download status modify other change")
 	}
 
 	if status.HasError() {
@@ -222,31 +191,20 @@ func (status DownloaderStatus) LogModify(old interface{}) {
 }
 
 // LogDelete :
-func (status DownloaderStatus) LogDelete() {
-	logObject := base.EnsureLogObject(base.DownloaderStatusLogType, status.Name,
-		status.ImageID, status.LogKey())
+func (status DownloaderStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DownloaderStatusLogType, status.Name,
+		nilUUID, status.LogKey())
 	logObject.CloneAndAddField("state", status.State.String()).
 		AddField("refcount-int64", status.RefCount).
 		AddField("size-int64", status.Size).
-		Infof("Download status delete")
+		Noticef("Download status delete")
 
-	base.DeleteLogObject(status.LogKey())
+	base.DeleteLogObject(logBase, status.LogKey())
 }
 
 // LogKey :
 func (status DownloaderStatus) LogKey() string {
 	return string(base.DownloaderStatusLogType) + "-" + status.Key()
-}
-
-type GlobalDownloadConfig struct {
-	MaxSpace uint64 // Number of kbytes allowed in types.DownloadDirname
-}
-
-// These are all in kbytes
-type GlobalDownloadStatus struct {
-	UsedSpace      uint64 // Number of kbytes used in types.DownloadDirname
-	ReservedSpace  uint64 // Reserved for ongoing downloads
-	RemainingSpace uint64 // MaxSpace - UsedSpace - ReservedSpace
 }
 
 // DatastoreContext : datastore detail
@@ -268,160 +226,9 @@ func AllowNonFreePort(gc ConfigItemValueMap, objType string) bool {
 		return gc.GlobalValueTriState(AllowNonFreeAppImages) == TS_ENABLED
 	case BaseOsObj:
 		return gc.GlobalValueTriState(AllowNonFreeBaseImages) == TS_ENABLED
-	case CertObj:
-		return (gc.GlobalValueTriState(AllowNonFreeBaseImages) == TS_ENABLED) ||
-			(gc.GlobalValueTriState(AllowNonFreeAppImages) == TS_ENABLED)
 	default:
-		log.Fatalf("AllowNonFreePort: Unknown ObjType %s\n",
+		logrus.Fatalf("AllowNonFreePort: Unknown ObjType %s\n",
 			objType)
 		return false
 	}
-}
-
-// ResolveConfig key/index to this is the combination of
-// DatastoreID which is allocated by the controller, name
-// and the sequence counter.
-// It will resolve the tag in name to sha256
-type ResolveConfig struct {
-	DatastoreID      uuid.UUID
-	Name             string
-	AllowNonFreePort bool
-	Counter          uint32
-}
-
-// Key : DatastoreID, name and sequence counter are used
-// to differentiate different config
-func (config ResolveConfig) Key() string {
-	return fmt.Sprintf("%s+%s+%v", config.DatastoreID.String(), config.Name, config.Counter)
-}
-
-// VerifyFilename will verify the key name
-func (config ResolveConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained key: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-// LogCreate :
-func (config ResolveConfig) LogCreate() {
-	logObject := base.NewLogObject(base.ResolveConfigLogType, config.Name,
-		config.DatastoreID, config.LogKey())
-	if logObject == nil {
-		return
-	}
-	logObject.Infof("Resolve config create")
-}
-
-// LogModify :
-func (config ResolveConfig) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.ResolveConfigLogType, config.Name,
-		config.DatastoreID, config.LogKey())
-
-	// Why would it change?
-	logObject.Infof("Resolve config modify")
-}
-
-// LogDelete :
-func (config ResolveConfig) LogDelete() {
-	logObject := base.EnsureLogObject(base.ResolveConfigLogType, config.Name,
-		config.DatastoreID, config.LogKey())
-	logObject.Infof("Resolve config delete")
-
-	base.DeleteLogObject(config.LogKey())
-}
-
-// LogKey :
-func (config ResolveConfig) LogKey() string {
-	return string(base.ResolveConfigLogType) + "-" + config.Key()
-}
-
-// ResolveStatus key/index to this is the combination of
-// DatastoreID, name and the sequence counter which comes
-// from the ResolveConfig
-type ResolveStatus struct {
-	DatastoreID uuid.UUID
-	Name        string
-	ImageSha256 string
-	Counter     uint32
-	RetryCount  int
-	// ErrorAndTime provides SetErrorNow() and ClearError()
-	ErrorAndTime
-}
-
-// Key : DatastoreID, name and sequence counter are used
-// to differentiate different config
-func (status ResolveStatus) Key() string {
-	return fmt.Sprintf("%s+%s+%v", status.DatastoreID.String(), status.Name, status.Counter)
-}
-
-// VerifyFilename will verify the key name
-func (status ResolveStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained key: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-// LogCreate :
-func (status ResolveStatus) LogCreate() {
-	logObject := base.NewLogObject(base.ResolveStatusLogType, status.Name,
-		status.DatastoreID, status.LogKey())
-	if logObject == nil {
-		return
-	}
-	logObject.CloneAndAddField("image-sha256", status.ImageSha256).
-		AddField("retry-count-int64", status.RetryCount).
-		Infof("Resolve status create")
-}
-
-// LogModify :
-func (status ResolveStatus) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.ResolveStatusLogType, status.Name,
-		status.DatastoreID, status.LogKey())
-
-	oldStatus, ok := old.(ResolveStatus)
-	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of ResolveStatus type")
-	}
-	if oldStatus.ImageSha256 != status.ImageSha256 ||
-		oldStatus.RetryCount != status.RetryCount {
-
-		logObject.CloneAndAddField("image-sha256", status.ImageSha256).
-			AddField("retry-count-int64", status.RetryCount).
-			AddField("old-image-sha256", oldStatus.ImageSha256).
-			AddField("old-retry-count-int64", oldStatus.RetryCount).
-			Infof("Resolve status modify")
-	}
-
-	if status.HasError() {
-		errAndTime := status.ErrorAndTime
-		logObject.CloneAndAddField("image-sha256", status.ImageSha256).
-			AddField("retry-count-int64", status.RetryCount).
-			AddField("error", errAndTime.Error).
-			AddField("error-time", errAndTime.ErrorTime).
-			Errorf("Resolve status modify")
-	}
-}
-
-// LogDelete :
-func (status ResolveStatus) LogDelete() {
-	logObject := base.EnsureLogObject(base.ResolveStatusLogType, status.Name,
-		status.DatastoreID, status.LogKey())
-	logObject.CloneAndAddField("image-sha256", status.ImageSha256).
-		AddField("retry-count-int64", status.RetryCount).
-		Infof("Resolve status delete")
-
-	base.DeleteLogObject(status.LogKey())
-}
-
-// LogKey :
-func (status ResolveStatus) LogKey() string {
-	return string(base.ResolveStatusLogType) + "-" + status.Key()
 }

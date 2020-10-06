@@ -16,17 +16,21 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/oci"
+	zconfig "github.com/lf-edge/eve/api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"os"
+	"path"
 )
 
 const eveScript = "/bin/eve"
 
 var vethScript = []string{"eve", "exec", "pillar", "/opt/zededa/bin/veth.sh"}
 
-//revive:disable
+// ociSpec is kept private (with all the actions done by getters and setters
+// This is because we expect the implementation to still evolve quite a bit
+// for all the different task usecases
 type ociSpec struct {
 	specs.Spec
 	name         string
@@ -36,8 +40,23 @@ type ociSpec struct {
 	stopSignal   string
 }
 
+// OCISpec provides methods to manipulate OCI runtime specifications and create containers based on them
+type OCISpec interface {
+	Get() *specs.Spec
+	Save(*os.File) error
+	Load(*os.File) error
+	CreateContainer(bool) error
+	AdjustMemLimit(types.DomainConfig, int64)
+	UpdateVifList(types.DomainConfig)
+	UpdateFromDomain(types.DomainConfig)
+	UpdateFromVolume(string) error
+	UpdateMounts([]types.DiskStatus)
+	UpdateMountsNested([]types.DiskStatus)
+	UpdateEnvVar(map[string]string)
+}
+
 // NewOciSpec returns a default oci spec from the containerd point of view
-func NewOciSpec(name string) (*ociSpec, error) {
+func NewOciSpec(name string) (OCISpec, error) {
 	s := &ociSpec{name: name}
 	// we need a dummy container object to trick containerd
 	// initialization functions into filling out defaults
@@ -53,7 +72,10 @@ func NewOciSpec(name string) (*ociSpec, error) {
 	return s, nil
 }
 
-//revive:enable
+// Get simply returns an underlying OCI runtime spec
+func (s *ociSpec) Get() *specs.Spec {
+	return &s.Spec
+}
 
 // Save stores json representation of the oci spec in a file
 func (s *ociSpec) Save(file *os.File) error {
@@ -83,17 +105,23 @@ func (s *ociSpec) CreateContainer(removeExisting bool) error {
 	_, err := CtrdClient.NewContainer(ctrdCtx, s.name, containerd.WithSpec(&s.Spec))
 	// if container exists, is stopped and we are asked to remove existing - try that
 	if err != nil && removeExisting {
-		_, status, err := CtrInfo(s.name)
-		if err == nil && status != "running" && status != "pausing" {
-			_ = CtrDelete(s.name)
-			_, err = CtrdClient.NewContainer(ctrdCtx, s.name, containerd.WithSpec(&s.Spec))
-		}
+		_ = CtrDeleteContainer(s.name)
+		_, err = CtrdClient.NewContainer(ctrdCtx, s.name, containerd.WithSpec(&s.Spec))
 	}
 	return err
 }
 
-// UpdateFromDomain updates values in the OCI spec based on EVE DomainConfig settings
-func (s *ociSpec) UpdateFromDomain(dom types.DomainConfig) {
+// AdjustMemLimit adds Memory Resources of the spec with given number
+func (s *ociSpec) AdjustMemLimit(dom types.DomainConfig, addMemory int64) {
+	// update cgroup resource constraints for CPU and memory
+	if s.Linux != nil {
+		m := int64(dom.Memory*1024) + addMemory
+		s.Linux.Resources.Memory.Limit = &m
+	}
+}
+
+// UpdateVifList creates VIF management hooks in OCI spec
+func (s *ociSpec) UpdateVifList(dom types.DomainConfig) {
 	// use pre-start and post-stop hooks for networking
 	if s.Hooks == nil {
 		s.Hooks = &specs.Hooks{}
@@ -114,7 +142,10 @@ func (s *ociSpec) UpdateFromDomain(dom types.DomainConfig) {
 			Timeout: &timeout,
 		})
 	}
+}
 
+// UpdateFromDomain updates values in the OCI spec based on EVE DomainConfig settings
+func (s *ociSpec) UpdateFromDomain(dom types.DomainConfig) {
 	// update cgroup resource constraints for CPU and memory
 	if s.Linux != nil {
 		if s.Linux.Resources == nil {
@@ -147,7 +178,7 @@ func (s *ociSpec) UpdateFromVolume(volume string) error {
 	}
 
 	if err = s.updateFromImageConfig(imgInfo.Config); err == nil {
-		s.Root.Path = "/var" + volume + "/rootfs"
+		s.Root.Path = volume + "/rootfs"
 	}
 
 	return err
@@ -190,4 +221,93 @@ func (s *ociSpec) updateFromImageConfig(config v1.ImageConfig) error {
 		}
 	}
 	return oci.WithAdditionalGIDs("root")(ctrdCtx, CtrdClient, &dummy, &s.Spec)
+}
+
+func (s *ociSpec) updateMounts(disks []types.DiskStatus, nested bool) {
+	ociVolumeData := "rootfs"
+	root := ""
+	mounts := []specs.Mount{}
+	rootMount := specs.Mount{Type: "bind"}
+
+	if nested {
+		rootMount.Destination = "/mnt"
+		root = path.Join(rootMount.Destination, ociVolumeData)
+		mounts = append(mounts, specs.Mount{
+			Type:        "tmpfs",
+			Source:      "tmpfs",
+			Destination: path.Join(root, "dev"),
+			Options:     []string{"nosuid", "strictatime", "mode=755", "size=65536"},
+		})
+	}
+
+	for id, disk := range disks {
+		src := disk.FileLocation
+		opts := []string{"rbind"}
+		if disk.ReadOnly {
+			opts = append(opts, "ro")
+		} else {
+			opts = append(opts, "rw")
+		}
+
+		// we may need additional filtering here, but for now assume that
+		// we can bind mount anything aside from FmtUnknown
+		switch disk.Format {
+		case zconfig.Format_FmtUnknown:
+			continue
+		case zconfig.Format_CONTAINER:
+			if path.Clean(disk.MountDir) == "/" {
+				rootMount.Options = opts
+				rootMount.Source = src
+				continue
+			} else {
+				src = path.Join(src, ociVolumeData)
+			}
+		}
+
+		dests := []string{fmt.Sprintf("/dev/eve/volumes/by-id/%d", id)}
+		if disk.DisplayName != "" {
+			dests = append(dests, "/dev/eve/volumes/by-name/"+disk.DisplayName)
+		}
+		if disk.MountDir != "" {
+			dst := disk.MountDir
+			if disk.Format != zconfig.Format_CONTAINER {
+				// this is a bit of a hack: we assume that anything but
+				// the container image has to be a file and thus make it
+				// appear *under* destination directory as a file with ID
+				dst = fmt.Sprintf("%s/%d", dst, id)
+			}
+			dests = append(dests, dst)
+		}
+
+		for _, dest := range dests {
+			mounts = append(mounts, specs.Mount{
+				Type:        "bind",
+				Source:      src,
+				Destination: path.Join(root, dest),
+				Options:     opts,
+			})
+		}
+	}
+
+	if nested && rootMount.Source != "" {
+		s.Mounts = append(s.Mounts, rootMount)
+	}
+	s.Mounts = append(s.Mounts, mounts...)
+}
+
+// UpdateMounts adds volume specification mount points to the OCI runtime spec
+func (s *ociSpec) UpdateMounts(disks []types.DiskStatus) {
+	s.updateMounts(disks, false)
+}
+
+// UpdateMountsNested adds volume specification mount points to the OCI runtime spec under a static root
+func (s *ociSpec) UpdateMountsNested(disks []types.DiskStatus) {
+	s.updateMounts(disks, true)
+}
+
+// UpdateEnvVar adds user specified env variables to the OCI spec.
+func (s *ociSpec) UpdateEnvVar(envVars map[string]string) {
+	for k, v := range envVars {
+		s.Process.Env = append(s.Process.Env, fmt.Sprintf("%s=%s", k, v))
+	}
 }

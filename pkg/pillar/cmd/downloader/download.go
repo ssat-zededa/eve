@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
@@ -5,17 +8,18 @@ import (
 	"fmt"
 	"net"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/lf-edge/eve/pkg/pillar/zedUpload"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 )
 
-// perform the actual download
+// download perform the actual download, given the necessary information.
+// Returns the content-type of the object downloaded, normally from the
+// Content-Type header, but subject to whatever the DronaRequest implementation
+// determined it is, empty string if not available; and the error, if any.
 func download(ctx *downloaderContext, trType zedUpload.SyncTransportType,
 	status Status, syncOp zedUpload.SyncOpType, downloadURL string,
 	auth *zedUpload.AuthInput, dpath, region string, maxsize uint64, ifname string,
-	ipSrc net.IP, filename, locFilename string) error {
+	ipSrc net.IP, filename, locFilename string) (string, error) {
 
 	// create Endpoint
 	var dEndPoint zedUpload.DronaEndPoint
@@ -34,11 +38,11 @@ func download(ctx *downloaderContext, trType zedUpload.SyncTransportType,
 	}
 	if err != nil {
 		log.Errorf("NewSyncerDest failed: %s", err)
-		return err
+		return "", err
 	}
 	// check for proxies on the selected management port interface
-	proxyLookupURL := zedcloud.IntfLookupProxyCfg(&ctx.deviceNetworkStatus, ifname, downloadURL)
-	proxyURL, err := zedcloud.LookupProxy(&ctx.deviceNetworkStatus, ifname, proxyLookupURL)
+	proxyLookupURL := zedcloud.IntfLookupProxyCfg(log, &ctx.deviceNetworkStatus, ifname, downloadURL)
+	proxyURL, err := zedcloud.LookupProxy(log, &ctx.deviceNetworkStatus, ifname, proxyLookupURL)
 	if err == nil && proxyURL != nil {
 		log.Infof("%s: Using proxy %s", trType, proxyURL.String())
 		dEndPoint.WithSrcIPAndProxySelection(ipSrc, proxyURL)
@@ -56,25 +60,25 @@ func download(ctx *downloaderContext, trType zedUpload.SyncTransportType,
 	req := dEndPoint.NewRequest(syncOp, filename, locFilename,
 		int64(maxsize), true, respChan)
 	if req == nil {
-		return errors.New("NewRequest failed")
+		return "", errors.New("NewRequest failed")
 	}
 
 	req.Post()
 	for resp := range respChan {
 		if resp.IsDnUpdate() {
-			asize, osize, progress := resp.Progress()
+			currentSize, totalSize, progress := resp.Progress()
 			log.Infof("Update progress for %v: %v/%v",
-				resp.GetLocalName(), asize, osize)
+				resp.GetLocalName(), currentSize, totalSize)
 			// sometime, the download goes to an infinite loop,
 			// showing it has downloaded, more than it is supposed to
 			// aborting download, marking it as an error
-			if asize > osize {
+			if currentSize > totalSize {
 				errStr := fmt.Sprintf("Size '%v' provided in image config of '%s' is incorrect.\nDownload status (%v / %v). Aborting the download",
-					osize, resp.GetLocalName(), asize, osize)
+					totalSize, resp.GetLocalName(), currentSize, totalSize)
 				log.Errorln(errStr)
-				return errors.New(errStr)
+				return "", errors.New(errStr)
 			}
-			status.Progress(progress)
+			status.Progress(progress, currentSize, totalSize)
 			continue
 		}
 		if syncOp == zedUpload.SyncOpDownload {
@@ -83,20 +87,21 @@ func download(ctx *downloaderContext, trType zedUpload.SyncTransportType,
 			_, err = resp.GetUpStatus()
 		}
 		if resp.IsError() {
-			return err
+			return "", err
 		}
+		asize, osize := resp.GetAsize(), resp.GetOsize()
 		log.Infof("Done for %v: size %v/%v",
 			resp.GetLocalName(),
-			resp.GetAsize(), resp.GetOsize())
-		status.Progress(100)
-		return nil
+			asize, osize)
+		status.Progress(100, osize, asize)
+		return req.GetContentType(), nil
 	}
 	// if we got here, channel was closed
 	// range ends on a closed channel, which is the equivalent of "!ok"
 	errStr := fmt.Sprintf("respChan EOF for <%s>, <%s>, <%s>",
 		dpath, region, filename)
 	log.Errorln(errStr)
-	return errors.New(errStr)
+	return "", errors.New(errStr)
 }
 
 func objectMetadata(ctx *downloaderContext, trType zedUpload.SyncTransportType,
@@ -119,9 +124,9 @@ func objectMetadata(ctx *downloaderContext, trType zedUpload.SyncTransportType,
 		return sha256, err
 	}
 	// check for proxies on the selected management port interface
-	proxyLookupURL := zedcloud.IntfLookupProxyCfg(&ctx.deviceNetworkStatus, ifname, downloadURL)
+	proxyLookupURL := zedcloud.IntfLookupProxyCfg(log, &ctx.deviceNetworkStatus, ifname, downloadURL)
 
-	proxyURL, err := zedcloud.LookupProxy(&ctx.deviceNetworkStatus, ifname, proxyLookupURL)
+	proxyURL, err := zedcloud.LookupProxy(log, &ctx.deviceNetworkStatus, ifname, proxyLookupURL)
 	if err == nil && proxyURL != nil {
 		log.Infof("%s: Using proxy %s", trType, proxyURL.String())
 		dEndPoint.WithSrcIPAndProxySelection(ipSrc, proxyURL)

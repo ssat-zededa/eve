@@ -4,106 +4,94 @@
 package baseosmgr
 
 import (
-	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	uuid "github.com/satori/go.uuid"
 )
 
 // Really a constant
 var nilUUID uuid.UUID
 
-func checkVolumeStatus(ctx *baseOsMgrContext,
-	baseOsUUID uuid.UUID, config []types.StorageConfig,
-	status []types.StorageStatus) *types.RetStatus {
+func checkContentTreeStatus(ctx *baseOsMgrContext,
+	baseOsUUID uuid.UUID, config []types.ContentTreeConfig,
+	status []types.ContentTreeStatus) *types.RetStatus {
 
 	uuidStr := baseOsUUID.String()
 	ret := &types.RetStatus{}
-	log.Infof("checkVolumeStatus for %s", uuidStr)
+	log.Infof("checkContentTreeStatus for %s", uuidStr)
 
 	ret.Changed = false
 	ret.AllErrors = ""
 	ret.MinState = types.MAXSTATE
 
-	for i, sc := range config {
+	for i, ctc := range config {
 
-		ss := &status[i]
+		cts := &status[i]
 
-		imageID := sc.ImageID
+		contentID := ctc.ContentID
 
-		log.Infof("checkVolumeStatus %s, image status %v",
-			imageID, ss.State)
-		if ss.State == types.INSTALLED {
-			ret.MinState = ss.State
-			ss.Progress = 100
+		log.Infof("checkContentTreeStatus %s, content status %v",
+			contentID, cts.State)
+		if cts.State == types.INSTALLED {
+			ret.MinState = cts.State
+			cts.Progress = 100
+			// XXX TotalSize and CurrentSize?
 			ret.Changed = true
-			log.Infof("checkVolumeStatus %s is already installed",
-				imageID)
+			log.Infof("checkContentTreeStatus %s is already installed",
+				contentID)
 			continue
 		}
 
-		if !ss.HasVolumemgrRef {
-			log.Infof("checkVolumeStatus %s, !HasVolumemgrRef", sc.ImageID)
-			// We use the baseos object UUID as appInstID here
-			// XXX note that we use the ImageID for the VolumeID
-			// argument since we do not have a VolumeID
-			AddOrRefcountVolumeConfig(ctx, ss.ImageSha256,
-				baseOsUUID, ss.ImageID, *ss)
-			ss.HasVolumemgrRef = true
+		c := MaybeAddContentTreeConfig(ctx, &ctc)
+		if c {
 			ret.Changed = true
 		}
-		// We use the baseos object UUID as appInstID here
-		vs := lookupVolumeStatus(ctx, ss.ImageSha256, baseOsUUID, ss.ImageID)
-		if vs == nil || vs.RefCount == 0 {
-			if vs == nil {
-				log.Infof("VolumeStatus not found. name: %s",
-					ss.Name)
-			} else {
-				log.Infof("VolumeStatus RefCount zero. name: %s",
-					ss.Name)
-			}
+		contentStatus := lookupContentTreeStatus(ctx, ctc.Key())
+		if contentStatus == nil {
+			log.Infof("Content tree status not found. name: %s", ctc.RelativeURL)
 			ret.MinState = types.DOWNLOADING
-			ss.State = types.DOWNLOADING
+			cts.State = types.DOWNLOADING
 			ret.Changed = true
 			continue
 		}
 
-		if vs.FileLocation != ss.ActiveFileLocation {
-			ss.ActiveFileLocation = vs.FileLocation
+		if contentStatus.FileLocation != cts.FileLocation {
+			cts.FileLocation = contentStatus.FileLocation
 			ret.Changed = true
-			log.Infof("checkVolumeStatus(%s) from vs set ActiveFileLocation to %s",
-				imageID, vs.FileLocation)
+			log.Infof("checkContentTreeStatus(%s) from contentStatus set FileLocation to %s",
+				contentID, contentStatus.FileLocation)
 		}
-		if ret.MinState > vs.State {
-			ret.MinState = vs.State
+		if ret.MinState > contentStatus.State {
+			ret.MinState = contentStatus.State
 		}
-		if vs.State != ss.State {
-			log.Infof("checkVolumeStatus(%s) from ds set ss.State %d",
-				imageID, vs.State)
-			ss.State = vs.State
+		if contentStatus.State != cts.State {
+			log.Infof("checkContentTreeStatus(%s) from ds set cts.State %d",
+				contentID, contentStatus.State)
+			cts.State = contentStatus.State
 			ret.Changed = true
 		}
 
-		if vs.Progress != ss.Progress {
-			ss.Progress = vs.Progress
+		if contentStatus.Progress != cts.Progress {
+			cts.Progress = contentStatus.Progress
 			ret.Changed = true
 		}
-		if vs.Pending() {
-			log.Infof("checkVolumeStatus(%s) Pending",
-				imageID)
-			continue
+		if contentStatus.TotalSize != cts.TotalSize {
+			cts.TotalSize = contentStatus.TotalSize
+			ret.Changed = true
 		}
-		if vs.HasError() {
-			log.Errorf("checkVolumeStatus %s, volumemgr error, %s",
-				uuidStr, vs.Error)
-			ss.SetErrorWithSource(vs.Error, types.VolumeStatus{},
-				vs.ErrorTime)
-			ret.AllErrors = appendError(ret.AllErrors, "volumemgr", vs.Error)
-			ret.ErrorTime = ss.ErrorTime
+		if contentStatus.CurrentSize != cts.CurrentSize {
+			cts.CurrentSize = contentStatus.CurrentSize
+			ret.Changed = true
+		}
+		if contentStatus.HasError() {
+			log.Errorf("checkContentTreeStatus %s, volumemgr error, %s",
+				uuidStr, contentStatus.Error)
+			cts.SetErrorWithSource(contentStatus.Error, types.ContentTreeStatus{},
+				contentStatus.ErrorTime)
+			ret.AllErrors = appendError(ret.AllErrors, "volumemgr", contentStatus.Error)
+			ret.ErrorTime = cts.ErrorTime
 			ret.Changed = true
 		}
 	}
@@ -118,75 +106,93 @@ func checkVolumeStatus(ctx *baseOsMgrContext,
 }
 
 // Note: can not do this in volumemgr since it is triggered by Activate=true
-func installDownloadedObjects(uuidStr string,
-	status *[]types.StorageStatus) bool {
+func installDownloadedObjects(ctx *baseOsMgrContext, uuidStr, finalObjDir string,
+	status *[]types.ContentTreeStatus) (bool, bool, error) {
 
-	ret := true
+	var (
+		changed bool
+		proceed bool
+		err     error
+	)
 	log.Infof("installDownloadedObjects(%s)", uuidStr)
 
 	for i := range *status {
-		ssPtr := &(*status)[i]
+		ctsPtr := &(*status)[i]
 
-		if ssPtr.State == types.CREATED_VOLUME {
-			err := installDownloadedObject(ssPtr.ImageID, ssPtr)
+		if ctsPtr.State == types.LOADED {
+			changed, proceed, err = installDownloadedObject(ctx, ctsPtr.ContentID,
+				finalObjDir, ctsPtr)
 			if err != nil {
 				log.Error(err)
+				return changed, proceed, err
 			}
 		}
-		// if something is still not installed, mark accordingly
-		if ssPtr.State != types.INSTALLED {
-			ret = false
+		if ctsPtr.State == types.INSTALLED {
+			proceed = true
 		}
 	}
-
-	log.Infof("installDownloadedObjects(%s) done %v", uuidStr, ret)
-	return ret
+	log.Infof("installDownloadedObjects(%s) done %v", uuidStr, proceed)
+	return changed, proceed, nil
 }
 
 // If the final installation directory is known, move the object there
-func installDownloadedObject(imageID uuid.UUID,
-	ssPtr *types.StorageStatus) error {
+// returns an error, and if ready
+func installDownloadedObject(ctx *baseOsMgrContext, contentID uuid.UUID, finalObjDir string,
+	ctsPtr *types.ContentTreeStatus) (bool, bool, error) {
 
-	var ret error
-	var srcFilename string
+	var (
+		refID   string
+		changed bool
+		proceed bool
+	)
 
 	log.Infof("installDownloadedObject(%s, %v)",
-		imageID, ssPtr.State)
+		contentID, ctsPtr.State)
 
-	if ssPtr.State != types.CREATED_VOLUME {
-		return nil
+	if ctsPtr.State != types.LOADED {
+		return changed, proceed, nil
 	}
-	srcFilename = ssPtr.ActiveFileLocation
-	if srcFilename == "" {
-		log.Fatalf("XXX no ActiveFileLocation for CREATED_VOLUME %s",
-			imageID)
+	refID = ctsPtr.ReferenceID()
+	if refID == "" {
+		log.Fatalf("XXX no image ID for LOADED %s",
+			contentID)
 	}
-	log.Infof("For %s ActiveFileLocation for CREATED_VOLUME: %s",
-		imageID, srcFilename)
+	log.Infof("For %s reference ID for LOADED: %s",
+		contentID, refID)
 
-	// ensure the file is present
-	if _, err := os.Stat(srcFilename); err != nil {
-		log.Fatal(err)
+	// make sure we have a proper final destination point
+	if finalObjDir == "" {
+		changed = true
+		errStr := fmt.Sprintf("installDownloadedObject %s, final dir not set",
+			contentID)
+		log.Errorln(errStr)
+		ctsPtr.SetErrorWithSource(errStr, types.ContentTreeStatus{}, time.Now())
+		return changed, proceed, fmt.Errorf(errStr)
 	}
+
+	// check if we have a result
+	wres := lookupInstallWorkResult(contentID.String())
+	if wres != nil {
+		log.Infof("installDownloadedObject(%s): InstallWorkResult found", contentID)
+		DeleteWorkInstall(contentID.String())
+		if wres.Error != nil {
+			err := fmt.Errorf("installDownloadedObject(%s): InstallWorkResult error, exception while installing: %v", contentID, wres.Error)
+			log.Errorf(err.Error())
+			return changed, proceed, err
+		}
+		changed = true
+		proceed = true
+		// if we made it here, we successfully completed the job
+		ctsPtr.State = types.INSTALLED
+		return changed, proceed, nil
+	}
+
+	// if we made it here, there was no work result, so try to add it
 
 	// Move to final installation point
-	if ssPtr.FinalObjDir != "" {
-
-		var dstFilename string = ssPtr.FinalObjDir
-		ret = installBaseOsObject(srcFilename, dstFilename)
-	} else {
-		errStr := fmt.Sprintf("installDownloadedObject %s, final dir not set",
-			imageID)
-		log.Errorln(errStr)
-		ret = errors.New(errStr)
-	}
-
-	if ret == nil {
-		ssPtr.State = types.INSTALLED
-		log.Infof("installDownloadedObject(%s) done", imageID)
-	} else {
-		errStr := fmt.Sprintf("installDownloadedObject: %s", ret)
-		ssPtr.SetErrorWithSource(errStr, types.VolumeStatus{}, time.Now())
-	}
-	return ret
+	// do this as a background task
+	// XXX called twice!
+	AddWorkInstall(ctx, contentID.String(), refID, finalObjDir)
+	log.Infof("installDownloadedObject(%s) worker started", contentID)
+	return changed, proceed, nil
 }

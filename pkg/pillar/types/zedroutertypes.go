@@ -13,21 +13,18 @@ import (
 
 	"github.com/eriknordmark/ipinfo"
 	"github.com/eriknordmark/netlink"
+	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // Indexed by UUID
-// If IsZedmanager is set we do not create boN but instead configure the EID
-// locally. This will go away once ZedManager runs in a domU like any
-// application.
 type AppNetworkConfig struct {
 	UUIDandVersion      UUIDandVersion
 	DisplayName         string
 	Activate            bool
-	IsZedmanager        bool
-	LegacyDataPlane     bool
-	OverlayNetworkList  []OverlayNetworkConfig
+	GetStatsIPAddr      net.IP
 	UnderlayNetworkList []UnderlayNetworkConfig
 }
 
@@ -35,25 +32,51 @@ func (config AppNetworkConfig) Key() string {
 	return config.UUIDandVersion.UUID.String()
 }
 
-func (config AppNetworkConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
+// LogCreate :
+func (config AppNetworkConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.AppNetworkConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+	if logObject == nil {
+		return
 	}
-	return ret
+	logObject.CloneAndAddField("activate", config.Activate).
+		Noticef("App network config create")
 }
 
-func (config *AppNetworkConfig) getOverlayConfig(
-	network uuid.UUID) *OverlayNetworkConfig {
-	for i := range config.OverlayNetworkList {
-		olConfig := &config.OverlayNetworkList[i]
-		if olConfig.Network == network {
-			return olConfig
-		}
+// LogModify :
+func (config AppNetworkConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.AppNetworkConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+
+	oldConfig, ok := old.(AppNetworkConfig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of AppNetworkConfig type")
 	}
-	return nil
+	if oldConfig.Activate != config.Activate {
+
+		logObject.CloneAndAddField("activate", config.Activate).
+			AddField("old-activate", oldConfig.Activate).
+			Noticef("App network config modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("App network config modify other change")
+	}
+}
+
+// LogDelete :
+func (config AppNetworkConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.AppNetworkConfigLogType, config.DisplayName,
+		config.UUIDandVersion.UUID, config.LogKey())
+	logObject.CloneAndAddField("activate", config.Activate).
+		Noticef("App network config delete")
+
+	base.DeleteLogObject(logBase, config.LogKey())
+}
+
+// LogKey :
+func (config AppNetworkConfig) LogKey() string {
+	return string(base.AppNetworkConfigLogType) + "-" + config.Key()
 }
 
 func (config *AppNetworkConfig) getUnderlayConfig(
@@ -68,28 +91,12 @@ func (config *AppNetworkConfig) getUnderlayConfig(
 }
 
 func (config *AppNetworkConfig) IsNetworkUsed(network uuid.UUID) bool {
-	olConfig := config.getOverlayConfig(network)
-	if olConfig != nil {
-		return true
-	}
 	ulConfig := config.getUnderlayConfig(network)
 	if ulConfig != nil {
 		return true
 	}
 	// Network UUID matching neither UL nor OL network
 	return false
-}
-
-func (status AppNetworkStatus) CheckPendingAdd() bool {
-	return status.PendingAdd
-}
-
-func (status AppNetworkStatus) CheckPendingModify() bool {
-	return status.PendingModify
-}
-
-func (status AppNetworkStatus) CheckPendingDelete() bool {
-	return status.PendingDelete
 }
 
 func (status AppNetworkStatus) Pending() bool {
@@ -106,9 +113,7 @@ type AppNetworkStatus struct {
 	PendingDelete  bool
 	DisplayName    string
 	// Copy from the AppNetworkConfig; used to delete when config is gone.
-	IsZedmanager        bool
-	LegacyDataPlane     bool
-	OverlayNetworkList  []OverlayNetworkStatus
+	GetStatsIPAddr      net.IP
 	UnderlayNetworkList []UnderlayNetworkStatus
 	MissingNetwork      bool // If any Missing flag is set in the networks
 	// Any errros from provisioning the network
@@ -120,15 +125,130 @@ func (status AppNetworkStatus) Key() string {
 	return status.UUIDandVersion.UUID.String()
 }
 
-func (status AppNetworkStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
+// LogCreate :
+func (status AppNetworkStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.AppNetworkStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+	if logObject == nil {
+		return
 	}
-	return ret
+	logObject.CloneAndAddField("activated", status.Activated).
+		Noticef("App network status create")
+}
 
+// LogModify :
+func (status AppNetworkStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.AppNetworkStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+
+	oldStatus, ok := old.(AppNetworkStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of AppNetworkStatus type")
+	}
+	if oldStatus.Activated != status.Activated {
+
+		logObject.CloneAndAddField("activated", status.Activated).
+			AddField("old-activated", oldStatus.Activated).
+			Noticef("App network status modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+			Noticef("App network status modify other change")
+	}
+
+	if status.HasError() {
+		errAndTime := status.ErrorAndTime
+		logObject.CloneAndAddField("activated", status.Activated).
+			AddField("error", errAndTime.Error).
+			AddField("error-time", errAndTime.ErrorTime).
+			Errorf("App network status modify")
+	}
+}
+
+// LogDelete :
+func (status AppNetworkStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.AppNetworkStatusLogType, status.DisplayName,
+		status.UUIDandVersion.UUID, status.LogKey())
+	logObject.CloneAndAddField("activated", status.Activated).
+		Noticef("App network status delete")
+
+	base.DeleteLogObject(logBase, status.LogKey())
+}
+
+// LogKey :
+func (status AppNetworkStatus) LogKey() string {
+	return string(base.AppNetworkStatusLogType) + "-" + status.Key()
+}
+
+// AppContainerMetrics - App Container Metrics
+type AppContainerMetrics struct {
+	UUIDandVersion UUIDandVersion // App UUID
+	// Stats Collection time for uploading stats to cloud
+	CollectTime time.Time
+	StatsList   []AppContainerStats
+}
+
+// AppContainerStats - for App Container Stats
+type AppContainerStats struct {
+	ContainerName string // unique under an App
+	Status        string // uptime, pause, stop status
+	Pids          uint32 // number of PIDs within the container
+	// CPU stats
+	Uptime         int64  // unix.nano, time since container starts
+	CPUTotal       uint64 // container CPU since starts in sec
+	SystemCPUTotal uint64 // total system, user, idle in sec
+	// Memory stats
+	UsedMem  uint32 // in MBytes
+	AvailMem uint32 // in MBytes
+	// Network stats
+	TxBytes uint64 // in Bytes
+	RxBytes uint64 // in Bytes
+	// Disk stats
+	ReadBytes  uint64 // in MBytes
+	WriteBytes uint64 // in MBytes
+}
+
+// Key - key for AppContainerMetrics
+func (acMetric AppContainerMetrics) Key() string {
+	return acMetric.UUIDandVersion.UUID.String()
+}
+
+// LogCreate :
+func (acMetric AppContainerMetrics) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.AppContainerMetricsLogType, "",
+		acMetric.UUIDandVersion.UUID, acMetric.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("App container metric create")
+}
+
+// LogModify :
+func (acMetric AppContainerMetrics) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.AppContainerMetricsLogType, "",
+		acMetric.UUIDandVersion.UUID, acMetric.LogKey())
+
+	oldAcMetric, ok := old.(AppContainerMetrics)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of AppContainerMetrics type")
+	}
+	// XXX remove? XXX huge?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldAcMetric, acMetric)).
+		Metricf("App container metric modify")
+}
+
+// LogDelete :
+func (acMetric AppContainerMetrics) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.AppContainerMetricsLogType, "",
+		acMetric.UUIDandVersion.UUID, acMetric.LogKey())
+	logObject.Metricf("App container metric delete")
+
+	base.DeleteLogObject(logBase, acMetric.LogKey())
+}
+
+// LogKey :
+func (acMetric AppContainerMetrics) LogKey() string {
+	return string(base.AppContainerMetricsLogType) + "-" + acMetric.Key()
 }
 
 // IntfStatusMap - Used to return per-interface test results (success and failures)
@@ -179,24 +299,240 @@ func NewIntfStatusMap() *IntfStatusMap {
 	return &intfStatusMap
 }
 
-// Array in timestamp aka priority order; first one is the most desired
-// config to use
+// DevicePortConfigList is an array in timestamp aka priority order;
+// first one is the most desired config to use
+// It includes test results hence is misnamed - should have a separate status
+// This is only published under the key "global"
 type DevicePortConfigList struct {
+	Key            string // Assume "gobal" if empty
 	CurrentIndex   int
 	PortConfigList []DevicePortConfig
 }
 
-// A complete set of configuration for all the ports used by zedrouter on the
-// device
+// PubKey is used for pubsub
+func (config DevicePortConfigList) PubKey() string {
+	if config.Key == "" {
+		return "global"
+	} else {
+		return config.Key
+	}
+}
+
+// LogCreate :
+func (config DevicePortConfigList) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DevicePortConfigListLogType, "",
+		nilUUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("current-index-int64", config.CurrentIndex).
+		AddField("num-portconfig-int64", len(config.PortConfigList)).
+		Noticef("DevicePortConfigList create")
+}
+
+// LogModify :
+func (config DevicePortConfigList) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DevicePortConfigListLogType, "",
+		nilUUID, config.LogKey())
+
+	oldConfig, ok := old.(DevicePortConfigList)
+	if !ok {
+		logObject.Clone().Errorf("LogModify: Old object interface passed is not of DevicePortConfigList type")
+		return
+	}
+	if oldConfig.CurrentIndex != config.CurrentIndex ||
+		len(oldConfig.PortConfigList) != len(config.PortConfigList) {
+
+		logObject.CloneAndAddField("current-index-int64", config.CurrentIndex).
+			AddField("num-portconfig-int64", len(config.PortConfigList)).
+			AddField("old-current-index-int64", oldConfig.CurrentIndex).
+			AddField("old-num-portconfig-int64", len(oldConfig.PortConfigList)).
+			Noticef("DevicePortConfigList modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("DevicePortConfigList modify other change")
+	}
+
+}
+
+// LogDelete :
+func (config DevicePortConfigList) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DevicePortConfigListLogType, "",
+		nilUUID, config.LogKey())
+	logObject.CloneAndAddField("current-index-int64", config.CurrentIndex).
+		AddField("num-portconfig-int64", len(config.PortConfigList)).
+		Noticef("DevicePortConfigList delete")
+
+	base.DeleteLogObject(logBase, config.LogKey())
+}
+
+// LogKey :
+func (config DevicePortConfigList) LogKey() string {
+	return string(base.DevicePortConfigListLogType) + "-" + config.PubKey()
+}
+
+// PendDPCStatus tracks the internal progression of a DPC
+type PendDPCStatus uint32
+
+// DPC_NONE and friends is the internal state of the testing
+const (
+	DPC_NONE PendDPCStatus = iota
+	DPC_FAIL
+	DPC_FAIL_WITH_IPANDDNS // Failed to reach controller but has IP/DNS
+	DPC_SUCCESS
+	DPC_IPDNS_WAIT  // DPC_IPDNS_WAIT means not IP and DNS server yet
+	DPC_PCI_WAIT    // DPC_PCI_WAIT means some interface still in pci back
+	DPC_INTF_WAIT   // DPC_INTF_WAIT means some interface missing from kernel
+	DPC_REMOTE_WAIT // DPC_REMOTE_WAIT means controller is down or has old certificate
+)
+
+// String returns the string name
+func (status PendDPCStatus) String() string {
+	switch status {
+	case DPC_NONE:
+		return ""
+	case DPC_FAIL:
+		return "DPC_FAIL"
+	case DPC_FAIL_WITH_IPANDDNS:
+		return "DPC_FAIL_WITH_IPANDDNS"
+	case DPC_SUCCESS:
+		return "DPC_SUCCESS"
+	case DPC_IPDNS_WAIT:
+		return "DPC_IPDNS_WAIT"
+	case DPC_PCI_WAIT:
+		return "DPC_PCI_WAIT"
+	case DPC_INTF_WAIT:
+		return "DPC_INTF_WAIT"
+	case DPC_REMOTE_WAIT:
+		return "DPC_REMOTE_WAIT"
+	default:
+		return fmt.Sprintf("Unknown status %d", status)
+	}
+}
+
+// DevicePortConfig is a misnomer in that it includes the total test results
+// plus the test results for a given port. The complete status with
+// IP addresses lives in DeviceNetworkStatus
 type DevicePortConfig struct {
 	Version      DevicePortConfigVersion
 	Key          string
 	TimePriority time.Time // All zero's is fallback lowest priority
+	State        PendDPCStatus
 
 	TestResults
 	LastIPAndDNS time.Time // Time when we got some IP addresses and DNS
 
 	Ports []NetworkPortConfig
+}
+
+// PubKey is used for pubsub. Key string plus TimePriority
+func (config DevicePortConfig) PubKey() string {
+	return config.Key + "@" + config.TimePriority.UTC().Format(time.RFC3339Nano)
+}
+
+// LogCreate :
+func (config DevicePortConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DevicePortConfigLogType, "",
+		nilUUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("ports-int64", len(config.Ports)).
+		AddField("last-failed", config.LastFailed).
+		AddField("last-succeeded", config.LastSucceeded).
+		AddField("last-error", config.LastError).
+		AddField("state", config.State.String()).
+		Noticef("DevicePortConfig create")
+	for _, p := range config.Ports {
+		// XXX different logobject for a particular port?
+		logObject.CloneAndAddField("ifname", p.IfName).
+			AddField("last-error", p.LastError).
+			AddField("last-succeeded", p.LastSucceeded).
+			AddField("last-failed", p.LastFailed).
+			Noticef("DevicePortConfig port create")
+	}
+}
+
+// LogModify :
+func (config DevicePortConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DevicePortConfigLogType, "",
+		nilUUID, config.LogKey())
+
+	oldConfig, ok := old.(DevicePortConfig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DevicePortConfig type")
+	}
+	if len(oldConfig.Ports) != len(config.Ports) ||
+		oldConfig.LastFailed != config.LastFailed ||
+		oldConfig.LastSucceeded != config.LastSucceeded ||
+		oldConfig.LastError != config.LastError ||
+		oldConfig.State != config.State {
+
+		logObject.CloneAndAddField("ports-int64", len(config.Ports)).
+			AddField("last-failed", config.LastFailed).
+			AddField("last-succeeded", config.LastSucceeded).
+			AddField("last-error", config.LastError).
+			AddField("state", config.State.String()).
+			AddField("old-ports-int64", len(oldConfig.Ports)).
+			AddField("old-last-failed", oldConfig.LastFailed).
+			AddField("old-last-succeeded", oldConfig.LastSucceeded).
+			AddField("old-last-error", oldConfig.LastError).
+			AddField("old-state", oldConfig.State.String()).
+			Noticef("DevicePortConfig modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("DevicePortConfig modify other change")
+	}
+	// XXX which fields to compare/log?
+	for i, p := range config.Ports {
+		if len(oldConfig.Ports) <= i {
+			continue
+		}
+		op := oldConfig.Ports[i]
+		// XXX different logobject for a particular port?
+		if p.HasError() != op.HasError() ||
+			p.LastFailed != op.LastFailed ||
+			p.LastSucceeded != op.LastSucceeded ||
+			p.LastError != op.LastError {
+			logObject.CloneAndAddField("ifname", p.IfName).
+				AddField("last-error", p.LastError).
+				AddField("last-succeeded", p.LastSucceeded).
+				AddField("last-failed", p.LastFailed).
+				AddField("old-last-error", op.LastError).
+				AddField("old-last-succeeded", op.LastSucceeded).
+				AddField("old-last-failed", op.LastFailed).
+				Noticef("DevicePortConfig port modify")
+		}
+	}
+}
+
+// LogDelete :
+func (config DevicePortConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DevicePortConfigLogType, "",
+		nilUUID, config.LogKey())
+	logObject.CloneAndAddField("ports-int64", len(config.Ports)).
+		AddField("last-failed", config.LastFailed).
+		AddField("last-succeeded", config.LastSucceeded).
+		AddField("last-error", config.LastError).
+		AddField("state", config.State.String()).
+		Noticef("DevicePortConfig delete")
+	for _, p := range config.Ports {
+		// XXX different logobject for a particular port?
+		logObject.CloneAndAddField("ifname", p.IfName).
+			AddField("last-error", p.LastError).
+			AddField("last-succeeded", p.LastSucceeded).
+			AddField("last-failed", p.LastFailed).
+			Noticef("DevicePortConfig port delete")
+	}
+
+	base.DeleteLogObject(logBase, config.LogKey())
+}
+
+// LogKey :
+func (config DevicePortConfig) LogKey() string {
+	return string(base.DevicePortConfigLogType) + "-" + config.PubKey()
 }
 
 // TestResults is used to record when some test Failed or Succeeded.
@@ -208,16 +544,17 @@ type TestResults struct {
 }
 
 // RecordSuccess records a success
-// Keeps the LastError and LastFailed in place as history
+// Keeps the LastFailed in place as history
 func (trPtr *TestResults) RecordSuccess() {
 	trPtr.LastSucceeded = time.Now()
+	trPtr.LastError = ""
 }
 
 // RecordFailure records a failure
 // Keeps the LastSucceeded in place as history
 func (trPtr *TestResults) RecordFailure(errStr string) {
 	if errStr == "" {
-		log.Fatal("Missing error string")
+		logrus.Fatal("Missing error string")
 	}
 	trPtr.LastFailed = time.Now()
 	trPtr.LastError = errStr
@@ -240,9 +577,9 @@ func (trPtr *TestResults) Update(src TestResults) {
 		}
 	} else {
 		trPtr.LastSucceeded = src.LastSucceeded
+		trPtr.LastError = ""
 		if src.LastFailed.After(trPtr.LastFailed) {
 			trPtr.LastFailed = src.LastFailed
-			trPtr.LastError = src.LastError
 		}
 	}
 }
@@ -250,10 +587,10 @@ func (trPtr *TestResults) Update(src TestResults) {
 type DevicePortConfigVersion uint32
 
 // GetPortByIfName - DevicePortConfig method to get config pointer
-func (portConfig *DevicePortConfig) GetPortByIfName(
+func (config *DevicePortConfig) GetPortByIfName(
 	ifname string) *NetworkPortConfig {
-	for indx := range portConfig.Ports {
-		portPtr := &portConfig.Ports[indx]
+	for indx := range config.Ports {
+		portPtr := &config.Ports[indx]
 		if ifname == portPtr.IfName {
 			return portPtr
 		}
@@ -262,24 +599,18 @@ func (portConfig *DevicePortConfig) GetPortByIfName(
 }
 
 // RecordPortSuccess - Record for given ifname in PortConfig
-func (portConfig *DevicePortConfig) RecordPortSuccess(ifname string) {
-	portPtr := portConfig.GetPortByIfName(ifname)
+func (config *DevicePortConfig) RecordPortSuccess(ifname string) {
+	portPtr := config.GetPortByIfName(ifname)
 	if portPtr != nil {
 		portPtr.RecordSuccess()
-	} else {
-		log.Errorf("portConfig.RecordPortSuccess - port %s not found",
-			ifname)
 	}
 }
 
 // RecordPortFailure - Record for given ifname in PortConfig
-func (portConfig *DevicePortConfig) RecordPortFailure(ifname string, errStr string) {
-	portPtr := portConfig.GetPortByIfName(ifname)
+func (config *DevicePortConfig) RecordPortFailure(ifname string, errStr string) {
+	portPtr := config.GetPortByIfName(ifname)
 	if portPtr != nil {
 		portPtr.RecordFailure(errStr)
-	} else {
-		log.Errorf("portConfig.RecordPortFailure - port %s not found, "+
-			"err: %s", ifname, errStr)
 	}
 }
 
@@ -291,39 +622,38 @@ const (
 )
 
 // DoSanitize -
-func (portConfig *DevicePortConfig) DoSanitize(
-	sanitizeTimePriority bool,
-	sanitizeKey bool, key string,
+func (config *DevicePortConfig) DoSanitize(log *base.LogObject,
+	sanitizeTimePriority bool, sanitizeKey bool, key string,
 	sanitizeName bool) {
 
 	if sanitizeTimePriority {
 		zeroTime := time.Time{}
-		if portConfig.TimePriority == zeroTime {
+		if config.TimePriority == zeroTime {
 			// If we can stat the file use its modify time
 			filename := fmt.Sprintf("%s/DevicePortConfig/%s.json",
 				TmpDirname, key)
 			fi, err := os.Stat(filename)
 			if err == nil {
-				portConfig.TimePriority = fi.ModTime()
+				config.TimePriority = fi.ModTime()
 			} else {
-				portConfig.TimePriority = time.Unix(0, 0)
+				config.TimePriority = time.Unix(0, 0)
 			}
 			log.Infof("DoSanitize: Forcing TimePriority for %s to %v\n",
-				key, portConfig.TimePriority)
+				key, config.TimePriority)
 		}
 	}
 	if sanitizeKey {
-		if portConfig.Key == "" {
-			portConfig.Key = key
+		if config.Key == "" {
+			config.Key = key
 			log.Infof("DoSanitize: Forcing Key for %s TS %v\n",
-				key, portConfig.TimePriority)
+				key, config.TimePriority)
 		}
 	}
 	if sanitizeName {
 		// In case Phylabel isn't set we make it match IfName. Ditto for Logicallabel
 		// XXX still needed?
-		for i := range portConfig.Ports {
-			port := &portConfig.Ports[i]
+		for i := range config.Ports {
+			port := &config.Ports[i]
 			if port.Phylabel == "" {
 				port.Phylabel = port.IfName
 				log.Infof("XXX DoSanitize: Forcing Phylabel for %s ifname %s\n",
@@ -340,10 +670,10 @@ func (portConfig *DevicePortConfig) DoSanitize(
 
 // CountMgmtPorts returns the number of management ports
 // Exclude any broken ones with Dhcp = DT_NONE
-func (portConfig *DevicePortConfig) CountMgmtPorts() int {
+func (config *DevicePortConfig) CountMgmtPorts() int {
 
 	count := 0
-	for _, port := range portConfig.Ports {
+	for _, port := range config.Ports {
 		if port.IsMgmt && port.Dhcp != DT_NONE {
 			count++
 		}
@@ -351,20 +681,20 @@ func (portConfig *DevicePortConfig) CountMgmtPorts() int {
 	return count
 }
 
-// Equal compares two DevicePortConfig but skips things that are
+// MostlyEqual compares two DevicePortConfig but skips things that are
 // more of status such as the timestamps and the TestResults
 // XXX Compare Version or not?
 // We compare the Ports in array order.
-func (portConfig *DevicePortConfig) Equal(portConfig2 *DevicePortConfig) bool {
+func (config *DevicePortConfig) MostlyEqual(config2 *DevicePortConfig) bool {
 
-	if portConfig.Key != portConfig2.Key {
+	if config.Key != config2.Key {
 		return false
 	}
-	if len(portConfig.Ports) != len(portConfig2.Ports) {
+	if len(config.Ports) != len(config2.Ports) {
 		return false
 	}
-	for i, p1 := range portConfig.Ports {
-		p2 := portConfig2.Ports[i]
+	for i, p1 := range config.Ports {
+		p2 := config2.Ports[i]
 		if p1.IfName != p2.IfName ||
 			p1.Phylabel != p2.Phylabel ||
 			p1.Logicallabel != p2.Logicallabel ||
@@ -384,27 +714,27 @@ func (portConfig *DevicePortConfig) Equal(portConfig2 *DevicePortConfig) bool {
 
 // IsDPCTestable - Return false if recent failure (less than 60 seconds ago)
 // Also returns false if it isn't usable
-func (portConfig DevicePortConfig) IsDPCTestable() bool {
+func (config DevicePortConfig) IsDPCTestable() bool {
 
-	if !portConfig.IsDPCUsable() {
+	if !config.IsDPCUsable() {
 		return false
 	}
-	if portConfig.LastFailed.IsZero() {
+	if config.LastFailed.IsZero() {
 		return true
 	}
-	if portConfig.LastSucceeded.After(portConfig.LastFailed) {
+	if config.LastSucceeded.After(config.LastFailed) {
 		return true
 	}
 	// convert time difference in nano seconds to seconds
-	timeDiff := time.Since(portConfig.LastFailed) / time.Second
+	timeDiff := time.Since(config.LastFailed) / time.Second
 	return (timeDiff > 60)
 }
 
 // IsDPCUntested - returns true if this is something we might want to test now.
 // Checks if it is Usable since there is no point in testing unusable things.
-func (portConfig DevicePortConfig) IsDPCUntested() bool {
-	if portConfig.LastFailed.IsZero() && portConfig.LastSucceeded.IsZero() &&
-		portConfig.IsDPCUsable() {
+func (config DevicePortConfig) IsDPCUntested() bool {
+	if config.LastFailed.IsZero() && config.LastSucceeded.IsZero() &&
+		config.IsDPCUsable() {
 		return true
 	}
 	return false
@@ -412,30 +742,30 @@ func (portConfig DevicePortConfig) IsDPCUntested() bool {
 
 // IsDPCUsable - checks whether something is invalid; no management IP
 // addresses means it isn't usable hence we return false if none.
-func (portConfig DevicePortConfig) IsDPCUsable() bool {
-	mgmtCount := portConfig.CountMgmtPorts()
+func (config DevicePortConfig) IsDPCUsable() bool {
+	mgmtCount := config.CountMgmtPorts()
 	return mgmtCount > 0
 }
 
 // WasDPCWorking - Check if the last results for the DPC was Success
-func (portConfig DevicePortConfig) WasDPCWorking() bool {
+func (config DevicePortConfig) WasDPCWorking() bool {
 
-	if portConfig.LastSucceeded.IsZero() {
+	if config.LastSucceeded.IsZero() {
 		return false
 	}
-	if portConfig.LastSucceeded.After(portConfig.LastFailed) {
+	if config.LastSucceeded.After(config.LastFailed) {
 		return true
 	}
 	return false
 }
 
-// UpdatePortStatusFromIntfStatusMap - Set TestResults for ports in portConfig to
+// UpdatePortStatusFromIntfStatusMap - Set TestResults for ports in DevicePortConfig to
 // those from intfStatusMap. If a port is not found in intfStatusMap, it means
 // the port was not tested, so we retain the original TestResults for the port.
-func (portConfig *DevicePortConfig) UpdatePortStatusFromIntfStatusMap(
+func (config *DevicePortConfig) UpdatePortStatusFromIntfStatusMap(
 	intfStatusMap IntfStatusMap) {
-	for indx := range portConfig.Ports {
-		portPtr := &portConfig.Ports[indx]
+	for indx := range config.Ports {
+		portPtr := &config.Ports[indx]
 		tr, ok := intfStatusMap.StatusMap[portPtr.IfName]
 		if ok {
 			portPtr.TestResults.Update(tr)
@@ -537,7 +867,7 @@ type WirelessConfig struct {
 // for one IfName.
 // XXX odd to have ParseErrors and/or TestResults here but we don't have
 // a corresponding Status struct.
-// Note that if fields are added the Equal function needs to be updated.
+// Note that if fields are added the MostlyEqual function needs to be updated.
 type NetworkPortConfig struct {
 	IfName       string
 	Phylabel     string // Physical name set by controller/model
@@ -561,8 +891,15 @@ type NetworkPortStatus struct {
 	Alias          string // From SystemAdapter's alias
 	IsMgmt         bool   // Used to talk to controller
 	Free           bool
-	NetworkXConfig NetworkXObjectConfig
+	Dhcp           DhcpType
+	Subnet         net.IPNet
+	NtpServer      net.IP
+	DomainName     string
+	DNSServers     []net.IP // If not set we use Gateway as DNS server
 	AddrInfoList   []AddrInfo
+	Up             bool
+	MacAddr        string
+	DefaultRouters []net.IP
 	ProxyConfig
 	// TestResults provides recording of failure and success
 	TestResults
@@ -574,11 +911,182 @@ type AddrInfo struct {
 	LastGeoTimestamp time.Time
 }
 
-// Published to microservices which needs to know about ports and IP addresses
+// DeviceNetworkStatus is published to microservices which needs to know about ports and IP addresses
+// It is published under the key "global" only
 type DeviceNetworkStatus struct {
 	Version DevicePortConfigVersion // From DevicePortConfig
 	Testing bool                    // Ignore since it is not yet verified
+	State   PendDPCStatus           // Details about testing state
 	Ports   []NetworkPortStatus
+}
+
+// Key is used for pubsub
+func (status DeviceNetworkStatus) Key() string {
+	return "global"
+}
+
+// LogCreate :
+func (status DeviceNetworkStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DeviceNetworkStatusLogType, "",
+		nilUUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("testing-bool", status.Testing).
+		AddField("ports-int64", len(status.Ports)).
+		AddField("state", status.State.String()).
+		Noticef("DeviceNetworkStatus create")
+	for _, p := range status.Ports {
+		// XXX different logobject for a particular port?
+		logObject.CloneAndAddField("ifname", p.IfName).
+			AddField("last-error", p.LastError).
+			AddField("last-succeeded", p.LastSucceeded).
+			AddField("last-failed", p.LastFailed).
+			Noticef("DeviceNetworkStatus port create")
+	}
+}
+
+// LogModify :
+func (status DeviceNetworkStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DeviceNetworkStatusLogType, "",
+		nilUUID, status.LogKey())
+
+	oldStatus, ok := old.(DeviceNetworkStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DeviceNetworkStatus type")
+	}
+	if oldStatus.Testing != status.Testing ||
+		oldStatus.State != status.State ||
+		len(oldStatus.Ports) != len(status.Ports) {
+
+		logObject.CloneAndAddField("testing-bool", status.Testing).
+			AddField("ports-int64", len(status.Ports)).
+			AddField("state", status.State.String()).
+			AddField("old-testing-bool", oldStatus.Testing).
+			AddField("old-ports-int64", len(oldStatus.Ports)).
+			AddField("old-state", oldStatus.State.String()).
+			Noticef("DeviceNetworkStatus modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+			Noticef("DeviceNetworkStatus modify other change")
+	}
+	// XXX which fields to compare/log?
+	for i, p := range status.Ports {
+		if len(oldStatus.Ports) <= i {
+			continue
+		}
+		op := oldStatus.Ports[i]
+		// XXX different logobject for a particular port?
+		if p.HasError() != op.HasError() ||
+			p.LastFailed != op.LastFailed ||
+			p.LastSucceeded != op.LastSucceeded ||
+			p.LastError != op.LastError {
+			logObject.CloneAndAddField("ifname", p.IfName).
+				AddField("last-error", p.LastError).
+				AddField("last-succeeded", p.LastSucceeded).
+				AddField("last-failed", p.LastFailed).
+				AddField("old-last-error", op.LastError).
+				AddField("old-last-succeeded", op.LastSucceeded).
+				AddField("old-last-failed", op.LastFailed).
+				Noticef("DeviceNetworkStatus port modify")
+		}
+	}
+}
+
+// LogDelete :
+func (status DeviceNetworkStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DeviceNetworkStatusLogType, "",
+		nilUUID, status.LogKey())
+	logObject.CloneAndAddField("testing-bool", status.Testing).
+		AddField("ports-int64", len(status.Ports)).
+		AddField("state", status.State.String()).
+		Noticef("DeviceNetworkStatus instance status delete")
+	for _, p := range status.Ports {
+		// XXX different logobject for a particular port?
+		logObject.CloneAndAddField("ifname", p.IfName).
+			AddField("last-error", p.LastError).
+			AddField("last-succeeded", p.LastSucceeded).
+			AddField("last-failed", p.LastFailed).
+			Noticef("DeviceNetworkStatus port delete")
+	}
+
+	base.DeleteLogObject(logBase, status.LogKey())
+}
+
+// LogKey :
+func (status DeviceNetworkStatus) LogKey() string {
+	return string(base.DeviceNetworkStatusLogType) + "-" + status.Key()
+}
+
+// MostlyEqual compares two DeviceNetworkStatus but skips things the test status/results aspects.
+// We compare the Ports in array order.
+// XXX State and Testing?
+func (status DeviceNetworkStatus) MostlyEqual(status2 DeviceNetworkStatus) bool {
+
+	if len(status.Ports) != len(status2.Ports) {
+		return false
+	}
+	for i, p1 := range status.Ports {
+		p2 := status2.Ports[i]
+		if p1.IfName != p2.IfName ||
+			p1.Phylabel != p2.Phylabel ||
+			p1.Logicallabel != p2.Logicallabel ||
+			p1.Alias != p2.Alias ||
+			p1.IsMgmt != p2.IsMgmt ||
+			p1.Free != p2.Free {
+			return false
+		}
+		if p1.Dhcp != p2.Dhcp ||
+			!EqualSubnet(p1.Subnet, p2.Subnet) ||
+			!p1.NtpServer.Equal(p2.NtpServer) ||
+			p1.DomainName != p2.DomainName {
+			return false
+		}
+		if len(p1.DNSServers) != len(p2.DNSServers) {
+			return false
+		}
+		for i := range p1.DNSServers {
+			if !p1.DNSServers[i].Equal(p2.DNSServers[i]) {
+				return false
+			}
+		}
+		if len(p1.AddrInfoList) != len(p2.AddrInfoList) {
+			return false
+		}
+		for i := range p1.AddrInfoList {
+			if !p1.AddrInfoList[i].Addr.Equal(p2.AddrInfoList[i].Addr) {
+				return false
+			}
+		}
+		if p1.Up != p2.Up ||
+			p1.MacAddr != p2.MacAddr {
+			return false
+		}
+		if len(p1.DefaultRouters) != len(p2.DefaultRouters) {
+			return false
+		}
+		for i := range p1.DefaultRouters {
+			if !p1.DefaultRouters[i].Equal(p2.DefaultRouters[i]) {
+				return false
+			}
+		}
+
+		if !reflect.DeepEqual(p1.ProxyConfig, p2.ProxyConfig) {
+			return false
+		}
+	}
+	return true
+}
+
+// EqualSubnet compares two subnets; silently assumes contigious masks
+func EqualSubnet(subnet1, subnet2 net.IPNet) bool {
+	if !subnet1.IP.Equal(subnet2.IP) {
+		return false
+	}
+	len1, _ := subnet1.Mask.Size()
+	len2, _ := subnet2.Mask.Size()
+	return len1 == len2
 }
 
 // GetPortByIfName - Get Port Status for port with given Ifname
@@ -586,7 +1094,6 @@ func (status *DeviceNetworkStatus) GetPortByIfName(
 	ifname string) *NetworkPortStatus {
 	for _, portStatus := range status.Ports {
 		if portStatus.IfName == ifname {
-			log.Infof("Found NetworkPortStatus for %s", ifname)
 			return &portStatus
 		}
 	}
@@ -598,7 +1105,6 @@ func (status *DeviceNetworkStatus) GetPortByLogicallabel(
 	label string) *NetworkPortStatus {
 	for _, portStatus := range status.Ports {
 		if portStatus.Logicallabel == label {
-			log.Infof("Found NetworkPortStatus for %s", label)
 			return &portStatus
 		}
 	}
@@ -692,8 +1198,6 @@ func CountLocalIPv4AddrAnyNoLinkLocal(globalStatus DeviceNetworkStatus) int {
 	// Count the number of addresses which apply
 	addrs, _ := getInterfaceAddr(globalStatus, false, "", false)
 	count := 0
-	log.Infof("CountLocalIPv4AddrAnyNoLinkLocal: total %d: %v\n",
-		len(addrs), addrs)
 	for _, addr := range addrs {
 		if addr.To4() == nil {
 			continue
@@ -717,7 +1221,7 @@ func CountDNSServers(globalStatus DeviceNetworkStatus, phylabelOrIfname string) 
 		if us.IfName != ifname && ifname != "" {
 			continue
 		}
-		count += len(us.NetworkXConfig.DnsServers)
+		count += len(us.DNSServers)
 	}
 	return count
 }
@@ -733,7 +1237,7 @@ func GetDNSServers(globalStatus DeviceNetworkStatus, ifname string) []net.IP {
 		if ifname != "" && ifname != us.IfName {
 			continue
 		}
-		for _, server := range us.NetworkXConfig.DnsServers {
+		for _, server := range us.DNSServers {
 			servers = append(servers, server)
 		}
 	}
@@ -759,8 +1263,6 @@ func CountLocalIPv4AddrAnyNoLinkLocalIf(globalStatus DeviceNetworkStatus,
 	// Count the number of addresses which apply
 	addrs, _ := getInterfaceAddr(globalStatus, true, phylabelOrIfname, false)
 	count := 0
-	log.Infof("CountLocalIPv4AddrAnyNoLinkLocalIf(%s): total %d: %v\n",
-		phylabelOrIfname, len(addrs), addrs)
 	for _, addr := range addrs {
 		if addr.To4() == nil {
 			continue
@@ -878,7 +1380,7 @@ func getInterfaceAndAddr(globalStatus DeviceNetworkStatus, free bool, phylabelOr
 }
 
 // Return the list of ifnames in DNC which exist in the kernel
-func GetExistingInterfaceList(globalStatus DeviceNetworkStatus) []string {
+func GetExistingInterfaceList(log *base.LogObject, globalStatus DeviceNetworkStatus) []string {
 
 	var ifs []string
 	for _, us := range globalStatus.Ports {
@@ -1042,18 +1544,14 @@ func PhylabelToIfName(deviceNetworkStatus *DeviceNetworkStatus,
 
 	for _, p := range deviceNetworkStatus.Ports {
 		if p.Phylabel == phylabelOrIfname {
-			log.Debugf("PhylabelToIfName: found %s for %s\n",
-				p.IfName, phylabelOrIfname)
 			return p.IfName
 		}
 	}
 	for _, p := range deviceNetworkStatus.Ports {
 		if p.IfName == phylabelOrIfname {
-			log.Debugf("PhylabelToIfName: matched %s\n", phylabelOrIfname)
 			return phylabelOrIfname
 		}
 	}
-	log.Debugf("PhylabelToIfName: no match for %s\n", phylabelOrIfname)
 	return phylabelOrIfname
 }
 
@@ -1075,15 +1573,15 @@ func LogicallabelToIfName(deviceNetworkStatus *DeviceNetworkStatus,
 //	If true, it also returns the ifName ( NOT bundle name )
 //	Also returns whether it is currently used by an application by
 //	returning a UUID. If the UUID is zero it is in PCIback but available.
-func (portConfig *DevicePortConfig) IsAnyPortInPciBack(
-	aa *AssignableAdapters) (bool, string, uuid.UUID) {
+func (config *DevicePortConfig) IsAnyPortInPciBack(
+	log *base.LogObject, aa *AssignableAdapters) (bool, string, uuid.UUID) {
 	if aa == nil {
 		log.Infof("IsAnyPortInPciBack: nil aa")
 		return false, "", uuid.UUID{}
 	}
 	log.Infof("IsAnyPortInPciBack: aa init %t, %d bundles, %d ports",
-		aa.Initialized, len(aa.IoBundleList), len(portConfig.Ports))
-	for _, port := range portConfig.Ports {
+		aa.Initialized, len(aa.IoBundleList), len(config.Ports))
+	for _, port := range config.Ports {
 		ioBundle := aa.LookupIoBundleIfName(port.IfName)
 		if ioBundle == nil {
 			// It is not guaranteed that all Ports are part of Assignable Adapters
@@ -1158,71 +1656,6 @@ type NetworkInstanceProbeStatus struct {
 	PInfo             map[string]ProbeInfo // per physical port eth0, eth1 probing state
 }
 
-type MapServer struct {
-	ServiceType MapServerType
-	NameOrIp    string
-	Credential  string
-}
-
-type LispConfig struct {
-	MapServers    []MapServer
-	IID           uint32
-	Allocate      bool
-	ExportPrivate bool
-	EidPrefix     net.IP
-	EidPrefixLen  uint32
-
-	Experimental bool
-}
-
-type NetworkInstanceLispConfig struct {
-	MapServers    []MapServer
-	IID           uint32
-	Allocate      bool
-	ExportPrivate bool
-	EidPrefix     net.IP
-	EidPrefixLen  uint32
-
-	Experimental bool
-}
-
-type OverlayNetworkConfig struct {
-	Name          string // From proto message
-	EID           net.IP // Always EIDv6
-	LispSignature string
-	ACLs          []ACE
-	AppMacAddr    net.HardwareAddr // If set use it for vif
-	AppIPAddr     net.IP           // EIDv4 or EIDv6
-	Network       uuid.UUID        // Points to a NetworkInstance.
-
-	// XXX Shouldn't we use ErrorAndTime here
-	// Error
-	//	If there is a parsing error and this uLNetwork config cannot be
-	//	processed, set the error here. This allows the error to be propagated
-	//  back to zedcloud
-	//	If this is non-empty ( != ""), the network Config should not be
-	// 	processed further. It Should just	be flagged to be in error state
-	//  back to the cloud.
-	Error string
-	// Optional additional information
-	AdditionalInfoDevice *AdditionalInfoDevice
-
-	// These field are only for isMgmt. XXX remove when isMgmt is removed
-	MgmtIID             uint32
-	MgmtDnsNameToIPList []DnsNameToIP // Used to populate DNS for the overlay
-	MgmtMapServers      []MapServer
-}
-
-type OverlayNetworkStatus struct {
-	OverlayNetworkConfig
-	VifInfo
-	BridgeMac    net.HardwareAddr
-	BridgeIPAddr string // The address for DNS/DHCP service in zedrouter
-	Assigned     bool   // Set to true once DHCP has assigned EID to domU
-	HostName     string
-	ACLRules     IPTablesRuleList
-}
-
 type DhcpType uint8
 
 const (
@@ -1259,6 +1692,7 @@ type UnderlayNetworkStatus struct {
 	BridgeIPAddr    string // The address for DNS/DHCP service in zedrouter
 	AllocatedIPAddr string // Assigned to domU
 	Assigned        bool   // Set to true once DHCP has assigned it to domU
+	IPAddrMisMatch  bool
 	HostName        string
 	ACLRules        IPTablesRuleList
 }
@@ -1306,11 +1740,50 @@ func (config NetworkXObjectConfig) Key() string {
 	return config.UUID.String()
 }
 
+// LogCreate :
+func (config NetworkXObjectConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.NetworkXObjectConfigLogType, "",
+		config.UUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Noticef("NetworkXObject config create")
+}
+
+// LogModify :
+func (config NetworkXObjectConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkXObjectConfigLogType, "",
+		config.UUID, config.LogKey())
+
+	oldConfig, ok := old.(NetworkXObjectConfig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of NetworkXObjectConfig type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+		Noticef("NetworkXObject config modify")
+}
+
+// LogDelete :
+func (config NetworkXObjectConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkXObjectConfigLogType, "",
+		config.UUID, config.LogKey())
+	logObject.Noticef("NetworkXObject config delete")
+
+	base.DeleteLogObject(logBase, config.LogKey())
+}
+
+// LogKey :
+func (config NetworkXObjectConfig) LogKey() string {
+	return string(base.NetworkXObjectConfigLogType) + "-" + config.Key()
+}
+
 type NetworkInstanceInfo struct {
-	BridgeNum    int
-	BridgeName   string // bn<N>
-	BridgeIPAddr string
-	BridgeMac    string
+	BridgeNum     int
+	BridgeName    string // bn<N>
+	BridgeIPAddr  string
+	BridgeMac     string
+	BridgeIfindex int
 
 	// interface names for the Logicallabel
 	IfNameList []string // Recorded at time of activate
@@ -1350,7 +1823,7 @@ func (instanceInfo *NetworkInstanceInfo) IsVifInBridge(
 	return false
 }
 
-func (instanceInfo *NetworkInstanceInfo) RemoveVif(
+func (instanceInfo *NetworkInstanceInfo) RemoveVif(log *base.LogObject,
 	vifName string) {
 	log.Infof("DelVif(%s, %s)\n", instanceInfo.BridgeName, vifName)
 
@@ -1363,7 +1836,7 @@ func (instanceInfo *NetworkInstanceInfo) RemoveVif(
 	instanceInfo.Vifs = vifs
 }
 
-func (instanceInfo *NetworkInstanceInfo) AddVif(
+func (instanceInfo *NetworkInstanceInfo) AddVif(log *base.LogObject,
 	vifName string, appMac string, appID uuid.UUID) {
 
 	log.Infof("addVifToBridge(%s, %s, %s, %s)\n",
@@ -1403,7 +1876,6 @@ type NetworkInstanceMetrics struct {
 	NetworkMetrics NetworkMetrics
 	ProbeMetrics   ProbeMetrics
 	VpnMetrics     *VpnMetrics
-	LispMetrics    *LispMetrics
 }
 
 // ProbeMetrics - NI probe metrics
@@ -1433,10 +1905,91 @@ func (metrics NetworkInstanceMetrics) Key() string {
 	return metrics.UUIDandVersion.UUID.String()
 }
 
+// LogCreate :
+func (metrics NetworkInstanceMetrics) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.NetworkInstanceMetricsLogType, "",
+		metrics.UUIDandVersion.UUID, metrics.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Network instance metrics create")
+}
+
+// LogModify :
+func (metrics NetworkInstanceMetrics) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkInstanceMetricsLogType, "",
+		metrics.UUIDandVersion.UUID, metrics.LogKey())
+
+	oldMetrics, ok := old.(NetworkInstanceMetrics)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of NetworkInstanceMetrics type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldMetrics, metrics)).
+		Metricf("Network instance metrics modify")
+}
+
+// LogDelete :
+func (metrics NetworkInstanceMetrics) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkInstanceMetricsLogType, "",
+		metrics.UUIDandVersion.UUID, metrics.LogKey())
+	logObject.Metricf("Network instance metrics delete")
+
+	base.DeleteLogObject(logBase, metrics.LogKey())
+}
+
+// LogKey :
+func (metrics NetworkInstanceMetrics) LogKey() string {
+	return string(base.NetworkInstanceMetricsLogType) + "-" + metrics.Key()
+}
+
 // Network metrics for overlay and underlay
 // Matches networkMetrics protobuf message
 type NetworkMetrics struct {
 	MetricList []NetworkMetric
+}
+
+// Key is used for pubsub
+func (nms NetworkMetrics) Key() string {
+	return "global"
+}
+
+// LogCreate :
+func (nms NetworkMetrics) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.NetworkMetricsLogType, "",
+		nilUUID, nms.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Network nms create")
+}
+
+// LogModify :
+func (nms NetworkMetrics) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkMetricsLogType, "",
+		nilUUID, nms.LogKey())
+
+	oldNms, ok := old.(NetworkMetrics)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of NetworkMetrics type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldNms, nms)).
+		Metricf("Network metrics modify")
+}
+
+// LogDelete :
+func (nms NetworkMetrics) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkMetricsLogType, "",
+		nilUUID, nms.LogKey())
+	logObject.Metricf("Network metrics delete")
+
+	base.DeleteLogObject(logBase, nms.LogKey())
+}
+
+// LogKey :
+func (nms NetworkMetrics) LogKey() string {
+	return string(base.NetworkMetricsLogType) + "-" + nms.Key()
 }
 
 func (nms *NetworkMetrics) LookupNetworkMetrics(ifName string) (NetworkMetric, bool) {
@@ -1472,7 +2025,6 @@ const (
 	NetworkInstanceTypeSwitch      NetworkInstanceType = 1
 	NetworkInstanceTypeLocal       NetworkInstanceType = 2
 	NetworkInstanceTypeCloud       NetworkInstanceType = 3
-	NetworkInstanceTypeMesh        NetworkInstanceType = 4
 	NetworkInstanceTypeHoneyPot    NetworkInstanceType = 5
 	NetworkInstanceTypeTransparent NetworkInstanceType = 6
 	NetworkInstanceTypeLast        NetworkInstanceType = 255
@@ -1516,14 +2068,51 @@ type NetworkInstanceConfig struct {
 	DhcpRange       IpRange
 	DnsNameToIPList []DnsNameToIP // Used for DNS and ACL ipset
 
-	HasEncap bool // Lisp/Vpn, for adjusting pMTU
-	// For other network services - Proxy / Lisp /StrongSwan etc..
+	HasEncap bool // Vpn, for adjusting pMTU
+	// For other network services - Proxy / StrongSwan etc..
 	OpaqueConfig string
-	LispConfig   NetworkInstanceLispConfig
 }
 
 func (config *NetworkInstanceConfig) Key() string {
 	return config.UUID.String()
+}
+
+// LogCreate :
+func (config NetworkInstanceConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.NetworkInstanceConfigLogType, "",
+		config.UUIDandVersion.UUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Network instance config create")
+}
+
+// LogModify :
+func (config NetworkInstanceConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkInstanceConfigLogType, "",
+		config.UUIDandVersion.UUID, config.LogKey())
+
+	oldConfig, ok := old.(NetworkInstanceConfig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of NetworkInstanceConfig type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+		Metricf("Network instance config modify")
+}
+
+// LogDelete :
+func (config NetworkInstanceConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkInstanceConfigLogType, "",
+		config.UUIDandVersion.UUID, config.LogKey())
+	logObject.Metricf("Network instance config delete")
+
+	base.DeleteLogObject(logBase, config.LogKey())
+}
+
+// LogKey :
+func (config NetworkInstanceConfig) LogKey() string {
+	return string(base.NetworkInstanceConfigLogType) + "-" + config.Key()
 }
 
 func (config *NetworkInstanceConfig) IsIPv6() bool {
@@ -1560,13 +2149,47 @@ type NetworkInstanceStatus struct {
 	NetworkInstanceInfo
 
 	OpaqueStatus string
-	LispStatus   NetworkInstanceLispConfig
-
-	VpnStatus      *VpnStatus
-	LispInfoStatus *LispInfoStatus
-	LispMetrics    *LispMetrics
+	VpnStatus    *VpnStatus
 
 	NetworkInstanceProbeStatus
+}
+
+// LogCreate :
+func (status NetworkInstanceStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.NetworkInstanceStatusLogType, "",
+		status.UUIDandVersion.UUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Network instance status create")
+}
+
+// LogModify :
+func (status NetworkInstanceStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkInstanceStatusLogType, "",
+		status.UUIDandVersion.UUID, status.LogKey())
+
+	oldStatus, ok := old.(NetworkInstanceStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of NetworkInstanceStatus type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+		Metricf("Network instance status modify")
+}
+
+// LogDelete :
+func (status NetworkInstanceStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.NetworkInstanceStatusLogType, "",
+		status.UUIDandVersion.UUID, status.LogKey())
+	logObject.Metricf("Network instance status delete")
+
+	base.DeleteLogObject(logBase, status.LogKey())
+}
+
+// LogKey :
+func (status NetworkInstanceStatus) LogKey() string {
+	return string(base.NetworkInstanceStatusLogType) + "-" + status.Key()
 }
 
 type VifNameMac struct {
@@ -1617,7 +2240,7 @@ type IPTablesRuleList []IPTablesRule
  * Drops/Errors/AclDrops of bridge is equal to total of Drops/Errors/AclDrops
  * on all member virtual interface including the bridge.
  */
-func (status *NetworkInstanceStatus) UpdateNetworkMetrics(
+func (status *NetworkInstanceStatus) UpdateNetworkMetrics(log *base.LogObject,
 	nms *NetworkMetrics) *NetworkMetric {
 
 	netMetric := NetworkMetric{IfName: status.BridgeName}
@@ -1654,7 +2277,7 @@ func (status *NetworkInstanceStatus) UpdateNetworkMetrics(
  * Drops/Errors/AclDrops of bridge is equal to total of Drops/Errors/AclDrops
  * on all member virtual interface including the bridge.
  */
-func (status *NetworkInstanceStatus) UpdateBridgeMetrics(
+func (status *NetworkInstanceStatus) UpdateBridgeMetrics(log *base.LogObject,
 	nms *NetworkMetrics, netMetric *NetworkMetric) {
 	// Get bridge metrics
 	bridgeMetric, found := nms.LookupNetworkMetrics(status.BridgeName)
@@ -1807,81 +2430,6 @@ type VpnTunnelConfig struct {
 	Metric       string
 	LocalIpAddr  string
 	RemoteIpAddr string
-}
-
-type LispRlocState struct {
-	Rloc      net.IP
-	Reachable bool
-}
-
-type LispMapCacheEntry struct {
-	EID   net.IP
-	Rlocs []LispRlocState
-}
-
-type LispDatabaseMap struct {
-	IID             uint64
-	MapCacheEntries []LispMapCacheEntry
-}
-
-type LispDecapKey struct {
-	Rloc     net.IP
-	Port     uint64
-	KeyCount uint64
-}
-
-type LispInfoStatus struct {
-	ItrCryptoPort uint64
-	EtrNatPort    uint64
-	Interfaces    []string
-	DatabaseMaps  []LispDatabaseMap
-	DecapKeys     []LispDecapKey
-}
-
-type LispPktStat struct {
-	Pkts  uint64
-	Bytes uint64
-}
-
-type LispRlocStatistics struct {
-	Rloc                   net.IP
-	Stats                  LispPktStat
-	SecondsSinceLastPacket uint64
-}
-
-type EidStatistics struct {
-	IID       uint64
-	Eid       net.IP
-	RlocStats []LispRlocStatistics
-}
-
-type EidMap struct {
-	IID  uint64
-	Eids []net.IP
-}
-
-type LispMetrics struct {
-	// Encap Statistics
-	EidMaps            []EidMap
-	EidStats           []EidStatistics
-	ItrPacketSendError LispPktStat
-	InvalidEidError    LispPktStat
-
-	// Decap Statistics
-	NoDecryptKey       LispPktStat
-	OuterHeaderError   LispPktStat
-	BadInnerVersion    LispPktStat
-	GoodPackets        LispPktStat
-	ICVError           LispPktStat
-	LispHeaderError    LispPktStat
-	CheckSumError      LispPktStat
-	DecapReInjectError LispPktStat
-	DecryptError       LispPktStat
-}
-
-type LispDataplaneConfig struct {
-	// If true, we run legacy lispers.net data plane.
-	Legacy bool
 }
 
 type VpnState uint8
@@ -2056,6 +2604,44 @@ func (flows IPFlow) Key() string {
 	return flows.Scope.UUID.String() + flows.Scope.NetUUID.String() + flows.Scope.Sequence
 }
 
+// LogCreate : we treat IPFlow as Metrics for logging
+func (flows IPFlow) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.IPFlowLogType, "",
+		flows.DevID, flows.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("IP flow create")
+}
+
+// LogModify :
+func (flows IPFlow) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.IPFlowLogType, "",
+		flows.DevID, flows.LogKey())
+
+	oldFlows, ok := old.(IPFlow)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of IPFlow type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldFlows, flows)).
+		Metricf("IP flow modify")
+}
+
+// LogDelete :
+func (flows IPFlow) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.IPFlowLogType, "",
+		flows.DevID, flows.LogKey())
+	logObject.Metricf("IP flow delete")
+
+	base.DeleteLogObject(logBase, flows.LogKey())
+}
+
+// LogKey :
+func (flows IPFlow) LogKey() string {
+	return string(base.IPFlowLogType) + "-" + flows.Key()
+}
+
 // VifIPTrig - structure contains Mac Address
 type VifIPTrig struct {
 	MacAddr string
@@ -2067,7 +2653,88 @@ func (vifIP VifIPTrig) Key() string {
 	return vifIP.MacAddr
 }
 
+// LogCreate :
+func (vifIP VifIPTrig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.VifIPTrigLogType, "",
+		nilUUID, vifIP.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Vif IP trig create")
+}
+
+// LogModify :
+func (vifIP VifIPTrig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.VifIPTrigLogType, "",
+		nilUUID, vifIP.LogKey())
+
+	oldVifIP, ok := old.(VifIPTrig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of VifIPTrig type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldVifIP, vifIP)).
+		Metricf("Vif IP trig modify")
+}
+
+// LogDelete :
+func (vifIP VifIPTrig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.VifIPTrigLogType, "",
+		nilUUID, vifIP.LogKey())
+	logObject.Metricf("Vif IP trig delete")
+
+	base.DeleteLogObject(logBase, vifIP.LogKey())
+}
+
+// LogKey :
+func (vifIP VifIPTrig) LogKey() string {
+	return string(base.VifIPTrigLogType) + "-" + vifIP.Key()
+}
+
 // OnboardingStatus - UUID, etc. advertised by client process
 type OnboardingStatus struct {
 	DeviceUUID uuid.UUID
+}
+
+// Key returns the key for pubsub
+func (status OnboardingStatus) Key() string {
+	return "global"
+}
+
+// LogCreate :
+func (status OnboardingStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.OnboardingStatusLogType, "",
+		nilUUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Metricf("Onboarding status create")
+}
+
+// LogModify :
+func (status OnboardingStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.OnboardingStatusLogType, "",
+		nilUUID, status.LogKey())
+
+	oldStatus, ok := old.(OnboardingStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of OnboardingStatus type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+		Metricf("Onboarding status modify")
+}
+
+// LogDelete :
+func (status OnboardingStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.OnboardingStatusLogType, "",
+		nilUUID, status.LogKey())
+	logObject.Metricf("Onboarding status delete")
+
+	base.DeleteLogObject(logBase, status.LogKey())
+}
+
+// LogKey :
+func (status OnboardingStatus) LogKey() string {
+	return string(base.OnboardingStatusLogType) + "-" + status.Key()
 }

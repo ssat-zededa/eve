@@ -6,12 +6,13 @@ package types
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/api/go/info"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus" // OK for logrus.Fatal
 )
 
 // SwState started with enum names from OMA-TS-LWM2M_SwMgmt-V1_0-20151201-C
@@ -29,15 +30,21 @@ const (
 	DOWNLOADED
 	VERIFYING
 	VERIFIED
+	LOADING
+	LOADED
 	CREATING_VOLUME // Volume create in progress
 	CREATED_VOLUME  // Volume create done or failed
 	INSTALLED       // Available to be activated
 	BOOTING
 	RUNNING
+	PAUSING
+	PAUSED
 	HALTING // being halted
 	HALTED
 	RESTARTING // Restarting due to config change or zcli
 	PURGING    // Purging due to config change
+	BROKEN     // Domain is still alive, but its device model has failed
+	UNKNOWN    // State of the domain can't be determined
 	MAXSTATE
 )
 
@@ -58,6 +65,10 @@ func (state SwState) String() string {
 		return "VERIFYING"
 	case VERIFIED:
 		return "VERIFIED"
+	case LOADING:
+		return "LOADING"
+	case LOADED:
+		return "LOADED"
 	case CREATING_VOLUME:
 		return "CREATING_VOLUME"
 	case CREATED_VOLUME:
@@ -68,12 +79,18 @@ func (state SwState) String() string {
 		return "BOOTING"
 	case RUNNING:
 		return "RUNNING"
-	case HALTING:
-		return "HALTING"
+	case PAUSING:
+		return "PAUSING"
+	case PAUSED:
+		return "PAUSED"
 	case HALTED:
 		return "HALTED"
 	case RESTARTING:
 		return "RESTARTING"
+	case BROKEN:
+		return "BROKEN"
+	case UNKNOWN:
+		return "UNKNOWN"
 	case PURGING:
 		return "PURGING"
 	default:
@@ -96,7 +113,7 @@ func (state SwState) ZSwState() info.ZSwState {
 		return info.ZSwState_DOWNLOAD_STARTED
 	case DOWNLOADED, VERIFYING:
 		return info.ZSwState_DOWNLOADED
-	case VERIFIED:
+	case VERIFIED, LOADING, LOADED:
 		return info.ZSwState_DELIVERED
 	case CREATING_VOLUME:
 		return info.ZSwState_CREATING_VOLUME
@@ -104,11 +121,27 @@ func (state SwState) ZSwState() info.ZSwState {
 		return info.ZSwState_CREATED_VOLUME
 	case INSTALLED:
 		return info.ZSwState_INSTALLED
+	// for now we're treating PAUSED as a subset
+	// of INSTALLED simply because controllers don't
+	// support resumable paused tasks just yet (see
+	// how PAUSING maps to RUNNING below)
+	case PAUSED:
+		return info.ZSwState_INSTALLED
 	case BOOTING:
 		return info.ZSwState_BOOTING
 	case RUNNING:
 		return info.ZSwState_RUNNING
+	// for now we're treating PAUSING as a subset of RUNNING
+	// simply because controllers don't support resumable
+	// paused tasks yet
+	case PAUSING:
+		return info.ZSwState_RUNNING
 	case HALTING:
+		return info.ZSwState_HALTING
+	// we map BROKEN to HALTING to indicate that EVE has an active
+	// role in reaping BROKEN domains and transitioning them to
+	// a final HALTED state
+	case BROKEN:
 		return info.ZSwState_HALTING
 	case HALTED:
 		return info.ZSwState_HALTED
@@ -117,7 +150,7 @@ func (state SwState) ZSwState() info.ZSwState {
 	case PURGING:
 		return info.ZSwState_PURGING
 	default:
-		log.Fatalf("Unknown state %d", state)
+		logrus.Fatalf("Unknown state %d", state)
 	}
 	return info.ZSwState_INITIAL
 }
@@ -127,46 +160,6 @@ const (
 	// NoHash constant to indicate that we have no real hash
 	NoHash = "sha"
 )
-
-// UrlToSafename returns a safename
-// XXX deprecate? We might need something for certs
-func UrlToSafename(url string, sha string) string {
-
-	var safename string
-
-	if sha != "" {
-		safename = strings.Replace(url, "/", " ", -1) + "." + sha
-	} else {
-		safename = strings.Replace(url, "/", " ", -1) + "." + NoHash
-	}
-	return safename
-}
-
-// SafenameToFilename returns the filename from inside the safename
-// Remove initial part up to last '/' in URL. Note that '/' was converted
-// to ' ' in Safename
-// XXX deprecate? We might need something for certs
-func SafenameToFilename(safename string) string {
-	comp := strings.Split(safename, " ")
-	last := comp[len(comp)-1]
-	// Drop "."sha256 tail part of Safename
-	i := strings.LastIndex(last, ".")
-	if i == -1 {
-		log.Fatal("Malformed safename with no .sha256",
-			safename)
-	}
-	last = last[0:i]
-	return last
-}
-
-// UrlToFilename returns the last component of a URL.
-// XXX deprecate? We might need something for certs
-// XXX assumes len
-func UrlToFilename(urlName string) string {
-	comp := strings.Split(urlName, "/")
-	last := comp[len(comp)-1]
-	return last
-}
 
 // Used to retain UUID to integer maps across reboots.
 // Used for appNum and bridgeNum
@@ -179,8 +172,47 @@ type UuidToNum struct {
 	InUse       bool
 }
 
+// Key is the key in pubsub
 func (info UuidToNum) Key() string {
 	return info.UUID.String()
+}
+
+// LogCreate :
+func (info UuidToNum) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.UUIDToNumLogType, "",
+		info.UUID, info.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Noticef("UuidToNum info create")
+}
+
+// LogModify :
+func (info UuidToNum) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.UUIDToNumLogType, "",
+		info.UUID, info.LogKey())
+
+	oldInfo, ok := old.(UuidToNum)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of UuidToNum type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldInfo, info)).
+		Noticef("UuidToNum info modify")
+}
+
+// LogDelete :
+func (info UuidToNum) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.UUIDToNumLogType, "",
+		info.UUID, info.LogKey())
+	logObject.Noticef("UuidToNum info delete")
+
+	base.DeleteLogObject(logBase, info.LogKey())
+}
+
+// LogKey :
+func (info UuidToNum) LogKey() string {
+	return string(base.UUIDToNumLogType) + "-" + info.Key()
 }
 
 // Use this for booleans which have a none/dontcare/notset value
@@ -219,7 +251,7 @@ func FormatTriState(state TriState) string {
 	case TS_DISABLED:
 		return "disabled"
 	default:
-		log.Fatalf("Invalid TriState Value: %v", state)
+		logrus.Fatalf("Invalid TriState Value: %v", state)
 	}
 	return ""
 }

@@ -1,17 +1,43 @@
 package legacy
 
 import (
+	"os"
+	"sync"
+
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub/socketdriver"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
+var onceLock = &sync.Mutex{}
+var onceVal bool
+
+// Protected by once()
 var (
-	defaultPubsub = pubsub.New(&socketdriver.SocketDriver{})
+	logger        *logrus.Logger
+	log           *base.LogObject
+	defaultPubsub *pubsub.PubSub
 )
+
+// once returns true the first time and then false
+func once() bool {
+	onceLock.Lock()
+	defer onceLock.Unlock()
+	if onceVal {
+		return false
+	} else {
+		onceVal = true
+		return true
+	}
+}
 
 // Publish create a `Publication` for the given agent name and topic type.
+// XXX remove? Used by ledmanagerutils.go
 func Publish(agentName string, topicType interface{}) (pubsub.Publication, error) {
+	if once() {
+		initialize(agentName)
+	}
 	log.Debugf("legacy.Publish agentName(%s)", agentName)
 	return defaultPubsub.NewPublication(pubsub.PublicationOptions{
 		AgentName: agentName,
@@ -21,7 +47,11 @@ func Publish(agentName string, topicType interface{}) (pubsub.Publication, error
 
 // PublishPersistent create a `Publication` for the given agent name and topic
 // type, but with persistence of the messages across reboots.
+// XXX remove? Used by globalutils.go
 func PublishPersistent(agentName string, topicType interface{}) (pubsub.Publication, error) {
+	if once() {
+		initialize(agentName)
+	}
 	log.Infof("legacy.PublishPersistent agentName(%s)", agentName)
 	return defaultPubsub.NewPublication(pubsub.PublicationOptions{
 		AgentName:  agentName,
@@ -30,92 +60,9 @@ func PublishPersistent(agentName string, topicType interface{}) (pubsub.Publicat
 	})
 }
 
-// PublishScope create a `Publication` for the given agent name and topic,
-// restricted to a given scope.
-func PublishScope(agentName string, agentScope string, topicType interface{}) (pubsub.Publication, error) {
-	log.Infof("legacy.PublishScope agentName(%s), agentScope (%s)", agentName, agentScope)
-	return defaultPubsub.NewPublication(pubsub.PublicationOptions{
-		AgentName:  agentName,
-		TopicType:  topicType,
-		AgentScope: agentScope,
-	})
-}
-
-// Subscribe create a subscription for the given agent name and topic
-// optionally activating immediately. If `activate` is set to `false`
-// (the default), then the subscription will not begin to send messages
-// on the channel or process them until `Subscription.Start()` is called.
-func Subscribe(agentName string, topicType interface{}, activate bool,
-	ctx interface{}, options *pubsub.SubscriptionOptions) (pubsub.Subscription, error) {
-
-	if options == nil {
-		options = &pubsub.SubscriptionOptions{}
-	}
-	return defaultPubsub.NewSubscription(pubsub.SubscriptionOptions{
-		CreateHandler:  options.CreateHandler,
-		ModifyHandler:  options.ModifyHandler,
-		DeleteHandler:  options.DeleteHandler,
-		RestartHandler: options.RestartHandler,
-		SyncHandler:    options.SyncHandler,
-		WarningTime:    options.WarningTime,
-		ErrorTime:      options.ErrorTime,
-		AgentName:      agentName,
-		TopicImpl:      topicType,
-		Activate:       activate,
-		Ctx:            ctx,
-		Persistent:     false,
-	})
-}
-
-// SubscribeScope create a subscription for the given agent name and topic,
-// limited to a given scope,
-// optionally activating immediately. If `activate` is set to `false`
-// (the default), then the subscription will not begin to send messages
-// on the channel or process them until `Subscription.Start()` is called.
-func SubscribeScope(agentName string, agentScope string, topicType interface{},
-	activate bool, ctx interface{}, options *pubsub.SubscriptionOptions) (pubsub.Subscription, error) {
-	if options == nil {
-		options = &pubsub.SubscriptionOptions{}
-	}
-	return defaultPubsub.NewSubscription(pubsub.SubscriptionOptions{
-		CreateHandler:  options.CreateHandler,
-		ModifyHandler:  options.ModifyHandler,
-		DeleteHandler:  options.DeleteHandler,
-		RestartHandler: options.RestartHandler,
-		SyncHandler:    options.SyncHandler,
-		WarningTime:    options.WarningTime,
-		ErrorTime:      options.ErrorTime,
-		AgentName:      agentName,
-		AgentScope:     agentScope,
-		TopicImpl:      topicType,
-		Activate:       activate,
-		Ctx:            ctx,
-		Persistent:     false,
-	})
-}
-
-// SubscribePersistent create a subscription for the given agent name and topic,
-// persistent,
-// optionally activating immediately. If `activate` is set to `false`
-// (the default), then the subscription will not begin to send messages
-// on the channel or process them until `Subscription.Start()` is called.
-func SubscribePersistent(agentName string, topicType interface{}, activate bool,
-	ctx interface{}, options *pubsub.SubscriptionOptions) (pubsub.Subscription, error) {
-	if options == nil {
-		options = &pubsub.SubscriptionOptions{}
-	}
-	return defaultPubsub.NewSubscription(pubsub.SubscriptionOptions{
-		CreateHandler:  options.CreateHandler,
-		ModifyHandler:  options.ModifyHandler,
-		DeleteHandler:  options.DeleteHandler,
-		RestartHandler: options.RestartHandler,
-		SyncHandler:    options.SyncHandler,
-		WarningTime:    options.WarningTime,
-		ErrorTime:      options.ErrorTime,
-		AgentName:      agentName,
-		TopicImpl:      topicType,
-		Activate:       activate,
-		Ctx:            ctx,
-		Persistent:     true,
-	})
+func initialize(agentName string) {
+	logger = logrus.New()
+	log = base.NewSourceLogObject(logger, agentName, os.Getpid())
+	defaultPubsub = pubsub.New(&socketdriver.SocketDriver{Log: log},
+		logger, log)
 }

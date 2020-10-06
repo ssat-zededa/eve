@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2018 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// ACL configlet for overlay and underlay interface towards domU
+// ACL configlet for underlay interface towards domU
 
 package zedrouter
 
@@ -15,7 +15,6 @@ import (
 	"github.com/eriknordmark/netlink"
 	"github.com/lf-edge/eve/pkg/pillar/iptables"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 )
 
 // XXX Stop gap allocator copied from zedrouter/appnumallocator.go
@@ -116,25 +115,6 @@ func compileAceIpsets(ACLs []types.ACE) []string {
 	return ipsets
 }
 
-func compileOverlayIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkConfig) []string {
-
-	ipsets := []string{}
-	for _, olConfig := range ollist {
-		netconfig := lookupNetworkInstanceConfig(ctx,
-			olConfig.Network.String())
-		if netconfig != nil {
-			// All ipsets from everybody on this network
-			ipsets = append(ipsets, compileNetworkIpsetsConfig(ctx,
-				netconfig)...)
-		} else {
-			log.Errorf("No NetworkInstanceConfig for %s",
-				olConfig.Network.String())
-		}
-	}
-	return ipsets
-}
-
 func compileUnderlayIpsets(ctx *zedrouterContext,
 	ullist []types.UnderlayNetworkConfig) []string {
 
@@ -155,11 +135,9 @@ func compileUnderlayIpsets(ctx *zedrouterContext,
 }
 
 func compileAppInstanceIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkConfig,
 	ullist []types.UnderlayNetworkConfig) []string {
 
 	ipsets := []string{}
-	ipsets = append(ipsets, compileOverlayIpsets(ctx, ollist)...)
 	ipsets = append(ipsets, compileUnderlayIpsets(ctx, ullist)...)
 	return ipsets
 }
@@ -183,13 +161,6 @@ func compileNetworkIpsetsStatus(ctx *zedrouterContext,
 			continue
 		}
 
-		for _, olStatus := range status.OverlayNetworkList {
-			if olStatus.Network != netconfig.UUID {
-				continue
-			}
-			ipsets = append(ipsets,
-				compileAceIpsets(olStatus.ACLs)...)
-		}
 		for _, ulStatus := range status.UnderlayNetworkList {
 			if ulStatus.Network != netconfig.UUID {
 				continue
@@ -213,39 +184,12 @@ func compileNetworkIpsetsConfig(ctx *zedrouterContext,
 	items := sub.GetAll()
 	for _, c := range items {
 		config := c.(types.AppNetworkConfig)
-		for _, olConfig := range config.OverlayNetworkList {
-			if olConfig.Network != netconfig.UUID {
-				continue
-			}
-			ipsets = append(ipsets,
-				compileAceIpsets(olConfig.ACLs)...)
-		}
 		for _, ulConfig := range config.UnderlayNetworkList {
 			if ulConfig.Network != netconfig.UUID {
 				continue
 			}
 			ipsets = append(ipsets,
 				compileAceIpsets(ulConfig.ACLs)...)
-		}
-	}
-	return ipsets
-}
-
-// If skipKey is set ignore any AppNetworkStatus with that key
-func compileOldOverlayIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkStatus, skipKey string) []string {
-
-	ipsets := []string{}
-	for _, olStatus := range ollist {
-		netconfig := lookupNetworkInstanceConfig(ctx,
-			olStatus.Network.String())
-		if netconfig != nil {
-			// All ipsets from everybody on this network
-			ipsets = append(ipsets, compileNetworkIpsetsStatus(ctx,
-				netconfig, skipKey)...)
-		} else {
-			log.Errorf("No NetworkInstanceConfig for %s",
-				olStatus.Network.String())
 		}
 	}
 	return ipsets
@@ -273,11 +217,9 @@ func compileOldUnderlayIpsets(ctx *zedrouterContext,
 
 // If skipKey is set ignore any AppNetworkStatus with that key
 func compileOldAppInstanceIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkStatus,
 	ullist []types.UnderlayNetworkStatus, skipKey string) []string {
 
 	ipsets := []string{}
-	ipsets = append(ipsets, compileOldOverlayIpsets(ctx, ollist, skipKey)...)
 	ipsets = append(ipsets, compileOldUnderlayIpsets(ctx, ullist, skipKey)...)
 	return ipsets
 }
@@ -1446,19 +1388,19 @@ func executeIPTablesRule(operation string, rule types.IPTablesRule) error {
 		ruleStr = append(ruleStr, rule.Action...)
 	}
 	if rule.IPVer == 4 {
-		err = iptables.IptableCmd(ruleStr...)
+		err = iptables.IptableCmd(log, ruleStr...)
 		if operation == "-D" && rule.Table == "mangle" {
 			if rule.ActionChainName != "" {
 				chainFlush := []string{"-t", "mangle", "--flush", rule.ActionChainName}
 				chainDelete := []string{"-t", "mangle", "-X", rule.ActionChainName}
-				err = iptables.IptableCmd(chainFlush...)
+				err = iptables.IptableCmd(log, chainFlush...)
 				if err == nil {
-					iptables.IptableCmd(chainDelete...)
+					iptables.IptableCmd(log, chainDelete...)
 				}
 			}
 		}
 	} else if rule.IPVer == 6 {
-		err = iptables.Ip6tableCmd(ruleStr...)
+		err = iptables.Ip6tableCmd(log, ruleStr...)
 	} else {
 		errStr := fmt.Sprintf("ACL: Unknown IP version %d", rule.IPVer)
 		err = errors.New(errStr)
@@ -1640,7 +1582,7 @@ func createMarkAndAcceptChain(aclArgs types.AppNetworkACLArgs,
 
 	newChain := []string{"-t", "mangle", "-N", name}
 	log.Infof("createMarkAndAcceptChain: Creating new chain (%s)", name)
-	err := iptables.IptableCmd(newChain...)
+	err := iptables.IptableCmd(log, newChain...)
 	if err != nil {
 		log.Errorf("createMarkAndAcceptChain: New chain (%s) creation failed: %s",
 			name, err)
@@ -1665,45 +1607,76 @@ func createMarkAndAcceptChain(aclArgs types.AppNetworkACLArgs,
 	chainFlush := []string{"-t", "mangle", "--flush", name}
 	chainDelete := []string{"-t", "mangle", "-X", name}
 
-	err = iptables.IptableCmd(rule1...)
+	err = iptables.IptableCmd(log, rule1...)
 	if err != nil {
 		log.Errorf("createMarkAndAcceptChain: New rule (%s) creation failed: %s",
 			rule1, err)
-		iptables.IptableCmd(chainFlush...)
-		iptables.IptableCmd(chainDelete...)
+		iptables.IptableCmd(log, chainFlush...)
+		iptables.IptableCmd(log, chainDelete...)
 		return err
 	}
-	err = iptables.IptableCmd(rule2...)
+	err = iptables.IptableCmd(log, rule2...)
 	if err != nil {
 		log.Errorf("createMarkAndAcceptChain: New rule (%s) creation failed: %s",
 			rule2, err)
-		iptables.IptableCmd(chainFlush...)
-		iptables.IptableCmd(chainDelete...)
+		iptables.IptableCmd(log, chainFlush...)
+		iptables.IptableCmd(log, chainDelete...)
 		return err
 	}
-	err = iptables.IptableCmd(rule3...)
+	err = iptables.IptableCmd(log, rule3...)
 	if err != nil {
 		log.Errorf("createMarkAndAcceptChain: New rule (%s) creation failed: %s",
 			rule3, err)
-		iptables.IptableCmd(chainFlush...)
-		iptables.IptableCmd(chainDelete...)
+		iptables.IptableCmd(log, chainFlush...)
+		iptables.IptableCmd(log, chainDelete...)
 		return err
 	}
-	err = iptables.IptableCmd(rule4...)
+	err = iptables.IptableCmd(log, rule4...)
 	if err != nil {
 		log.Errorf("createMarkAndAcceptChain: New rule (%s) creation failed: %s",
 			rule4, err)
-		iptables.IptableCmd(chainFlush...)
-		iptables.IptableCmd(chainDelete...)
+		iptables.IptableCmd(log, chainFlush...)
+		iptables.IptableCmd(log, chainDelete...)
 		return err
 	}
-	err = iptables.IptableCmd(rule5...)
+	err = iptables.IptableCmd(log, rule5...)
 	if err != nil {
 		log.Errorf("createMarkAndAcceptChain: New rule (%s) creation failed: %s",
 			rule5, err)
-		iptables.IptableCmd(chainFlush...)
-		iptables.IptableCmd(chainDelete...)
+		iptables.IptableCmd(log, chainFlush...)
+		iptables.IptableCmd(log, chainDelete...)
 		return err
 	}
 	return nil
+}
+
+// insert or remove the App Container API endpoint blocking ACL
+func appConfigContainerStatsACL(appIPAddr net.IP, isRemove bool) {
+	var err error
+	action := "-I"
+	// install or remove the App Container Stats blocking ACL
+	// This ACL blocks the other Apps accessing through the same subnet to 'appIPAddr:DOCKERAPIPORT'
+	// in TCP protocol, and only allow the Dom0 process to query the App's docker stats
+	// - this blocking is only possible in the 'raw' table and 'PREROUTING' chain due to the marking
+	//   is done in the 'mangle' of 'PREROUTING'. Install to the front of the 'PREROUTING' list
+	// - this blocking ACL does not block the Dom0 access to the above TCP endpoint on the same
+	//   subnet. This is due to the IP packets from Dom0 to the internal bridge entering the linux
+	//   forwarding through the 'OUTPUT' chain
+	// - this blocking does not seem to work if further matching to the '--physdev', so the drop action
+	//   needs to be at network layer3
+	// - XXX currently the 'drop' mark of 0xffffff on the flow of internal traffic on bridge does not work,
+	//   later it may be possible to change below '-j DROP' to '-j MARK' action
+	if isRemove {
+		action = "-D"
+		err = iptables.IptableCmd(log, "-t", "raw", action, "PREROUTING", "-d", appIPAddr.String(), "-p", "tcp",
+			"--dport", strconv.Itoa(DOCKERAPIPORT), "-j", "DROP")
+	} else {
+		err = iptables.IptableCmd(log, "-t", "raw", action, "PREROUTING", "1", "-d", appIPAddr.String(), "-p", "tcp",
+			"--dport", strconv.Itoa(DOCKERAPIPORT), "-j", "DROP")
+	}
+	if err != nil {
+		log.Errorf("appCheckContainerStatsACL: iptableCmd err %v", err)
+	} else {
+		log.Infof("appCheckContainerStatsACL: iptableCmd %s for %s", action, appIPAddr.String())
+	}
 }

@@ -6,8 +6,6 @@ package upgradeconverter
 import (
 	"os"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 )
 
 func fileExists(filename string) bool {
@@ -19,6 +17,19 @@ func fileExists(filename string) bool {
 		return false
 	}
 	log.Errorf("***File %s May or May Not exist. Err: %s", filename, err)
+	return false
+}
+
+func dirExists(dirname string) bool {
+	fi, err := os.Stat(dirname)
+	if err == nil {
+		return fi.IsDir()
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	log.Errorf("***Directory %s may or may not exist. Err: %s",
+		dirname, err)
 	return false
 }
 

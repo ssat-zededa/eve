@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"time"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus" // OK for logrus.Fatal
 )
 
 // Common error with timestamp
@@ -21,7 +21,7 @@ type ErrorAndTime struct {
 // SetErrorNow uses the current time
 func (etPtr *ErrorAndTime) SetErrorNow(errStr string) {
 	if errStr == "" {
-		log.Fatal("Missing error string")
+		logrus.Fatal("Missing error string")
 	}
 	etPtr.Error = errStr
 	etPtr.ErrorTime = time.Now()
@@ -30,7 +30,7 @@ func (etPtr *ErrorAndTime) SetErrorNow(errStr string) {
 // SetError is when time is specified
 func (etPtr *ErrorAndTime) SetError(errStr string, errorTime time.Time) {
 	if errStr == "" {
-		log.Fatal("Missing error string")
+		logrus.Fatal("Missing error string")
 	}
 	etPtr.Error = errStr
 	etPtr.ErrorTime = errorTime
@@ -61,7 +61,7 @@ func NewErrorAndTimeNow(errStr string) ErrorAndTime {
 // which is used to selectively clear errors by calling IsErrorSource before
 // calling ClearErrorWithSource. See zedmanager and volumemgr for example use.
 type ErrorAndTimeWithSource struct {
-	ErrorSourceType interface{}
+	ErrorSourceType string
 	Error           string
 	ErrorTime       time.Time
 }
@@ -69,43 +69,50 @@ type ErrorAndTimeWithSource struct {
 // SetError - Sets error state with no source type
 func (etsPtr *ErrorAndTimeWithSource) SetError(errStr string, errTime time.Time) {
 	if errStr == "" {
-		log.Fatal("Missing error string")
+		logrus.Fatal("Missing error string")
 	}
 	etsPtr.Error = errStr
-	etsPtr.ErrorSourceType = nil
+	etsPtr.ErrorSourceType = ""
 	etsPtr.ErrorTime = errTime
 }
 
 // SetErrorWithSource - Sets error state. Source needs to be a type
+// but source might be a string passed from ErrorSourceType in another
+// object.
 func (etsPtr *ErrorAndTimeWithSource) SetErrorWithSource(errStr string,
 	source interface{}, errTime time.Time) {
 
 	if !allowedSourceType(source) {
-		log.Fatalf("Bad ErrorSourceType %T", source)
+		logrus.Fatalf("Bad ErrorSourceType %T", source)
 	}
 	if errStr == "" {
-		log.Fatal("Missing error string")
+		logrus.Fatal("Missing error string")
 	}
 	etsPtr.Error = errStr
-	etsPtr.ErrorSourceType = source
+	switch source.(type) {
+	case string:
+		etsPtr.ErrorSourceType = source.(string)
+	default:
+		etsPtr.ErrorSourceType = reflect.TypeOf(source).String()
+	}
 	etsPtr.ErrorTime = errTime
 }
 
 // IsErrorSource returns true if the source type matches
 func (etsPtr *ErrorAndTimeWithSource) IsErrorSource(source interface{}) bool {
 	if !allowedSourceType(source) {
-		log.Fatalf("Bad ErrorSourceType %T", source)
+		logrus.Fatalf("Bad ErrorSourceType %T", source)
 	}
 	if !etsPtr.HasError() {
 		return false
 	}
-	return reflect.TypeOf(source) == reflect.TypeOf(etsPtr.ErrorSourceType)
+	return reflect.TypeOf(source).String() == etsPtr.ErrorSourceType
 }
 
 // ClearErrorWithSource - Clears error state
 func (etsPtr *ErrorAndTimeWithSource) ClearErrorWithSource() {
 	etsPtr.Error = ""
-	etsPtr.ErrorSourceType = nil
+	etsPtr.ErrorSourceType = ""
 	etsPtr.ErrorTime = time.Time{}
 }
 
@@ -122,14 +129,17 @@ func (etsPtr *ErrorAndTimeWithSource) ErrorAndTime() ErrorAndTime {
 
 // Disallow leaf types and pointers, since pointers
 // and their struct types do not compare as equal
+// Allow string in case passed from another ErrorSourceType
 func allowedSourceType(source interface{}) bool {
-	// Catch common mistakes like a string
 	switch source.(type) {
 	case int:
 		return false
 	case string:
-		return false
+		return true
 	case bool:
+		return false
+	}
+	if _, ok := source.(map[string]interface{}); ok {
 		return false
 	}
 	val := reflect.ValueOf(source)

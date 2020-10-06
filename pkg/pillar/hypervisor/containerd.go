@@ -8,25 +8,35 @@ import (
 	zconfig "github.com/lf-edge/eve/api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/containerd"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"os"
-	"strconv"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
 type ctrdContext struct {
+	// XXX add log?
 	domCounter int
 	PCI        map[string]bool
 }
 
-func newContainerd() Hypervisor {
+func initContainerd() (*ctrdContext, error) {
 	if err := containerd.InitContainerdClient(); err != nil {
-		log.Fatal(err)
-		return nil
+		return nil, err
 	}
-	return ctrdContext{
+	return &ctrdContext{
 		domCounter: 0,
 		PCI:        map[string]bool{},
+	}, nil
+}
+
+func newContainerd() Hypervisor {
+	if ret, err := initContainerd(); err != nil {
+		log.Fatalf("couldn't initialize containerd (this should not happen): %v. Exiting.", err)
+		return nil // it really never returns on account of above
+	} else {
+		return ret
 	}
 }
 
@@ -34,111 +44,104 @@ func (ctx ctrdContext) Name() string {
 	return "containerd"
 }
 
-func (ctx ctrdContext) CreateDomConfig(domainName string, config types.DomainConfig, diskStatusList []types.DiskStatus, aa *types.AssignableAdapters, file *os.File) error {
-	if len(diskStatusList) != 1 || diskStatusList[0].Format != zconfig.Format_CONTAINER {
-		return logError("failed to create container for %s containerd only supports ECOs with a single drive in an image format for now", domainName)
-	}
+func (ctx ctrdContext) Task(status *types.DomainStatus) types.Task {
+	return ctx
+}
 
+func (ctx ctrdContext) Setup(status types.DomainStatus, config types.DomainConfig, aa *types.AssignableAdapters, file *os.File) error {
+	diskStatusList := status.DiskStatusList
+	domainName := status.DomainName
 	spec, err := containerd.NewOciSpec(domainName)
 	if err != nil {
 		return logError("requesting default OCI spec for domain %s failed %v", domainName, err)
 	}
 
-	if err := spec.UpdateFromVolume(diskStatusList[0].FileLocation); err != nil {
-		return logError("failed to update OCI spec from volume %s (%v)", diskStatusList[0].FileLocation, err)
+	if len(diskStatusList) > 0 && diskStatusList[0].Format == zconfig.Format_CONTAINER {
+		if err := spec.UpdateFromVolume(diskStatusList[0].FileLocation); err != nil {
+			return logError("failed to update OCI spec from volume %s (%v)", diskStatusList[0].FileLocation, err)
+		}
 	}
 
 	spec.UpdateFromDomain(config)
+	spec.UpdateMounts(status.DiskStatusList)
+	spec.UpdateVifList(config)
+	spec.Get().Mounts = append(spec.Get().Mounts, specs.Mount{
+		Type:        "bind",
+		Source:      "/etc/resolv.conf",
+		Destination: "/etc/resolv.conf",
+		Options:     []string{"rbind", "ro"}})
+	spec.UpdateEnvVar(status.EnvVariables)
+	if err := spec.CreateContainer(true); err != nil {
+		return logError("Failed to create container for task %s from %v: %v", domainName, config, err)
+	}
 
-	return spec.Save(file)
+	return nil
 }
 
-func (ctx ctrdContext) Create(domainName string, cfgFilename string, VirtualizationMode types.VmMode) (int, error) {
-	spec, err := containerd.NewOciSpec(domainName)
-	if err != nil {
-		return 0, logError("containerd create failed to initialize OCI spec %s %v", domainName, err)
-	}
+func (ctx ctrdContext) Create(domainName string, cfgFilename string, config *types.DomainConfig) (int, error) {
+	// if we are here we may need to get rid of the wedged, stale task just in case
+	// we are ignoring error here since it is cheaper to always call this as opposed
+	// to figure out if there's a wedged task (IOW, error could simply mean there was
+	// nothing to kill)
+	_ = containerd.CtrStopContainer(domainName, true)
 
-	specf, err := os.Open(cfgFilename)
-	if err != nil {
-		return 0, logError("containerd create failed to open OCI spec file %s %v", cfgFilename, err)
-	}
-
-	if err = spec.Load(specf); err == nil {
-		err = spec.CreateContainer(true)
-	}
-
-	if err == nil {
-		ctx.domCounter--
-		log.Infof("containerd create finished creating domain %s %d", domainName, ctx.domCounter)
-		return ctx.domCounter, nil
-	}
-	return 0, logError("containerd create failed to create domain %s %v", domainName, err)
+	return containerd.CtrCreateTask(domainName)
 }
 
 func (ctx ctrdContext) Start(domainName string, domainID int) error {
-	id, err := containerd.CtrStart(domainName)
+	err := containerd.CtrStartTask(domainName)
 	if err != nil {
-		return logError("containerd failed to start domain %s %v", domainName, err)
+		return err
 	}
-	log.Infof("containerd launched domain %s with PID %d", domainName, id)
-	return nil
+
+	// now lets wait for task to reach a steady state or for >10sec to elapse
+	for i := 0; i < 10; i++ {
+		_, _, status, err := containerd.CtrContainerInfo(domainName)
+		if err == nil && (status == "running" || status == "stopped" || status == "paused") {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+
+	return fmt.Errorf("task %s couldn't reach a steady state in time", domainName)
 }
 
 func (ctx ctrdContext) Stop(domainName string, domainID int, force bool) error {
-	err := containerd.CtrStop(domainName, force)
-	if err == nil {
-		log.Infof("containerd stopped domain %s with PID %d (forced %v)", domainName, domainID, force)
-	} else {
-		log.Errorf("containerd failed to stop domain %s with PID %d (forced %v) %v", domainName, domainID, force, err)
-	}
-	return err
+	return containerd.CtrStopContainer(domainName, force)
 }
 
 func (ctx ctrdContext) Delete(domainName string, domainID int) error {
-	err := containerd.CtrDelete(domainName)
-	if err == nil {
-		log.Infof("containerd deleted domain %s with PID %d", domainName, domainID)
-	} else {
-		return logError("containerd failed to delete domain %s with PID %d %v", domainName, domainID, err)
-	}
-	return err
+	return containerd.CtrDeleteContainer(domainName)
 }
 
-func (ctx ctrdContext) Info(domainName string, domainID int) error {
-	pid, status, err := containerd.CtrInfo(domainName)
-	if err == nil {
-		if pid == domainID {
-			log.Infof("containerd domain %s with PID %d is %s\n", domainName, domainID, status)
-			return nil
-		} else {
-			log.Warnf("containerd domain %s with PID %d (different from expected %d) is %s",
-				domainName, pid, domainID, status)
-			return nil
-		}
-	} else {
-		return logError("containerd looking up domain %s with PID %d resulted in %v", domainName, domainID, err)
+func (ctx ctrdContext) Info(domainName string, domainID int) (int, types.SwState, error) {
+	effectiveDomainID, exit, status, err := containerd.CtrContainerInfo(domainName)
+	if err != nil {
+		return domainID, types.UNKNOWN, logError("containerd looking up domain %s with PID %d resulted in %v", domainName, domainID, err)
 	}
-}
 
-func (ctx ctrdContext) LookupByName(domainName string, domainID int) (int, error) {
-	pid, status, err := containerd.CtrInfo(domainName)
-	if err == nil {
-		if pid == domainID {
-			log.Infof("containerd domain %s with PID %d is %s\n", domainName, domainID, status)
-		} else {
-			log.Warnf("containerd domain %s with PID %d (different from expected %d) is %s",
-				domainName, pid, domainID, status)
-		}
-		return pid, nil
-	} else {
-		return 0, logError("containerd looking up domain by name %s with PID %d resulted in %v",
-			domainName, domainID, err)
+	if status == "stopped" && exit != 0 {
+		return domainID, types.BROKEN, logError("task broke with exit status %d", exit)
 	}
-}
 
-func (ctx ctrdContext) Tune(string, int, int) error {
-	return nil
+	if effectiveDomainID != domainID {
+		log.Warnf("containerd domain %s with PID %d (different from expected %d) is %s",
+			domainName, effectiveDomainID, domainID, status)
+	}
+
+	stateMap := map[string]types.SwState{
+		"created": types.INSTALLED,
+		"running": types.RUNNING,
+		"pausing": types.PAUSING,
+		"paused":  types.PAUSED,
+		"stopped": types.HALTED,
+	}
+	if effectiveDomainState, matched := stateMap[status]; !matched {
+		return effectiveDomainID, types.BROKEN, fmt.Errorf("task %s happens to be in an unexpected state %s",
+			domainName, status)
+	} else {
+		return effectiveDomainID, effectiveDomainState, nil
+	}
 }
 
 func (ctx ctrdContext) PCIReserve(long string) error {
@@ -159,37 +162,31 @@ func (ctx ctrdContext) PCIRelease(long string) error {
 	}
 }
 
-func (ctx ctrdContext) IsDomainPotentiallyShuttingDown(domainName string) bool {
-	_, status, err := containerd.CtrInfo(domainName)
-	return err == nil && status == "pausing"
-}
-
-func (ctx ctrdContext) IsDeviceModelAlive(id int) bool {
-	_, err := os.Stat("/proc/" + strconv.Itoa(id))
-	return err == nil
-}
-
 func (ctx ctrdContext) GetHostCPUMem() (types.HostMemory, error) {
 	return selfDomCPUMem()
 }
 
 func (ctx ctrdContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 	res := map[string]types.DomainMetric{}
-	ids, err := containerd.CtrList()
+	ids, err := containerd.CtrListTaskIds()
 	if err != nil {
 		return nil, err
 	}
 
 	for _, id := range ids {
-		var usedMem, availMem uint32
+		var usedMem, availMem, totalMem uint32
 		var usedMemPerc float64
 		var cpuTotal uint64
 
-		if metric, err := containerd.GetMetrics(id); err == nil {
+		if metric, err := containerd.CtrGetContainerMetrics(id); err == nil {
 			usedMem = uint32(roundFromBytesToMbytes(metric.Memory.Usage.Usage))
-			availMem = uint32(roundFromBytesToMbytes(metric.Memory.Usage.Max))
-			if availMem != 0 {
-				usedMemPerc = float64(100 * float32(usedMem) / float32(availMem))
+			totalMem = uint32(roundFromBytesToMbytes(metric.Memory.HierarchicalMemoryLimit))
+			availMem = 0
+			if totalMem > usedMem {
+				availMem = totalMem - usedMem
+			}
+			if totalMem != 0 {
+				usedMemPerc = float64(100 * float32(usedMem) / float32(totalMem))
 			} else {
 				usedMemPerc = 0
 			}

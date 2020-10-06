@@ -8,7 +8,6 @@ import (
 	"fmt"
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 )
 
 // MaybeAddDomainConfig makes sure we have a DomainConfig
@@ -46,81 +45,35 @@ func MaybeAddDomainConfig(ctx *zedmanagerContext,
 		CipherBlockStatus: aiConfig.CipherBlockStatus,
 	}
 
-	// Determine number of "disk" targets in list
-	numDisks := 0
-	for _, sc := range aiConfig.StorageConfigList {
-		if sc.Target == "" || sc.Target == "disk" || sc.Target == "tgtunknown" {
-			numDisks++
-		} else {
-			log.Infof("Not allocating disk for Target %s",
-				sc.Target)
-		}
-	}
-	dc.DiskConfigList = make([]types.DiskConfig, 0, numDisks)
-	for _, sc := range aiConfig.StorageConfigList {
-		ssPtr := lookupStorageStatus(&aiStatus, sc)
-		if ssPtr == nil {
-			log.Errorf("Missing StorageStatus for (Name: %s, "+
-				"ImageSha256: %s, ImageID: %s, PurgeCounter: %d)",
-				sc.Name, sc.ImageSha256, sc.ImageID, sc.PurgeCounter)
+	dc.DiskConfigList = make([]types.DiskConfig, 0, len(aiStatus.VolumeRefStatusList))
+	for _, vrc := range aiConfig.VolumeRefConfigList {
+		vrs := getVolumeRefStatusFromAIStatus(&aiStatus, vrc)
+		if vrs == nil {
+			log.Errorf("Missing VolumeRefStatus for (VolumeID: %s, GenerationCounter: %d)",
+				vrc.VolumeID, vrc.GenerationCounter)
 			continue
 		}
-		location := ssPtr.ActiveFileLocation
+		location := vrs.ActiveFileLocation
 		if location == "" {
-			errStr := "No ActiveFileLocation"
+			errStr := fmt.Sprintf("No ActiveFileLocation for %s", vrs.DisplayName)
 			log.Error(errStr)
 			return errors.New(errStr)
 		}
-
-		switch sc.Target {
-		case "", "disk", "tgtunknown":
-			disk := types.DiskConfig{}
-			disk.ImageID = sc.ImageID
-			// Pick up sha and FileLocation from volumemgr
-			disk.ImageSha256 = ssPtr.ImageSha256
-			disk.FileLocation = location
-			disk.ReadOnly = sc.ReadOnly
-			disk.Preserve = sc.Preserve
-			disk.Format = sc.Format
-			disk.Maxsizebytes = sc.Maxsizebytes
-			disk.Devtype = sc.Devtype
-			dc.DiskConfigList = append(dc.DiskConfigList, disk)
-		case "kernel":
-			if dc.Kernel != "" {
-				log.Infof("Overriding kernel %s with location %s",
-					dc.Kernel, location)
-			}
-			dc.Kernel = location
-		case "ramdisk":
-			if dc.Ramdisk != "" {
-				log.Infof("Overriding ramdisk %s with location %s",
-					dc.Ramdisk, location)
-			}
-			dc.Ramdisk = location
-		case "device_tree":
-			if dc.DeviceTree != "" {
-				log.Infof("Overriding device_tree %s with location %s",
-					dc.DeviceTree, location)
-			}
-			dc.DeviceTree = location
-		default:
-			errStr := fmt.Sprintf("Unknown target %s for %s",
-				sc.Target, displayName)
-			log.Errorln(errStr)
-			return errors.New(errStr)
-		}
+		disk := types.DiskConfig{}
+		disk.FileLocation = location
+		disk.ReadOnly = vrs.ReadOnly
+		disk.Format = vrs.ContentFormat
+		disk.MountDir = vrs.MountDir
+		disk.DisplayName = vrs.DisplayName
+		dc.DiskConfigList = append(dc.DiskConfigList, disk)
 	}
 	if ns != nil {
-		olNum := len(ns.OverlayNetworkList)
 		ulNum := len(ns.UnderlayNetworkList)
 
-		dc.VifList = make([]types.VifInfo, olNum+ulNum)
+		dc.VifList = make([]types.VifInfo, ulNum)
 		// Put UL before OL
 		for i, ul := range ns.UnderlayNetworkList {
 			dc.VifList[i] = ul.VifInfo
-		}
-		for i, ol := range ns.OverlayNetworkList {
-			dc.VifList[i+ulNum] = ol.VifInfo
 		}
 	}
 	publishDomainConfig(ctx, &dc)
@@ -134,7 +87,7 @@ func lookupDomainConfig(ctx *zedmanagerContext, key string) *types.DomainConfig 
 	pub := ctx.pubDomainConfig
 	c, _ := pub.Get(key)
 	if c == nil {
-		log.Infof("lookupDomainConfig(%s) not found", key)
+		log.Debugf("lookupDomainConfig(%s) not found", key)
 		return nil
 	}
 	config := c.(types.DomainConfig)
@@ -146,7 +99,7 @@ func lookupDomainStatus(ctx *zedmanagerContext, key string) *types.DomainStatus 
 	sub := ctx.subDomainStatus
 	st, _ := sub.Get(key)
 	if st == nil {
-		log.Infof("lookupDomainStatus(%s) not found", key)
+		log.Debugf("lookupDomainStatus(%s) not found", key)
 		return nil
 	}
 	status := st.(types.DomainStatus)

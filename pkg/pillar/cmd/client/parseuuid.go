@@ -11,10 +11,34 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	eveuuid "github.com/lf-edge/eve/api/go/eveuuid"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
 )
+
+// Return UUID, hardwaremodel, enterprise, and devicename
+func parseUUIDResponse(resp *http.Response, contents []byte) (uuid.UUID, string, string, string, error) {
+	var hardwaremodel string
+	var devUUID uuid.UUID
+	var uuidResponse = &eveuuid.UuidResponse{}
+	err := proto.Unmarshal(contents, uuidResponse)
+	if err != nil {
+		log.Errorf("Unmarshalling uuidResponse failed: %v", err)
+		return devUUID, hardwaremodel, "", "", err
+	}
+	productName := uuidResponse.GetProductName()
+	manufacturer := uuidResponse.GetManufacturer()
+	if manufacturer != "" && productName != "" {
+		hardwaremodel = hardware.FormatModel(manufacturer, productName, "")
+	}
+	uuidStr := strings.TrimSpace(uuidResponse.GetUuid())
+	devUUID, err = uuid.FromString(uuidStr)
+	if err != nil {
+		log.Errorf("uuid.FromString(%s): %s", uuidStr, err)
+		return devUUID, hardwaremodel, "", "", err
+	}
+	return devUUID, hardwaremodel, "", "", err
+}
 
 // Return UUID, hardwaremodel, enterprise, and devicename
 func parseConfig(configUrl string, resp *http.Response, contents []byte) (uuid.UUID, string, string, string, error) {
@@ -23,16 +47,16 @@ func parseConfig(configUrl string, resp *http.Response, contents []byte) (uuid.U
 	var enterprise string
 	var name string
 
-	if err := validateConfigMessage(configUrl, resp); err != nil {
-		log.Errorln("validateConfigMessage: ", err)
-		return devUUID, hardwaremodel, enterprise, name, err
-	}
-
 	if resp.StatusCode == http.StatusNotModified {
 		log.Debugf("StatusNotModified len %d", len(contents))
 		// Return as error since we are not returning any useful values.
 		return devUUID, hardwaremodel, enterprise, name,
 			fmt.Errorf("Unchanged StatusNotModified")
+	}
+
+	if err := validateConfigMessage(configUrl, resp); err != nil {
+		log.Errorln("validateConfigMessage: ", err)
+		return devUUID, hardwaremodel, enterprise, name, err
 	}
 
 	configResponse, err := readConfigResponseProtoMessage(contents)
@@ -114,6 +138,15 @@ func generateConfigRequest() ([]byte, error) {
 	b, err := proto.Marshal(configRequest)
 	if err != nil {
 		log.Errorln(err)
+		return b, err
+	}
+	return b, nil
+}
+
+func generateUUIDRequest() ([]byte, error) {
+	uuidRequest := &eveuuid.UuidRequest{}
+	b, err := proto.Marshal(uuidRequest)
+	if err != nil {
 		return b, err
 	}
 	return b, nil

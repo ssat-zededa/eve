@@ -7,12 +7,16 @@ package pubsub_test
 import (
 	"fmt"
 
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub/socketdriver"
+	"github.com/sirupsen/logrus"
 )
 
 func foo() {
-	driver := socketdriver.SocketDriver{}
-	ps := pubsub.New(&driver)
+	logger := logrus.StandardLogger()
+	log := base.NewSourceLogObject(logger, "test", 1234)
+	driver := socketdriver.SocketDriver{Logger: logger, Log: log}
+	ps := pubsub.New(&driver, logger, log)
 	fmt.Println(ps)
 }

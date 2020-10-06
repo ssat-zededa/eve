@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package socketdriver
 
 import (
@@ -11,9 +14,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+	logutils "github.com/lf-edge/eve/pkg/pillar/utils/logging"
 	"github.com/lf-edge/eve/pkg/pillar/watch"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // Subscriber implementation of `pubsub.DriverSubscriber` for `SocketDriver`.
@@ -27,6 +32,9 @@ type Subscriber struct {
 	topic            string
 	dirName          string
 	C                chan<- pubsub.Change
+	logger           *logrus.Logger
+	log              *base.LogObject
+	doneChan         chan struct{}
 }
 
 // Load load entire persisted data set into a map
@@ -35,12 +43,12 @@ func (s *Subscriber) Load() (map[string][]byte, bool, error) {
 	foundRestarted := false
 	items := make(map[string][]byte)
 
-	log.Debugf("Load(%s)\n", s.name)
+	s.log.Debugf("Load(%s)\n", s.name)
 
 	files, err := ioutil.ReadDir(dirName)
 	if err != nil {
 		// Drive on?
-		log.Error(err)
+		s.log.Error(err)
 		return items, foundRestarted, err
 	}
 	for _, file := range files {
@@ -56,16 +64,16 @@ func (s *Subscriber) Load() (map[string][]byte, bool, error) {
 		statusFile := dirName + "/" + file.Name()
 		if _, err := os.Stat(statusFile); err != nil {
 			// File just vanished!
-			log.Errorf("populate: File disappeared <%s>\n",
+			s.log.Errorf("populate: File disappeared <%s>\n",
 				statusFile)
 			continue
 		}
 
-		log.Debugf("Load found key %s file %s\n", key, statusFile)
+		s.log.Debugf("Load found key %s file %s\n", key, statusFile)
 
 		sb, err := ioutil.ReadFile(statusFile)
 		if err != nil {
-			log.Errorf("Load: %s for %s\n", err, statusFile)
+			s.log.Errorf("Load: %s for %s\n", err, statusFile)
 			continue
 		}
 		items[key] = sb
@@ -85,7 +93,7 @@ func (s *Subscriber) Start() error {
 		for {
 			if _, err := os.Stat(s.dirName); err != nil {
 				errStr := fmt.Sprintf("Subscribe(%s): failed %s; waiting", s.name, err)
-				log.Errorln(errStr)
+				s.log.Errorln(errStr)
 				time.Sleep(10 * time.Second)
 			} else {
 				break
@@ -95,10 +103,17 @@ func (s *Subscriber) Start() error {
 		// format than the standard for pubsub
 		// we pass it through a translator
 		translator := make(chan string)
-		go watch.WatchStatus(s.dirName, true, translator)
+		s.log.Infof("Creating %s at %s", "watch.WatchStatus",
+			logutils.GetMyStack())
+		go watch.WatchStatus(s.log, s.dirName, true, s.doneChan,
+			translator)
+		s.log.Infof("Creating %s at %s", "s.Translate",
+			logutils.GetMyStack())
 		go s.translate(translator, s.C)
 		return nil
 	} else if subscribeFromSock {
+		s.log.Infof("Creating %s at %s", "s.watchSock",
+			logutils.GetMyStack())
 		go s.watchSock()
 		return nil
 	} else {
@@ -107,9 +122,36 @@ func (s *Subscriber) Start() error {
 	}
 }
 
+// Stop the subscriber listening on the given name and topic
+func (s *Subscriber) Stop() error {
+	s.log.Infof("Stop(%s)", s.name)
+	// We handle both subscribeFromDir and subscribeFromSock
+	if s.subscribeFromDir {
+		// Tell watch.WatchStatus to finish and close the translator
+		// channel which in turn will make the translator finish.
+		close(s.doneChan)
+		return nil
+	} else if subscribeFromSock {
+		// Tell watchSock to finish
+		close(s.doneChan)
+		if s.sock != nil {
+			// Force connectAndRead to terminate
+			s.log.Warnf("Stop(%s): forcing socket closed",
+				s.name)
+			s.sock.Close()
+		}
+		return nil
+	} else {
+		errStr := fmt.Sprintf("Subscribe(%s): failed %s",
+			s.name, "nowhere to stop")
+		return errors.New(errStr)
+	}
+}
+
 func (s *Subscriber) watchSock() {
 	for {
 		msg, key, val := s.connectAndRead()
+		maybeLogAllocated(s.log)
 		switch msg {
 		case "hello":
 			// Do nothing
@@ -128,6 +170,9 @@ func (s *Subscriber) watchSock() {
 		case "update":
 			// XXX is size of val any issue? pointer?
 			s.C <- pubsub.Change{Operation: pubsub.Modify, Key: key, Value: val}
+		case "done":
+			s.log.Warnf("watchSock(%s) goroutine exiting", s.name)
+			return
 		}
 	}
 }
@@ -135,10 +180,21 @@ func (s *Subscriber) watchSock() {
 // Returns msg, key, val
 // key and val are base64-encoded
 func (s *Subscriber) connectAndRead() (string, string, []byte) {
-	buf := make([]byte, maxsize+1)
-
+	delay := time.Duration(0)
 	// Waiting for publisher to appear; retry on error
 	for {
+		if areWeDone(s.log, s.doneChan) {
+			s.log.Infof("connectAndRead(%s) done", s.name)
+			return "done", "", nil
+		}
+		if delay != 0 {
+			time.Sleep(delay)
+			delay = time.Duration(0)
+			if areWeDone(s.log, s.doneChan) {
+				s.log.Infof("connectAndRead(%s) done", s.name)
+				return "done", "", nil
+			}
+		}
 		if s.sock == nil {
 			sock, err := net.Dial("unixpacket", s.sockName)
 			if err != nil {
@@ -147,8 +203,8 @@ func (s *Subscriber) connectAndRead() (string, string, []byte) {
 				// During startup and after a publisher has
 				// exited we get these failures; treat
 				// as debug
-				log.Debugln(errStr)
-				time.Sleep(10 * time.Second)
+				s.log.Debugln(errStr)
+				delay = 10 * time.Second
 				continue
 			}
 			s.sock = sock
@@ -157,124 +213,154 @@ func (s *Subscriber) connectAndRead() (string, string, []byte) {
 			if err != nil {
 				errStr := fmt.Sprintf("connectAndRead(%s): sock write failed %s",
 					s.name, err)
-				log.Errorln(errStr)
+				s.log.Errorln(errStr)
 				s.sock.Close()
 				s.sock = nil
 				continue
 			}
 		}
+		if areWeDone(s.log, s.doneChan) {
+			s.log.Infof("connectAndRead(%s) done", s.name)
+			return "done", "", nil
+		}
 
-		res, err := s.sock.Read(buf)
-		if err != nil {
-			errStr := fmt.Sprintf("connectAndRead(%s): sock read failed %s",
+		// wait for readable conn
+		// We close s.sock when we close s.doneChan to make sure
+		// ConnReadCheck unblocks
+		if err := pubsub.ConnReadCheck(s.sock); err != nil {
+			errStr := fmt.Sprintf("connectAndRead(%s) ConnReadCheck failed: %s",
 				s.name, err)
-			log.Errorln(errStr)
+			s.log.Errorln(errStr)
 			s.sock.Close()
 			s.sock = nil
 			continue
 		}
-
-		if res == len(buf) {
-			// Likely truncated
-			// Peer process could have died
-			log.Errorf("connectAndRead(%s) request likely truncated\n", s.name)
+		msg, key, val := s.read()
+		if msg == "" {
 			continue
 		}
-		reply := strings.Split(string(buf[0:res]), " ")
-		count := len(reply)
-		if count < 2 {
-			errStr := fmt.Sprintf("connectAndRead(%s): too short read", s.name)
-			log.Errorln(errStr)
-			continue
+		return msg, key, val
+	}
+}
+
+// Returns msg, key, val
+// key and val are base64-encoded
+// msg is "" if there is nothing to process
+func (s *Subscriber) read() (string, string, []byte) {
+
+	buf, doneFunc := GetBuffer()
+	defer doneFunc()
+
+	res, err := s.sock.Read(buf)
+	if err != nil {
+		errStr := fmt.Sprintf("connectAndRead(%s): sock read failed %s",
+			s.name, err)
+		s.log.Errorln(errStr)
+		s.sock.Close()
+		s.sock = nil
+		return "", "", nil
+	}
+
+	if res == len(buf) {
+		// Likely truncated
+		// Peer process could have died
+		s.log.Errorf("connectAndRead(%s) request likely truncated\n", s.name)
+		return "", "", nil
+	}
+	reply := strings.Split(string(buf[0:res]), " ")
+	count := len(reply)
+	if count < 2 {
+		errStr := fmt.Sprintf("connectAndRead(%s): too short read", s.name)
+		s.log.Errorln(errStr)
+		return "", "", nil
+	}
+	msg := reply[0]
+	t := reply[1]
+
+	if t != s.topic {
+		errStr := fmt.Sprintf("connectAndRead(%s): mismatched topic %s vs. %s for %s", s.name, t, s.topic, msg)
+		s.log.Errorln(errStr)
+		// XXX return "", "", nil?
+	}
+
+	// XXX are there error cases where we should Close and
+	// continue aka reconnect?
+	switch msg {
+	case "hello", "restarted", "complete":
+		s.log.Debugf("connectAndRead(%s) Got message %s type %s\n", s.name, msg, t)
+		return msg, "", nil
+
+	case "delete":
+		if count < 3 {
+			errStr := fmt.Sprintf("connectAndRead(%s): too short delete", s.name)
+			s.log.Errorln(errStr)
+			return "", "", nil
 		}
-		msg := reply[0]
-		t := reply[1]
+		recvKey := reply[2]
 
-		if t != s.topic {
-			errStr := fmt.Sprintf("connectAndRead(%s): mismatched topic %s vs. %s for %s", s.name, t, s.topic, msg)
-			log.Errorln(errStr)
-			// XXX continue
+		key, err := base64.StdEncoding.DecodeString(recvKey)
+		if err != nil {
+			errStr := fmt.Sprintf("connectAndRead(%s): base64 failed %s", s.name, err)
+			s.log.Errorln(errStr)
+			return "", "", nil
 		}
-
-		// XXX are there error cases where we should Close and
-		// continue aka reconnect?
-		switch msg {
-		case "hello", "restarted", "complete":
-			log.Debugf("connectAndRead(%s) Got message %s type %s\n", s.name, msg, t)
-			return msg, "", nil
-
-		case "delete":
-			if count < 3 {
-				errStr := fmt.Sprintf("connectAndRead(%s): too short delete", s.name)
-				log.Errorln(errStr)
-				continue
-			}
-			recvKey := reply[2]
-
-			key, err := base64.StdEncoding.DecodeString(recvKey)
-			if err != nil {
-				errStr := fmt.Sprintf("connectAndRead(%s): base64 failed %s", s.name, err)
-				log.Errorln(errStr)
-				continue
-			}
-			if log.GetLevel() == log.DebugLevel {
-				log.Debugf("connectAndRead(%s): delete type %s key %s\n", s.name, t, string(key))
-			}
-			return msg, string(key), nil
-
-		case "update":
-			if count != 4 {
-				errStr := fmt.Sprintf("connectAndRead(%s): update of %d parts instead of expected 4", s.name, count)
-				log.Errorln(errStr)
-				continue
-			}
-			recvKey := reply[2]
-			recvVal := reply[3]
-			key, err := base64.StdEncoding.DecodeString(recvKey)
-			if err != nil {
-				errStr := fmt.Sprintf("connectAndRead(%s): base64 key failed %s", s.name, err)
-				log.Errorln(errStr)
-				continue
-			}
-			val, err := base64.StdEncoding.DecodeString(recvVal)
-			if err != nil {
-				errStr := fmt.Sprintf("connectAndRead(%s): base64 val failed %s", s.name, err)
-				log.Errorln(errStr)
-				continue
-			}
-			if log.GetLevel() == log.DebugLevel {
-				log.Debugf("connectAndRead(%s): update type %s key %s val %s\n", s.name, t, string(key), string(val))
-			}
-			return msg, string(key), val
-
-		default:
-			errStr := fmt.Sprintf("connectAndRead(%s): unknown message %s", s.name, msg)
-			log.Errorln(errStr)
-			continue
+		if s.logger.GetLevel() == logrus.TraceLevel {
+			s.log.Debugf("connectAndRead(%s): delete type %s key %s\n", s.name, t, string(key))
 		}
+		return msg, string(key), nil
+
+	case "update":
+		if count != 4 {
+			errStr := fmt.Sprintf("connectAndRead(%s): update of %d parts instead of expected 4", s.name, count)
+			s.log.Errorln(errStr)
+			return "", "", nil
+		}
+		recvKey := reply[2]
+		recvVal := reply[3]
+		key, err := base64.StdEncoding.DecodeString(recvKey)
+		if err != nil {
+			errStr := fmt.Sprintf("connectAndRead(%s): base64 key failed %s", s.name, err)
+			s.log.Errorln(errStr)
+			return "", "", nil
+		}
+		val, err := base64.StdEncoding.DecodeString(recvVal)
+		if err != nil {
+			errStr := fmt.Sprintf("connectAndRead(%s): base64 val failed %s", s.name, err)
+			s.log.Errorln(errStr)
+			return "", "", nil
+		}
+		if s.logger.GetLevel() == logrus.TraceLevel {
+			s.log.Debugf("connectAndRead(%s): update type %s key %s val %s\n", s.name, t, string(key), string(val))
+		}
+		return msg, string(key), val
+
+	default:
+		errStr := fmt.Sprintf("connectAndRead(%s): unknown message %s", s.name, msg)
+		s.log.Errorln(errStr)
+		return "", "", nil
 	}
 }
 
 func (s *Subscriber) translate(in <-chan string, out chan<- pubsub.Change) {
 	statusDirName := s.dirName
 	for change := range in {
-		log.Debugf("translate received message '%s'", change)
+		s.log.Debugf("translate received message '%s'", change)
 		operation := string(change[0])
 		fileName := string(change[2:])
 		// Remove .json from name */
 		name := strings.Split(fileName, ".json")
 		switch {
 		case operation == "R":
-			log.Infof("Received restart <%s>\n", fileName)
+			s.log.Infof("Received restart <%s>\n", fileName)
 			// I do not know why, but the "R" operation from the file watcher
 			// historically called the Complete operation, leading to the
 			// "Synchronized" handler being called.
 			out <- pubsub.Change{Operation: pubsub.Create}
 		case operation == "M" && fileName == "restarted":
-			log.Debugf("Found restarted file\n")
+			s.log.Debugf("Found restarted file\n")
 			out <- pubsub.Change{Operation: pubsub.Restart}
 		case !strings.HasSuffix(fileName, ".json"):
-			// log.Debugf("Ignoring file <%s> operation %s\n",
+			// s.log.Debugf("Ignoring file <%s> operation %s\n",
 			//	fileName, operation)
 			continue
 		case operation == "D":
@@ -283,12 +369,14 @@ func (s *Subscriber) translate(in <-chan string, out chan<- pubsub.Change) {
 			statusFile := path.Join(statusDirName, fileName)
 			cb, err := ioutil.ReadFile(statusFile)
 			if err != nil {
-				log.Errorf("%s for %s\n", err, statusFile)
+				s.log.Errorf("%s for %s\n", err, statusFile)
 				continue
 			}
 			out <- pubsub.Change{Operation: pubsub.Modify, Key: name[0], Value: cb}
 		default:
-			log.Fatal("Unknown operation from Watcher: ", operation)
+			s.log.Fatal("Unknown operation from Watcher: ", operation)
 		}
 	}
+	s.log.Warnf("translate goroutine exiting")
+	close(out)
 }

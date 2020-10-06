@@ -49,6 +49,9 @@ type DronaRequest struct {
 	// Filled by Drona, images list
 	imgList []string
 
+	// Filled by Drona, download metadata
+	contentType string
+
 	// Filled by Drona, uploaded blob content length
 	contentLength int64
 
@@ -83,6 +86,8 @@ type DronaRequest struct {
 	UploadID string
 	// generated after uploading the part to the multipart file
 	EtagID string
+	// chunkInfoChan used for communication of chunk details
+	chunkInfoChan chan ChunkData
 }
 
 // Return object local name
@@ -99,14 +104,14 @@ func (req *DronaRequest) GetLocalName() string {
 func (req *DronaRequest) GetDnStatus() error {
 	req.Lock()
 	defer req.Unlock()
-	return fmt.Errorf("Syncer Download Status on %s, Location: %s - error %s",
+	return fmt.Errorf("Syncer Download Status of image name: %s, location: %s - error %s",
 		req.name, req.objloc, req.status)
 }
 
 func (req *DronaRequest) GetUpStatus() (string, error) {
 	req.Lock()
 	defer req.Unlock()
-	return req.objloc, fmt.Errorf("Syncer Upload Status on %s, location: %s "+
+	return req.objloc, fmt.Errorf("Syncer Upload Status of image name: %s, location: %s "+
 		" - error %s", req.name, req.objloc, req.status)
 }
 
@@ -182,6 +187,14 @@ func (req *DronaRequest) GetRemoteFileMD5() string {
 	return req.remoteFileMD5
 }
 
+// GetContentType return the content type if available. If not, return
+// an empty string.
+func (req *DronaRequest) GetContentType() string {
+	req.Lock()
+	defer req.Unlock()
+	return req.contentType
+}
+
 // Update the actual size
 func (req *DronaRequest) updateAsize(size int64) {
 	req.Lock()
@@ -194,6 +207,14 @@ func (req *DronaRequest) updateOsize(size int64) {
 	req.Lock()
 	defer req.Unlock()
 	req.objectSize = size
+}
+
+// GetChunkDetails Return the chunk details
+func (req *DronaRequest) GetChunkDetails() (int64, []byte, bool) {
+	req.Lock()
+	defer req.Unlock()
+	chunkDetails := <-req.chunkInfoChan
+	return chunkDetails.Size, chunkDetails.Chunk, chunkDetails.EOF
 }
 
 // Return the if the object was downloaded with error

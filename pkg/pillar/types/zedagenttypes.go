@@ -4,87 +4,72 @@
 package types
 
 import (
-	"fmt"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
 )
-
-type OsVerParams struct {
-	OSVerKey   string
-	OSVerValue string
-}
 
 // This is what we assume will come from the ZedControl for base OS.
 // Note that we can have different versions  configured for the
 // same UUID, hence the key is the UUIDandVersion  We assume the
-// elements in StorageConfig should be installed, but activation
+// elements in ContentTreeConfig should be installed, but activation
 // is driven by the Activate attribute.
 
 type BaseOsConfig struct {
-	UUIDandVersion    UUIDandVersion
-	BaseOsVersion     string // From GetShortVersion
-	ConfigSha256      string
-	ConfigSignature   string
-	OsParams          []OsVerParams // From GetLongVersion
-	StorageConfigList []StorageConfig
-	RetryCount        int32
-	Activate          bool
+	UUIDandVersion        UUIDandVersion
+	BaseOsVersion         string // From GetShortVersion
+	ContentTreeConfigList []ContentTreeConfig
+	RetryCount            int32
+	Activate              bool
 }
 
 func (config BaseOsConfig) Key() string {
 	return config.UUIDandVersion.UUID.String()
 }
 
-func (config BaseOsConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
 // LogCreate :
-func (config BaseOsConfig) LogCreate() {
-	logObject := base.NewLogObject(base.BaseOsConfigLogType, config.BaseOsVersion,
+func (config BaseOsConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.BaseOsConfigLogType, config.BaseOsVersion,
 		config.UUIDandVersion.UUID, config.LogKey())
 	if logObject == nil {
 		return
 	}
 	logObject.CloneAndAddField("activate", config.Activate).
-		Infof("BaseOs config create")
+		Noticef("BaseOs config create")
 }
 
 // LogModify :
-func (config BaseOsConfig) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.BaseOsConfigLogType, config.BaseOsVersion,
+func (config BaseOsConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.BaseOsConfigLogType, config.BaseOsVersion,
 		config.UUIDandVersion.UUID, config.LogKey())
 
 	oldConfig, ok := old.(BaseOsConfig)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of BaseOsConfig type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of BaseOsConfig type")
 	}
 	if oldConfig.Activate != config.Activate {
 
 		logObject.CloneAndAddField("activate", config.Activate).
 			AddField("old-activate", oldConfig.Activate).
-			Infof("BaseOs config modify")
+			Noticef("BaseOs config modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("BaseOs config modify other change")
 	}
 
 }
 
 // LogDelete :
-func (config BaseOsConfig) LogDelete() {
-	logObject := base.EnsureLogObject(base.BaseOsConfigLogType, config.BaseOsVersion,
+func (config BaseOsConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.BaseOsConfigLogType, config.BaseOsVersion,
 		config.UUIDandVersion.UUID, config.LogKey())
 	logObject.CloneAndAddField("activate", config.Activate).
-		Infof("BaseOs config delete")
+		Noticef("BaseOs config delete")
 
-	base.DeleteLogObject(config.LogKey())
+	base.DeleteLogObject(logBase, config.LogKey())
 }
 
 // LogKey :
@@ -94,18 +79,15 @@ func (config BaseOsConfig) LogKey() string {
 
 // Indexed by UUIDandVersion as above
 type BaseOsStatus struct {
-	UUIDandVersion    UUIDandVersion
-	BaseOsVersion     string
-	ConfigSha256      string
-	Activated         bool
-	Reboot            bool
-	TooEarly          bool // Failed since previous was inprogress/test
-	OsParams          []OsVerParams
-	StorageStatusList []StorageStatus
-	PartitionLabel    string
-	PartitionDevice   string // From zboot
-	PartitionState    string // From zboot
-
+	UUIDandVersion        UUIDandVersion
+	BaseOsVersion         string
+	Activated             bool
+	Reboot                bool
+	TooEarly              bool // Failed since previous was inprogress/test
+	ContentTreeStatusList []ContentTreeStatus
+	PartitionLabel        string
+	PartitionDevice       string // From zboot
+	PartitionState        string // From zboot
 	// Mininum state across all steps/StorageStatus.
 	// Error* set implies error.
 	State SwState
@@ -118,53 +100,35 @@ func (status BaseOsStatus) Key() string {
 	return status.UUIDandVersion.UUID.String()
 }
 
-func (status BaseOsStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-func (status BaseOsStatus) CheckPendingAdd() bool {
-	return false
-}
-
-func (status BaseOsStatus) CheckPendingModify() bool {
-	return false
-}
-
-func (status BaseOsStatus) CheckPendingDelete() bool {
-	return false
-}
-
 // LogCreate :
-func (status BaseOsStatus) LogCreate() {
-	logObject := base.NewLogObject(base.BaseOsStatusLogType, status.BaseOsVersion,
+func (status BaseOsStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.BaseOsStatusLogType, status.BaseOsVersion,
 		status.UUIDandVersion.UUID, status.LogKey())
 	if logObject == nil {
 		return
 	}
 	logObject.CloneAndAddField("state", status.State.String()).
-		Infof("BaseOs status create")
+		Noticef("BaseOs status create")
 }
 
 // LogModify :
-func (status BaseOsStatus) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.BaseOsStatusLogType, status.BaseOsVersion,
+func (status BaseOsStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.BaseOsStatusLogType, status.BaseOsVersion,
 		status.UUIDandVersion.UUID, status.LogKey())
 
 	oldStatus, ok := old.(BaseOsStatus)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of BaseOsStatus type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of BaseOsStatus type")
 	}
 	if oldStatus.State != status.State {
 
 		logObject.CloneAndAddField("state", status.State.String()).
 			AddField("old-state", oldStatus.State.String()).
-			Infof("BaseOs status modify")
+			Noticef("BaseOs status modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+			Noticef("BaseOs status modify other change")
 	}
 
 	if status.HasError() {
@@ -177,111 +141,18 @@ func (status BaseOsStatus) LogModify(old interface{}) {
 }
 
 // LogDelete :
-func (status BaseOsStatus) LogDelete() {
-	logObject := base.EnsureLogObject(base.BaseOsStatusLogType, status.BaseOsVersion,
+func (status BaseOsStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.BaseOsStatusLogType, status.BaseOsVersion,
 		status.UUIDandVersion.UUID, status.LogKey())
 	logObject.CloneAndAddField("state", status.State.String()).
-		Infof("BaseOs status delete")
+		Noticef("BaseOs status delete")
 
-	base.DeleteLogObject(status.LogKey())
+	base.DeleteLogObject(logBase, status.LogKey())
 }
 
 // LogKey :
 func (status BaseOsStatus) LogKey() string {
 	return string(base.BaseOsStatusLogType) + "-" + status.BaseOsVersion
-}
-
-// captures the certificate config currently embeded
-// in Storage config from various objects
-// the UUIDandVersion/Config Sha are just
-// copied from the holder object configuration
-// for indexing
-// XXX shouldn't it be keyed by safename
-type CertObjConfig struct {
-	UUIDandVersion    UUIDandVersion
-	ConfigSha256      string
-	StorageConfigList []StorageConfig
-}
-
-func (config CertObjConfig) Key() string {
-	return config.UUIDandVersion.UUID.String()
-}
-
-func (config CertObjConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-// Indexed by UUIDandVersion as above
-// XXX shouldn't it be keyed by safename
-type CertObjStatus struct {
-	UUIDandVersion    UUIDandVersion
-	ConfigSha256      string
-	StorageStatusList []StorageStatus
-	// Mininum state across all steps/ StorageStatus.
-	// Error* set implies error.
-	State SwState
-	// error strings across all steps/StorageStatus
-	// ErrorAndTime provides SetErrorNow() and ClearError()
-	ErrorAndTime
-}
-
-func (status CertObjStatus) Key() string {
-	return status.UUIDandVersion.UUID.String()
-}
-
-func (status CertObjStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained uuid: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-func (status CertObjStatus) CheckPendingAdd() bool {
-	return false
-}
-
-func (status CertObjStatus) CheckPendingModify() bool {
-	return false
-}
-
-func (status CertObjStatus) CheckPendingDelete() bool {
-	return false
-}
-
-// getCertObjStatus finds a certificate, and returns the status
-// returns three values,
-//  - whether the cert object status is found
-//  - whether the cert object is installed
-//  - any error information
-func (status CertObjStatus) getCertStatus(certURL string) (bool, bool, ErrorAndTime) {
-	for _, certObj := range status.StorageStatusList {
-		if certObj.Name == certURL {
-			installed := true
-			if certObj.HasError() || certObj.State != INSTALLED {
-				installed = false
-			}
-			// An Error in StorageStatus can be from
-			// DownloaderStatus with changing timestamp
-			// from re-trying the download. Carry that to caller.
-			return true, installed, ErrorAndTime{
-				Error:     certObj.Error,
-				ErrorTime: certObj.ErrorTime,
-			}
-		}
-	}
-	return false, false, ErrorAndTime{
-		Error:     fmt.Sprintf("Invalid Certificate %s, not found", certURL),
-		ErrorTime: time.Now(),
-	}
 }
 
 // return value holder
@@ -334,6 +205,44 @@ func (config DatastoreConfig) Key() string {
 	return config.UUID.String()
 }
 
+// LogCreate :
+func (config DatastoreConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.DatastoreConfigLogType, "",
+		config.UUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Noticef("Datastore config create")
+}
+
+// LogModify :
+func (config DatastoreConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.DatastoreConfigLogType, "",
+		config.UUID, config.LogKey())
+
+	oldConfig, ok := old.(DatastoreConfig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of DatastoreConfig type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+		Noticef("Datastore config modify")
+}
+
+// LogDelete :
+func (config DatastoreConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.DatastoreConfigLogType, "",
+		config.UUID, config.LogKey())
+	logObject.Noticef("Datastore config delete")
+
+	base.DeleteLogObject(logBase, config.LogKey())
+}
+
+// LogKey :
+func (config DatastoreConfig) LogKey() string {
+	return string(base.DatastoreConfigLogType) + "-" + config.Key()
+}
+
 // NodeAgentStatus :
 type NodeAgentStatus struct {
 	Name              string
@@ -351,6 +260,44 @@ type NodeAgentStatus struct {
 // Key :
 func (status NodeAgentStatus) Key() string {
 	return status.Name
+}
+
+// LogCreate :
+func (status NodeAgentStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.NodeAgentStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Noticef("Nodeagent status create")
+}
+
+// LogModify :
+func (status NodeAgentStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.NodeAgentStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+
+	oldStatus, ok := old.(NodeAgentStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of NodeAgentStatus type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+		Noticef("Nodeagent status modify")
+}
+
+// LogDelete :
+func (status NodeAgentStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.NodeAgentStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+	logObject.Noticef("Nodeagent status delete")
+
+	base.DeleteLogObject(logBase, status.LogKey())
+}
+
+// LogKey :
+func (status NodeAgentStatus) LogKey() string {
+	return string(base.NodeAgentStatusLogType) + "-" + status.Key()
 }
 
 // ConfigGetStatus : Config Get Status from Controller
@@ -375,6 +322,44 @@ type ZedAgentStatus struct {
 // Key :
 func (status ZedAgentStatus) Key() string {
 	return status.Name
+}
+
+// LogCreate :
+func (status ZedAgentStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.ZedAgentStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Noticef("Zedagent status create")
+}
+
+// LogModify :
+func (status ZedAgentStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.ZedAgentStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+
+	oldStatus, ok := old.(ZedAgentStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of ZedAgentStatus type")
+	}
+	// XXX remove?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+		Noticef("Zedagent status modify")
+}
+
+// LogDelete :
+func (status ZedAgentStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.ZedAgentStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+	logObject.Noticef("Zedagent status delete")
+
+	base.DeleteLogObject(logBase, status.LogKey())
+}
+
+// LogKey :
+func (status ZedAgentStatus) LogKey() string {
+	return string(base.ZedAgentStatusLogType) + "-" + status.Key()
 }
 
 // DeviceOpsCmd - copy of zconfig.DeviceOpsCmd

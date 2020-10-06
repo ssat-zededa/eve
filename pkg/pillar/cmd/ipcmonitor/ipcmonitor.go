@@ -15,6 +15,7 @@
 package ipcmonitor
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -22,14 +23,20 @@ import (
 	"net"
 	"strings"
 
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 var debugOverride bool // From command line arg
 
-func Run(ps *pubsub.PubSub) {
+var logger *logrus.Logger
+var log *base.LogObject
+
+func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
+	logger = loggerArg
+	log = logArg
 	agentNamePtr := flag.String("a", "zedrouter",
 		"Agent name")
 	agentScopePtr := flag.String("s", "", "agentScope")
@@ -37,20 +44,22 @@ func Run(ps *pubsub.PubSub) {
 		"topic")
 	debugPtr := flag.Bool("d", false, "Debug flag")
 	persistentPtr := flag.Bool("P", false, "Persistent flag")
+	formatPtr := flag.String("f", "go", "format flag, defaults to 'go', supports: 'go', 'json'")
 	flag.Parse()
 	agentName := *agentNamePtr
 	agentScope := *agentScopePtr
 	topic := *topicPtr
 	debugOverride = *debugPtr
 	if debugOverride {
-		log.SetLevel(log.DebugLevel)
+		logger.SetLevel(logrus.TraceLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		logger.SetLevel(logrus.InfoLevel)
 	}
 	if *persistentPtr {
 		testPersistent(ps, agentName, agentScope, topic)
-		return
+		return 0
 	}
+	format := *formatPtr
 
 	name := nameString(agentName, agentScope, topic)
 	sockName := fmt.Sprintf("/var/run/%s.sock", name)
@@ -122,12 +131,23 @@ func Run(ps *pubsub.PubSub) {
 				log.Errorf("base64: %s\n", err)
 			}
 
-			var output interface{}
-			if err := json.Unmarshal(val, &output); err != nil {
-				log.Fatal(err, "json Unmarshal")
+			switch format {
+			case "go":
+				var output interface{}
+				if err := json.Unmarshal(val, &output); err != nil {
+					log.Fatal(err, "json Unmarshal")
+				}
+				log.Infof("update type %s key %s val %+v\n",
+					t, key, output)
+			case "json":
+				var out bytes.Buffer
+				if err = json.Indent(&out, val, "", "\t"); err != nil {
+					log.Fatalf("unable to indent json: %v", err)
+				}
+				log.Infof("update type %s key %s: %s\n", t, key, out.String())
+			default:
+				log.Fatalf("unsupported format: %s", format)
 			}
-			log.Infof("update type %s key %s val %+v\n",
-				t, key, output)
 
 		default:
 			log.Errorf("Unknown message: %s\n", msg)
@@ -146,8 +166,9 @@ func nameString(agentname, agentscope, topic string) string {
 func testPersistent(ps *pubsub.PubSub, agentName string, agentScope string, topic string) {
 	ctx := 3
 	sub, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:  agentName,
-		AgentScope: agentScope,
+		AgentName:   agentName,
+		AgentScope:  agentScope,
+		MyAgentName: agentName,
 		// XXX hard-coded; need nameToType ;-)
 		TopicImpl:     types.DevicePortConfigList{},
 		Activate:      false,

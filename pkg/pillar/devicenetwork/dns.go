@@ -5,10 +5,9 @@ package devicenetwork
 
 import (
 	"fmt"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/netclone"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/wrap"
-	log "github.com/sirupsen/logrus"
 	"net"
 	"os"
 	"strconv"
@@ -18,10 +17,10 @@ import (
 // GetDhcpInfo gets info from dhcpcd. Updates Gateway and Subnet
 // XXX set NtpServer once we know what name it has
 // XXX add IPv6 support?
-func GetDhcpInfo(us *types.NetworkPortStatus) {
+func GetDhcpInfo(log *base.LogObject, us *types.NetworkPortStatus) {
 
 	log.Infof("GetDhcpInfo(%s)\n", us.IfName)
-	if us.NetworkXConfig.Dhcp != types.DT_CLIENT {
+	if us.Dhcp != types.DT_CLIENT {
 		return
 	}
 	if strings.HasPrefix(us.IfName, "wwan") {
@@ -30,8 +29,7 @@ func GetDhcpInfo(us *types.NetworkPortStatus) {
 	// XXX get error -1 unless we have -4
 	// XXX add IPv6 support
 	log.Infof("Calling dhcpcd -U -4 %s\n", us.IfName)
-	cmd := wrap.Command("dhcpcd", "-U", "-4", us.IfName)
-	stdoutStderr, err := cmd.CombinedOutput()
+	stdoutStderr, err := base.Exec(log, "dhcpcd", "-U", "-4", us.IfName).CombinedOutput()
 	if err != nil {
 		errStr := fmt.Sprintf("dhcpcd -U failed %s: %s",
 			string(stdoutStderr), err)
@@ -49,17 +47,6 @@ func GetDhcpInfo(us *types.NetworkPortStatus) {
 		}
 		log.Debugf("Got <%s> <%s>\n", items[0], items[1])
 		switch items[0] {
-		case "routers":
-			routers := trimQuotes(items[1])
-			log.Infof("GetDhcpInfo(%s) Gateway %s\n", us.IfName,
-				routers)
-			// XXX multiple? How separated?
-			ip := net.ParseIP(routers)
-			if ip == nil {
-				log.Errorf("Failed to parse %s\n", routers)
-				continue
-			}
-			us.NetworkXConfig.Gateway = ip
 		case "network_number":
 			network := trimQuotes(items[1])
 			log.Infof("GetDhcpInfo(%s) network_number %s\n", us.IfName,
@@ -81,14 +68,14 @@ func GetDhcpInfo(us *types.NetworkPortStatus) {
 			}
 		}
 	}
-	us.NetworkXConfig.Subnet = net.IPNet{IP: subnet, Mask: net.CIDRMask(masklen, 32)}
+	us.Subnet = net.IPNet{IP: subnet, Mask: net.CIDRMask(masklen, 32)}
 }
 
 // GetDNSInfo gets DNS info from /run files. Updates DomainName and DnsServers
-func GetDNSInfo(us *types.NetworkPortStatus) {
+func GetDNSInfo(log *base.LogObject, us *types.NetworkPortStatus) {
 
 	log.Infof("GetDNSInfo(%s)\n", us.IfName)
-	if us.NetworkXConfig.Dhcp != types.DT_CLIENT {
+	if us.Dhcp != types.DT_CLIENT {
 		return
 	}
 	filename := IfnameToResolvConf(us.IfName)
@@ -106,11 +93,11 @@ func GetDNSInfo(us *types.NetworkPortStatus) {
 			log.Errorf("Failed to parse %s\n", server)
 			continue
 		}
-		us.NetworkXConfig.DnsServers = append(us.NetworkXConfig.DnsServers, ip)
+		us.DNSServers = append(us.DNSServers, ip)
 	}
 	// XXX just pick first since have one DomainName slot
 	for _, dn := range dc.Search {
-		us.NetworkXConfig.DomainName = dn
+		us.DomainName = dn
 		break
 	}
 }

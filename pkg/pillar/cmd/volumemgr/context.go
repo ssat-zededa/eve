@@ -8,7 +8,6 @@ import (
 
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 )
 
 func (ctx *volumemgrContext) subscription(topicType interface{}, objType string) pubsub.Subscription {
@@ -18,44 +17,12 @@ func (ctx *volumemgrContext) subscription(topicType interface{}, objType string)
 		log.Fatalf("subscription got a pointer type: %T", topicType)
 	}
 	switch typeName := topicType.(type) {
-	case types.VolumeConfig:
+	case types.ContentTreeConfig:
 		switch objType {
 		case types.AppImgObj:
-			sub = ctx.subAppVolumeConfig
+			sub = ctx.subContentTreeConfig
 		case types.BaseOsObj:
-			sub = ctx.subBaseOsVolumeConfig
-		default:
-			log.Fatalf("subscription: Unknown ObjType %s for %T",
-				objType, typeName)
-		}
-	case types.DownloaderStatus:
-		switch objType {
-		case types.AppImgObj:
-			sub = ctx.subAppImgDownloadStatus
-		case types.BaseOsObj:
-			sub = ctx.subBaseOsDownloadStatus
-		case types.CertObj:
-			sub = ctx.subCertObjDownloadStatus
-		default:
-			log.Fatalf("subscription: Unknown ObjType %s for %T",
-				objType, typeName)
-		}
-	case types.VerifyImageStatus:
-		switch objType {
-		case types.AppImgObj:
-			sub = ctx.subAppImgVerifierStatus
-		case types.BaseOsObj:
-			sub = ctx.subBaseOsVerifierStatus
-		default:
-			log.Fatalf("subscription: Unknown ObjType %s for %T",
-				objType, typeName)
-		}
-	case types.PersistImageStatus:
-		switch objType {
-		case types.AppImgObj:
-			sub = ctx.subAppImgPersistStatus
-		case types.BaseOsObj:
-			sub = ctx.subBaseOsPersistStatus
+			sub = ctx.subBaseOsContentTreeConfig
 		default:
 			log.Fatalf("subscription: Unknown ObjType %s for %T",
 				objType, typeName)
@@ -74,46 +41,12 @@ func (ctx *volumemgrContext) publication(topicType interface{}, objType string) 
 		log.Fatalf("publication got a pointer type: %T", topicType)
 	}
 	switch typeName := topicType.(type) {
-	case types.VolumeStatus:
+	case types.ContentTreeStatus:
 		switch objType {
 		case types.AppImgObj:
-			pub = ctx.pubAppVolumeStatus
+			pub = ctx.pubContentTreeStatus
 		case types.BaseOsObj:
-			pub = ctx.pubBaseOsVolumeStatus
-		case types.UnknownObj:
-			pub = ctx.pubUnknownVolumeStatus
-		default:
-			log.Fatalf("publication: Unknown ObjType %s for %T",
-				objType, typeName)
-		}
-	case types.DownloaderConfig:
-		switch objType {
-		case types.AppImgObj:
-			pub = ctx.pubAppImgDownloadConfig
-		case types.BaseOsObj:
-			pub = ctx.pubBaseOsDownloadConfig
-		case types.CertObj:
-			pub = ctx.pubCertObjDownloadConfig
-		default:
-			log.Fatalf("publication: Unknown ObjType %s for %T",
-				objType, typeName)
-		}
-	case types.VerifyImageConfig:
-		switch objType {
-		case types.AppImgObj:
-			pub = ctx.pubAppImgVerifierConfig
-		case types.BaseOsObj:
-			pub = ctx.pubBaseOsVerifierConfig
-		default:
-			log.Fatalf("publication: Unknown ObjType %s for %T",
-				objType, typeName)
-		}
-	case types.PersistImageConfig:
-		switch objType {
-		case types.AppImgObj:
-			pub = ctx.pubAppImgPersistConfig
-		case types.BaseOsObj:
-			pub = ctx.pubBaseOsPersistConfig
+			pub = ctx.pubBaseOsContentTreeStatus
 		default:
 			log.Fatalf("publication: Unknown ObjType %s for %T",
 				objType, typeName)

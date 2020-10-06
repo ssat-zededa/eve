@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
+	"github.com/lf-edge/eve/pkg/pillar/worker"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -32,42 +34,47 @@ const (
 var Version = "No version specified"
 
 type baseOsMgrContext struct {
-	pubBaseOsStatus pubsub.Publication
-	pubVolumeConfig pubsub.Publication
-	pubZbootStatus  pubsub.Publication
+	pubBaseOsStatus      pubsub.Publication
+	pubContentTreeConfig pubsub.Publication
+	pubZbootStatus       pubsub.Publication
 
-	subGlobalConfig    pubsub.Subscription
-	globalConfig       *types.ConfigItemValueMap
-	GCInitialized      bool
-	subBaseOsConfig    pubsub.Subscription
-	subZbootConfig     pubsub.Subscription
-	subVolumeStatus    pubsub.Subscription
-	subNodeAgentStatus pubsub.Subscription
-	rebootReason       string    // From last reboot
-	rebootTime         time.Time // From last reboot
-	rebootImage        string    // Image from which the last reboot happened
+	subGlobalConfig      pubsub.Subscription
+	globalConfig         *types.ConfigItemValueMap
+	GCInitialized        bool
+	subBaseOsConfig      pubsub.Subscription
+	subZbootConfig       pubsub.Subscription
+	subContentTreeStatus pubsub.Subscription
+	subNodeAgentStatus   pubsub.Subscription
+	rebootReason         string    // From last reboot
+	rebootTime           time.Time // From last reboot
+	rebootImage          string    // Image from which the last reboot happened
+
+	worker *worker.Worker // For background work
 }
 
 var debug = false
 var debugOverride bool // From command line arg
+var logger *logrus.Logger
+var log *base.LogObject
 
-func Run(ps *pubsub.PubSub) {
+func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
+	logger = loggerArg
+	log = logArg
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
 	if debugOverride {
-		log.SetLevel(log.DebugLevel)
+		logger.SetLevel(logrus.TraceLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		logger.SetLevel(logrus.InfoLevel)
 	}
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
-		return
+		return 0
 	}
-	agentlog.Init(agentName)
-	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
+	if err := pidfile.CheckAndCreatePidfile(log, agentName); err != nil {
 		log.Fatal(err)
 	}
 
@@ -75,7 +82,7 @@ func Run(ps *pubsub.PubSub) {
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
-	agentlog.StillRunning(agentName, warningTime, errorTime)
+	ps.StillRunning(agentName, warningTime, errorTime)
 
 	// Context to pass around
 	ctx := baseOsMgrContext{
@@ -91,8 +98,11 @@ func Run(ps *pubsub.PubSub) {
 	initializeZedagentHandles(ps, &ctx)
 	initializeVolumemgrHandles(ps, &ctx)
 
-	// publish zboot partition status
-	publishZbootPartitionStatusAll(&ctx)
+	// publish initial zboot partition status
+	updateAndPublishZbootStatusAll(&ctx)
+
+	// for background work
+	ctx.worker = worker.NewWorker(log, WorkerHandler, ctx, 5)
 
 	// report other agents, about, zboot status availability
 	ctx.pubZbootStatus.SignalRestarted()
@@ -105,7 +115,7 @@ func Run(ps *pubsub.PubSub) {
 			ctx.subGlobalConfig.ProcessChange(change)
 		case <-stillRunning.C:
 		}
-		agentlog.StillRunning(agentName, warningTime, errorTime)
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 	log.Infof("processed GlobalConfig")
 
@@ -121,15 +131,18 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-ctx.subZbootConfig.MsgChan():
 			ctx.subZbootConfig.ProcessChange(change)
 
-		case change := <-ctx.subVolumeStatus.MsgChan():
-			ctx.subVolumeStatus.ProcessChange(change)
+		case change := <-ctx.subContentTreeStatus.MsgChan():
+			ctx.subContentTreeStatus.ProcessChange(change)
 
 		case change := <-ctx.subNodeAgentStatus.MsgChan():
 			ctx.subNodeAgentStatus.ProcessChange(change)
 
+		case res := <-ctx.worker.MsgChan():
+			HandleWorkResult(&ctx, ctx.worker.Process(res))
+
 		case <-stillRunning.C:
 		}
-		agentlog.StillRunning(agentName, warningTime, errorTime)
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 }
 
@@ -156,15 +169,15 @@ func handleBaseOsCreate(ctxArg interface{}, key string, configArg interface{}) {
 	status := types.BaseOsStatus{
 		UUIDandVersion: config.UUIDandVersion,
 		BaseOsVersion:  config.BaseOsVersion,
-		ConfigSha256:   config.ConfigSha256,
 	}
 
-	status.StorageStatusList = make([]types.StorageStatus,
-		len(config.StorageConfigList))
+	status.ContentTreeStatusList = make([]types.ContentTreeStatus,
+		len(config.ContentTreeConfigList))
 
-	for i, sc := range config.StorageConfigList {
-		ss := &status.StorageStatusList[i]
-		ss.UpdateFromStorageConfig(sc)
+	for i, ctc := range config.ContentTreeConfigList {
+		cts := &status.ContentTreeStatusList[i]
+		cts.UpdateFromContentTreeConfig(ctc)
+		cts.ObjType = types.BaseOsObj
 	}
 	// Check image count
 	err := validateBaseOsConfig(ctx, config)
@@ -229,8 +242,8 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 		return
 	}
 	var gcp *types.ConfigItemValueMap
-	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, gcp = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	if gcp != nil {
 		ctx.globalConfig = gcp
 		ctx.GCInitialized = true
@@ -247,8 +260,8 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigDelete for %s", key)
-	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, _ = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	*ctx.globalConfig = *types.DefaultConfigItemValueMap()
 	log.Infof("handleGlobalConfigDelete done for %s", key)
 }
@@ -265,16 +278,15 @@ func initializeSelfPublishHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
 	pubBaseOsStatus.ClearRestarted()
 	ctx.pubBaseOsStatus = pubBaseOsStatus
 
-	pubVolumeConfig, err := ps.NewPublication(
+	pubContentTreeConfig, err := ps.NewPublication(
 		pubsub.PublicationOptions{
-			AgentName:  agentName,
-			AgentScope: types.BaseOsObj,
-			TopicType:  types.VolumeConfig{},
+			AgentName: agentName,
+			TopicType: types.ContentTreeConfig{},
 		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	ctx.pubVolumeConfig = pubVolumeConfig
+	ctx.pubContentTreeConfig = pubContentTreeConfig
 
 	pubZbootStatus, err := ps.NewPublication(
 		pubsub.PublicationOptions{
@@ -294,6 +306,7 @@ func initializeGlobalConfigHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
 	subGlobalConfig, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "",
+			MyAgentName:   agentName,
 			TopicImpl:     types.ConfigItemValueMap{},
 			Activate:      false,
 			Ctx:           ctx,
@@ -315,6 +328,7 @@ func initializeNodeAgentHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
 	subNodeAgentStatus, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "nodeagent",
+			MyAgentName:   agentName,
 			TopicImpl:     types.NodeAgentStatus{},
 			Activate:      false,
 			Ctx:           ctx,
@@ -333,6 +347,7 @@ func initializeNodeAgentHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
 	subZbootConfig, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "nodeagent",
+			MyAgentName:   agentName,
 			TopicImpl:     types.ZbootConfig{},
 			Activate:      false,
 			Ctx:           ctx,
@@ -354,6 +369,7 @@ func initializeZedagentHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
 	subBaseOsConfig, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "zedagent",
+			MyAgentName:   agentName,
 			TopicImpl:     types.BaseOsConfig{},
 			Activate:      false,
 			Ctx:           ctx,
@@ -371,25 +387,26 @@ func initializeZedagentHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
 }
 
 func initializeVolumemgrHandles(ps *pubsub.PubSub, ctx *baseOsMgrContext) {
-	// Look for BaseOs VolumeStatus from volumemgr
-	subVolumeStatus, err := ps.NewSubscription(
+	// Look for BaseOs OldVolumeStatus from volumemgr
+	subContentTreeStatus, err := ps.NewSubscription(
 		pubsub.SubscriptionOptions{
 			AgentName:     "volumemgr",
+			MyAgentName:   agentName,
 			AgentScope:    types.BaseOsObj,
-			TopicImpl:     types.VolumeStatus{},
+			TopicImpl:     types.ContentTreeStatus{},
 			Activate:      false,
 			Ctx:           ctx,
-			CreateHandler: handleVolumeStatusModify,
-			ModifyHandler: handleVolumeStatusModify,
-			DeleteHandler: handleVolumeStatusDelete,
+			CreateHandler: handleContentTreeStatusModify,
+			ModifyHandler: handleContentTreeStatusModify,
+			DeleteHandler: handleContentTreeStatusDelete,
 			WarningTime:   warningTime,
 			ErrorTime:     errorTime,
 		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	ctx.subVolumeStatus = subVolumeStatus
-	subVolumeStatus.Activate()
+	ctx.subContentTreeStatus = subContentTreeStatus
+	subContentTreeStatus.Activate()
 }
 
 // This handles both the create and modify events

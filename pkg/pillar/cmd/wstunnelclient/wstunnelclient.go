@@ -14,12 +14,13 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -53,24 +54,27 @@ type wstunnelclientContext struct {
 
 var debug = false
 var debugOverride bool // From command line arg
+var logger *logrus.Logger
+var log *base.LogObject
 
-func Run(ps *pubsub.PubSub) {
+func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
+	logger = loggerArg
+	log = logArg
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
 	if debugOverride {
-		log.SetLevel(log.DebugLevel)
+		logger.SetLevel(logrus.TraceLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		logger.SetLevel(logrus.InfoLevel)
 	}
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
-		return
+		return 0
 	}
-	agentlog.Init(agentName)
-	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
+	if err := pidfile.CheckAndCreatePidfile(log, agentName); err != nil {
 		log.Fatal(err)
 	}
 
@@ -78,7 +82,7 @@ func Run(ps *pubsub.PubSub) {
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
-	agentlog.StillRunning(agentName, warningTime, errorTime)
+	ps.StillRunning(agentName, warningTime, errorTime)
 
 	DNSctx := DNSContext{
 		deviceNetworkStatus: &types.DeviceNetworkStatus{},
@@ -89,6 +93,7 @@ func Run(ps *pubsub.PubSub) {
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "",
+		MyAgentName:   agentName,
 		TopicImpl:     types.ConfigItemValueMap{},
 		Activate:      false,
 		Ctx:           &wscCtx,
@@ -106,6 +111,7 @@ func Run(ps *pubsub.PubSub) {
 
 	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "nim",
+		MyAgentName:   agentName,
 		TopicImpl:     types.DeviceNetworkStatus{},
 		Activate:      false,
 		Ctx:           &DNSctx,
@@ -125,6 +131,7 @@ func Run(ps *pubsub.PubSub) {
 	// XXX is it better to look for AppInstanceStatus from zedmanager?
 	subAppInstanceConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "zedagent",
+		MyAgentName:   agentName,
 		TopicImpl:     types.AppInstanceConfig{},
 		Activate:      false,
 		Ctx:           &wscCtx,
@@ -169,7 +176,7 @@ func Run(ps *pubsub.PubSub) {
 			subGlobalConfig.ProcessChange(change)
 		case <-stillRunning.C:
 		}
-		agentlog.StillRunning(agentName, warningTime, errorTime)
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 	log.Infof("processed GlobalConfig")
 
@@ -199,7 +206,7 @@ func Run(ps *pubsub.PubSub) {
 
 		case <-stillRunning.C:
 		}
-		agentlog.StillRunning(agentName, warningTime, errorTime)
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 }
 
@@ -214,8 +221,8 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 	}
 	log.Infof("handleGlobalConfigModify for %s\n", key)
 	var gcp *types.ConfigItemValueMap
-	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, gcp = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	if gcp != nil {
 		ctx.GCInitialized = true
 	}
@@ -231,8 +238,8 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigDelete for %s\n", key)
-	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, _ = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	log.Infof("handleGlobalConfigDelete done for %s\n", key)
 }
 
@@ -246,8 +253,8 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 		return
 	}
 	log.Infof("handleDNSModify for %s\n", key)
-	// XXX empty is equal?
-	if cmp.Equal(*ctx.deviceNetworkStatus, status) {
+	// Ignore test status and timestamps
+	if ctx.deviceNetworkStatus.MostlyEqual(status) {
 		log.Infof("handleDNSModify no change\n")
 		ctx.DNSinitialized = true
 		return
@@ -336,7 +343,7 @@ func scanAIConfigs(ctx *wstunnelclientContext) {
 				ifname)
 			continue
 		}
-		wstunnelclient := zedcloud.InitializeTunnelClient(ctx.serverNameAndPort, "localhost:4822")
+		wstunnelclient := zedcloud.InitializeTunnelClient(log, ctx.serverNameAndPort, "localhost:4822")
 		destURL := wstunnelclient.Tunnel
 
 		addrCount := types.CountLocalAddrAnyNoLinkLocalIf(*deviceNetworkStatus, ifname)
@@ -359,7 +366,7 @@ func scanAIConfigs(ctx *wstunnelclientContext) {
 				continue
 			}
 
-			proxyURL, _ := zedcloud.LookupProxy(deviceNetworkStatus,
+			proxyURL, _ := zedcloud.LookupProxy(log, deviceNetworkStatus,
 				ifname, destURL)
 			if err := wstunnelclient.TestConnection(deviceNetworkStatus, proxyURL, localAddr, ctx.devUUID); err != nil {
 				log.Info(err)

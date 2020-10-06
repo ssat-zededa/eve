@@ -5,6 +5,7 @@ syntax = "proto3";
 
 import "evecommon/evecommon.proto";
 
+package org.lfedge.eve.auth;
 option go_package  = "github.com/lf-edge/eve/api/go/auth";
 option java_package = "org.lfedge.eve.auth";
 
@@ -14,7 +15,7 @@ message AuthBody {
 }
 
 message AuthContainer {
-  AuthBody authPayload = 1;      // envolope body, a marshalled protobuf data or it can be null
+  AuthBody protectedPayload = 1;      // envolope body, a marshalled protobuf data or it can be null
   // if the length of senderCertHash received is not N bytes, as described in hashAlgorithm, then the protobuf
   // message either is not AuthContainer type, or is corrupted. Otherwise, the
   // reciever may not have the sender's signing certificate

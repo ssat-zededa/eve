@@ -5,6 +5,7 @@ syntax = "proto3";
 
 import "evecommon/devmodelcommon.proto";
 
+package org.lfedge.eve.config;
 option go_package  = "github.com/lf-edge/eve/api/go/config";
 option java_package = "org.lfedge.eve.config";
 
@@ -134,6 +135,7 @@ message PhysicalIO {
   //    separated list of integers or even a range of integers. Hence using
   //    a string to address this.
   // "ioports": the address is a string such as "2f8-2ff"
+  // "usbaddr": the address is a USB of the form of "1:2.3"
   // If the type is PhyIoNet*, then there needs to be an "ifname" physaddr.
   map <string, string> phyaddrs = 3;
 

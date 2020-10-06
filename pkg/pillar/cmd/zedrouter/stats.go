@@ -8,13 +8,14 @@ package zedrouter
 import (
 	"encoding/json"
 	"errors"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 type ipSecCmdOut struct {
@@ -33,8 +34,7 @@ type readBlock struct {
 }
 
 func ipSecStatusCmdGet(vpnStatus *types.VpnStatus) error {
-	cmd := exec.Command("ipsec", "statusall")
-	bytes, err := cmd.Output()
+	bytes, err := base.Exec(log, "ipsec", "statusall").Output()
 	if err != nil {
 		log.Errorf("%s for %s statusall\n", err.Error(), "ipsec")
 		return err
@@ -49,8 +49,7 @@ func ipSecStatusCmdGet(vpnStatus *types.VpnStatus) error {
 }
 
 func swanCtlCmdGet(vpnStatus *types.VpnStatus) error {
-	cmd := exec.Command("swanctl", "-l")
-	bytes, err := cmd.Output()
+	bytes, err := base.Exec(log, "swanctl", "-l").Output()
 	if err != nil {
 		log.Errorf("%s for %s -l\n", err.Error(), "swanctl")
 		return err
@@ -164,7 +163,7 @@ func swanCtlCmdParse(vpnStatus *types.VpnStatus, outStr string) uint32 {
 		connInfo := populateConnInfo(cblock, outLines)
 		vpnStatus.ActiveVpnConns[idx] = connInfo
 	}
-	if log.GetLevel() == log.DebugLevel {
+	if logrus.GetLevel() == logrus.TraceLevel {
 		if bytes, err := json.Marshal(vpnStatus); err == nil {
 			log.Debugf("swanCtlCmdParse(): %s\n", string(bytes))
 		}
@@ -254,7 +253,7 @@ func swanCtlCmdGetBlockInfo(cmdOut *readBlock, outLines []string) {
 			cblock.childBlocks[lidx-1].endLine = cblock.endLine
 		}
 	}
-	if log.GetLevel() == log.DebugLevel {
+	if logrus.GetLevel() == logrus.TraceLevel {
 		swanCtlCmdOutPrint(cmdOut, 0)
 	}
 }

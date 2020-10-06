@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 type testEntry struct {
@@ -49,6 +50,7 @@ func newConfigItemValueMap() types.ConfigItemValueMap {
 		types.TS_ENABLED)
 	config.SetGlobalValueString(types.DefaultLogLevel, "warn")
 	config.SetAgentSettingStringValue("zedagent", types.LogLevel, "debug")
+
 	config.SetAgentSettingStringValue("zedagent", types.RemoteLogLevel, "crit")
 	return *config
 }
@@ -99,9 +101,13 @@ func checkNoDir(t *testing.T, dir string) {
 }
 
 func ucContextForTest() *ucContext {
-	//log.SetLevel(log.DebugLevel)
+	//log.SetLevel(log.TraceLevel)
 	var err error
 	ctxPtr := &ucContext{}
+	ctxPtr.persistDir, err = ioutil.TempDir(".", "PersistDir")
+	if err != nil {
+		log.Fatalf("Failed to create persistDir. err: %s", err)
+	}
 	ctxPtr.persistConfigDir, err = ioutil.TempDir(".", "Converter")
 	if err != nil {
 		log.Fatalf("Failed to create persistConfigDir. err: %s", err)
@@ -114,6 +120,8 @@ func ucContextForTest() *ucContext {
 }
 
 func ucContextCleanupDirs(ctxPtr *ucContext) {
+	os.RemoveAll(ctxPtr.persistDir)
+	ctxPtr.persistDir = ""
 	os.RemoveAll(ctxPtr.persistConfigDir)
 	ctxPtr.persistConfigDir = ""
 	os.RemoveAll(ctxPtr.varTmpDir)
@@ -121,6 +129,7 @@ func ucContextCleanupDirs(ctxPtr *ucContext) {
 }
 
 func runTestMatrix(t *testing.T, testMatrix map[string]testEntry) {
+	log = base.NewSourceLogObject(logrus.StandardLogger(), "domainmgr", 0)
 	oldConfig := oldGlobalConfig()
 	newConfig := newConfigItemValueMap()
 

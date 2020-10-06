@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
@@ -14,7 +17,6 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zedUpload"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
-	log "github.com/sirupsen/logrus"
 )
 
 // Drona APIs for object Download
@@ -22,17 +24,12 @@ func handleSyncOp(ctx *downloaderContext, key string,
 	config types.DownloaderConfig, status *types.DownloaderStatus,
 	dst *types.DatastoreConfig) {
 	var (
-		err                                                              error
-		errStr, locFilename, locDirname, filename, remoteName, serverURL string
-		syncOp                                                           zedUpload.SyncOpType = zedUpload.SyncOpDownload
-		trType                                                           zedUpload.SyncTransportType
-		auth                                                             *zedUpload.AuthInput
+		err                                                    error
+		errStr, locFilename, locDirname, remoteName, serverURL string
+		syncOp                                                 zedUpload.SyncOpType = zedUpload.SyncOpDownload
+		trType                                                 zedUpload.SyncTransportType
+		auth                                                   *zedUpload.AuthInput
 	)
-
-	if status.ObjType == "" {
-		log.Fatalf("handleSyncOp: No ObjType for %s",
-			status.ImageID)
-	}
 
 	// the target filename, where to place the download, is provided in config.
 	// downloader has two options:
@@ -44,7 +41,6 @@ func handleSyncOp(ctx *downloaderContext, key string,
 	// As of this writing, the file is downloaded directly to `config.Target`
 	locFilename = config.Target
 	locDirname = path.Dir(locFilename)
-	filename = path.Base(locFilename)
 
 	// construct the datastore context
 	dsCtx, err := constructDatastoreContext(ctx, config.Name, config.NameIsURL, *dst)
@@ -115,8 +111,10 @@ func handleSyncOp(ctx *downloaderContext, key string,
 		}
 		trType = zedUpload.SyncAwsTr
 		serverURL = dsCtx.DownloadURL
-		remoteName = filename
-		metricsUrl = fmt.Sprintf("S3:%s/%s", dsCtx.Dpath, filename)
+		// pass in the config.Name instead of 'filename' which
+		// does not contain the prefix of the relative path with '/'s
+		remoteName = config.Name
+		metricsUrl = fmt.Sprintf("S3:%s/%s", dsCtx.Dpath, config.Name)
 
 	case zconfig.DsType_DsAzureBlob.String():
 		auth = &zedUpload.AuthInput{
@@ -200,7 +198,8 @@ func handleSyncOp(ctx *downloaderContext, key string,
 			ctx:    ctx,
 			status: status,
 		}
-		err = download(ctx, trType, st, syncOp, serverURL, auth,
+		downloadStartTime := time.Now()
+		contentType, err := download(ctx, trType, st, syncOp, serverURL, auth,
 			dsCtx.Dpath, dsCtx.Region,
 			config.Size, ifname, ipSrc, remoteName, locFilename)
 		if err != nil {
@@ -216,8 +215,11 @@ func handleSyncOp(ctx *downloaderContext, key string,
 		} else {
 			size = info.Size()
 		}
-		zedcloud.ZedCloudSuccess(ifname,
-			metricsUrl, 1024, size)
+		downloadTime := int64(time.Since(downloadStartTime) / time.Millisecond)
+		status.Size = uint64(size)
+		status.ContentType = contentType
+		zedcloud.ZedCloudSuccess(log, ifname,
+			metricsUrl, 1024, size, downloadTime)
 		handleSyncOpResponse(ctx, config, status,
 			locFilename, key, "")
 		return
@@ -245,11 +247,6 @@ func handleSyncOpResponse(ctx *downloaderContext, config types.DownloaderConfig,
 	// have finished the download operation
 	// based on the result, perform some storage
 	// management also
-
-	if status.ObjType == "" {
-		log.Fatalf("handleSyncOpResponse: No ObjType for %s",
-			status.ImageID)
-	}
 
 	if errStr != "" {
 		// Delete file, and update the storage
@@ -321,7 +318,7 @@ func constructDatastoreContext(ctx *downloaderContext, configName string, NameIs
 
 func sourceFailureError(ip, ifname, url string, err error) {
 	log.Errorf("Source IP %s failed: %s", ip, err)
-	zedcloud.ZedCloudFailure(ifname, url, 1024, 0, false)
+	zedcloud.ZedCloudFailure(log, ifname, url, 1024, 0, false)
 }
 
 func getDatastoreCredential(ctx *downloaderContext,
@@ -335,6 +332,16 @@ func getDatastoreCredential(ctx *downloaderContext,
 				dst.Key(), err)
 			decBlock.DsAPIKey = dst.ApiKey
 			decBlock.DsPassword = dst.Password
+			// We assume IsCipher is only set when there was some
+			// data. Hence this is a fallback if there is
+			// some cleartext.
+			if decBlock.DsAPIKey != "" || decBlock.DsPassword != "" {
+				cipher.RecordFailure(agentName,
+					types.CleartextFallback)
+			} else {
+				cipher.RecordFailure(agentName,
+					types.MissingFallback)
+			}
 			return decBlock, nil
 		}
 		log.Infof("%s, datastore config cipherblock decryption successful", dst.Key())
@@ -344,5 +351,10 @@ func getDatastoreCredential(ctx *downloaderContext,
 	decBlock := types.EncryptionBlock{}
 	decBlock.DsAPIKey = dst.ApiKey
 	decBlock.DsPassword = dst.Password
+	if decBlock.DsAPIKey != "" || decBlock.DsPassword != "" {
+		cipher.RecordFailure(agentName, types.NoCipher)
+	} else {
+		cipher.RecordFailure(agentName, types.NoData)
+	}
 	return decBlock, nil
 }

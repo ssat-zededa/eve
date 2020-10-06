@@ -3,6 +3,7 @@
 
 syntax = "proto3";
 
+package org.lfedge.eve.config;
 option go_package  = "github.com/lf-edge/eve/api/go/config";
 option java_package = "org.lfedge.eve.config";
 
@@ -11,7 +12,6 @@ import "config/appconfig.proto";
 import "config/baseosconfig.proto";
 import "config/devcommon.proto";
 import "config/devmodel.proto";
-import "config/mesh.proto";
 import "config/netconfig.proto";
 import "config/netinst.proto";
 import "config/storage.proto";
@@ -32,7 +32,7 @@ message EdgeDevConfig {
   repeated NetworkConfig networks = 5;
   repeated DatastoreConfig datastores = 6;
 
-  DeviceLispDetails lispInfo = 7;
+  // deprecated 7; DeviceLispDetails lispInfo = 7
   repeated BaseOSConfig base = 8;        // BaseOSImage config block
   DeviceOpsCmd reboot = 9;
   DeviceOpsCmd backup = 10;
@@ -68,10 +68,19 @@ message EdgeDevConfig {
   // Application instances will refer to the volumes.
   repeated ContentTree contentInfo = 20;
   repeated Volume volumes = 21;
+
+  // This field is used by the device to detect when it needs to re-download
+  // the controller certs using the /certs API endpoint.
+  // The controller just needs to ensure this value changes when it wants the
+  // device to re-fetch the controller certs, for instance by having it
+  // be a hash of all of the controller certificates.
+  string controllercert_confighash = 22;
+  // deprecated 23;
 }
 
 message ConfigRequest {
   string configHash = 1;
+  bytes  integrity_token = 2; // value provided by controller during remote attestation
 }
 
 message ConfigResponse {

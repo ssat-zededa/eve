@@ -1,4 +1,4 @@
-// Copyright (c) 2018, Google Inc. All rights reserved.
+// Copyright (c) 2018, Google LLC All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,30 @@
 package tpm2
 
 import (
+	"crypto"
 	"crypto/elliptic"
-	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/sha512"
 	"fmt"
-	"hash"
+	"strings"
+
+	// Register the relevant hash implementations to prevent a runtime failure.
+	_ "crypto/sha1"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 
 	"github.com/google/go-tpm/tpmutil"
 )
 
-func init() {
-	tpmutil.UseTPM20LengthPrefixSize()
+var hashMapping = map[Algorithm]crypto.Hash{
+	AlgSHA1:   crypto.SHA1,
+	AlgSHA256: crypto.SHA256,
+	AlgSHA384: crypto.SHA384,
+	AlgSHA512: crypto.SHA512,
 }
+
+// MAX_DIGEST_BUFFER is the maximum size of []byte request or response fields.
+// Typically used for chunking of big blobs of data (such as for hashing or
+// encryption).
+const maxDigestBuffer = 1024
 
 // Algorithm represents a TPM_ALG_ID value.
 type Algorithm uint16
@@ -42,15 +53,22 @@ func (a Algorithm) UsesCount() bool {
 	return a == AlgECDAA
 }
 
-// HashConstructor returns a function that can be used to make a
-// hash.Hash using the specified algorithm. An error is returned
-// if the algorithm is not a hash algorithm.
-func (a Algorithm) HashConstructor() (func() hash.Hash, error) {
-	c, ok := hashConstructors[a]
+// UsesHash returns true if the algorithm requires the use of a hash.
+func (a Algorithm) UsesHash() bool {
+	return a == AlgOAEP
+}
+
+// Hash returns a crypto.Hash based on the given TPM_ALG_ID.
+// An error is returned if the given algorithm is not a hash algorithm or is not available.
+func (a Algorithm) Hash() (crypto.Hash, error) {
+	hash, ok := hashMapping[a]
 	if !ok {
-		return nil, fmt.Errorf("algorithm not supported: 0x%x", a)
+		return crypto.Hash(0), fmt.Errorf("hash algorithm not supported: 0x%x", a)
 	}
-	return c, nil
+	if !hash.Available() {
+		return crypto.Hash(0), fmt.Errorf("go hash algorithm #%d not available", hash)
+	}
+	return hash, nil
 }
 
 // Supported Algorithms.
@@ -58,8 +76,10 @@ const (
 	AlgUnknown   Algorithm = 0x0000
 	AlgRSA       Algorithm = 0x0001
 	AlgSHA1      Algorithm = 0x0004
+	AlgHMAC      Algorithm = 0x0005
 	AlgAES       Algorithm = 0x0006
 	AlgKeyedHash Algorithm = 0x0008
+	AlgXOR       Algorithm = 0x000A
 	AlgSHA256    Algorithm = 0x000B
 	AlgSHA384    Algorithm = 0x000C
 	AlgSHA512    Algorithm = 0x000D
@@ -73,6 +93,7 @@ const (
 	AlgECDAA     Algorithm = 0x001A
 	AlgKDF2      Algorithm = 0x0021
 	AlgECC       Algorithm = 0x0023
+	AlgSymCipher Algorithm = 0x0025
 	AlgCTR       Algorithm = 0x0040
 	AlgOFB       Algorithm = 0x0041
 	AlgCBC       Algorithm = 0x0042
@@ -109,6 +130,7 @@ const (
 // SessionAttributes represents an attribute of a session.
 type SessionAttributes byte
 
+// Session Attributes (Structures 8.4 TPMA_SESSION)
 const (
 	AttrContinueSession SessionAttributes = 1 << iota
 	AttrAuditExclusive
@@ -146,12 +168,89 @@ const (
 		FlagFixedParent | FlagSensitiveDataOrigin | FlagUserWithAuth
 )
 
-// TPMProp represents the index of a TPM property in a call to GetCapability().
+// TPMProp represents a Property Tag (TPM_PT) used with calls to GetCapability(CapabilityTPMProperties).
 type TPMProp uint32
 
-// TPM Capability Properties.
+// TPM Capability Properties, see TPM 2.0 Spec, Rev 1.38, Table 23.
+// Fixed TPM Properties (PT_FIXED)
 const (
-	NVMaxBufferSize    TPMProp = 0x100 + 44
+	FamilyIndicator TPMProp = 0x100 + iota
+	SpecLevel
+	SpecRevision
+	SpecDayOfYear
+	SpecYear
+	Manufacturer
+	VendorString1
+	VendorString2
+	VendorString3
+	VendorString4
+	VendorTPMType
+	FirmwareVersion1
+	FirmwareVersion2
+	InputMaxBufferSize
+	TransientObjectsMin
+	PersistentObjectsMin
+	LoadedObjectsMin
+	ActiveSessionsMax
+	PCRCount
+	PCRSelectMin
+	ContextGapMax
+	_ // (PT_FIXED + 21) is skipped
+	NVCountersMax
+	NVIndexMax
+	MemoryMethod
+	ClockUpdate
+	ContextHash
+	ContextSym
+	ContextSymSize
+	OrderlyCount
+	CommandMaxSize
+	ResponseMaxSize
+	DigestMaxSize
+	ObjectContextMaxSize
+	SessionContextMaxSize
+	PSFamilyIndicator
+	PSSpecLevel
+	PSSpecRevision
+	PSSpecDayOfYear
+	PSSpecYear
+	SplitSigningMax
+	TotalCommands
+	LibraryCommands
+	VendorCommands
+	NVMaxBufferSize
+	TPMModes
+	CapabilityMaxBufferSize
+)
+
+// Variable TPM Properties (PT_VAR)
+const (
+	TPMAPermanent TPMProp = 0x200 + iota
+	TPMAStartupClear
+	HRNVIndex
+	HRLoaded
+	HRLoadedAvail
+	HRActive
+	HRActiveAvail
+	HRTransientAvail
+	CurrentPersistent
+	AvailPersistent
+	NVCounters
+	NVCountersAvail
+	AlgorithmSet
+	LoadedCurves
+	LockoutCounter
+	MaxAuthFail
+	LockoutInterval
+	LockoutRecovery
+	NVWriteRecovery
+	AuditCounter0
+	AuditCounter1
+)
+
+// Allowed ranges of different kinds of Handles (TPM_HANDLE)
+// These constants have type TPMProp for backwards compatibility.
+const (
 	PCRFirst           TPMProp = 0x00000000
 	HMACSessionFirst   TPMProp = 0x02000000
 	LoadedSessionFirst TPMProp = 0x02000000
@@ -248,79 +347,64 @@ var toGoCurve = map[EllipticCurve]elliptic.Curve{
 
 // Supported TPM operations.
 const (
-	cmdEvictControl       tpmutil.Command = 0x00000120
-	cmdUndefineSpace      tpmutil.Command = 0x00000122
-	cmdClockSet           tpmutil.Command = 0x00000128
-	cmdDefineSpace        tpmutil.Command = 0x0000012A
-	cmdPCRAllocate        tpmutil.Command = 0x0000012B
-	cmdCreatePrimary      tpmutil.Command = 0x00000131
-	cmdIncrementNVCounter tpmutil.Command = 0x00000134
-	cmdWriteNV            tpmutil.Command = 0x00000137
-	cmdPCREvent           tpmutil.Command = 0x0000013C
-	cmdStartup            tpmutil.Command = 0x00000144
-	cmdShutdown           tpmutil.Command = 0x00000145
-	cmdStirRandom         tpmutil.Command = 0x00000146
-	cmdActivateCredential tpmutil.Command = 0x00000147
-	cmdCertify            tpmutil.Command = 0x00000148
-	cmdCertifyCreation    tpmutil.Command = 0x0000014A
-	cmdReadNV             tpmutil.Command = 0x0000014E
-	// CmdPolicySecret is a command code for TPM2_PolicySecret.
-	// It's exported for computing of default AuthPolicy value.
-	CmdPolicySecret     tpmutil.Command = 0x00000151
-	cmdCreate           tpmutil.Command = 0x00000153
-	cmdEcdhZgen         tpmutil.Command = 0x00000154
-	cmdLoad             tpmutil.Command = 0x00000157
-	cmdQuote            tpmutil.Command = 0x00000158
-	cmdSign             tpmutil.Command = 0x0000015D
-	cmdUnseal           tpmutil.Command = 0x0000015E
-	cmdContextLoad      tpmutil.Command = 0x00000161
-	cmdContextSave      tpmutil.Command = 0x00000162
-	cmdEcdhKeyGen       tpmutil.Command = 0x00000163
-	cmdFlushContext     tpmutil.Command = 0x00000165
-	cmdLoadExternal     tpmutil.Command = 0x00000167
-	cmdMakeCredential   tpmutil.Command = 0x00000168
-	cmdReadPublicNV     tpmutil.Command = 0x00000169
-	cmdReadPublic       tpmutil.Command = 0x00000173
-	cmdStartAuthSession tpmutil.Command = 0x00000176
-	cmdGetCapability    tpmutil.Command = 0x0000017A
-	cmdGetRandom        tpmutil.Command = 0x0000017B
-	cmdHash             tpmutil.Command = 0x0000017D
-	cmdPCRRead          tpmutil.Command = 0x0000017E
-	// CmdPolicyPCR is the command code for TPM2_PolicyPCR.
-	// It's exported for computing AuthPolicy values for PCR-based sessions.
-	CmdPolicyPCR       tpmutil.Command = 0x0000017F
-	cmdReadClock       tpmutil.Command = 0x00000181
-	cmdPCRExtend       tpmutil.Command = 0x00000182
-	cmdPolicyGetDigest tpmutil.Command = 0x00000189
-	cmdPolicyPassword  tpmutil.Command = 0x0000018C
+	CmdNVUndefineSpaceSpecial     tpmutil.Command = 0x0000011F
+	CmdEvictControl               tpmutil.Command = 0x00000120
+	CmdUndefineSpace              tpmutil.Command = 0x00000122
+	CmdClear                      tpmutil.Command = 0x00000126
+	CmdHierarchyChangeAuth        tpmutil.Command = 0x00000129
+	CmdDefineSpace                tpmutil.Command = 0x0000012A
+	CmdCreatePrimary              tpmutil.Command = 0x00000131
+	CmdIncrementNVCounter         tpmutil.Command = 0x00000134
+	CmdWriteNV                    tpmutil.Command = 0x00000137
+	CmdWriteLockNV                tpmutil.Command = 0x00000138
+	CmdDictionaryAttackLockReset  tpmutil.Command = 0x00000139
+	CmdDictionaryAttackParameters tpmutil.Command = 0x0000013A
+	CmdPCREvent                   tpmutil.Command = 0x0000013C
+	CmdStartup                    tpmutil.Command = 0x00000144
+	CmdShutdown                   tpmutil.Command = 0x00000145
+	CmdActivateCredential         tpmutil.Command = 0x00000147
+	CmdCertify                    tpmutil.Command = 0x00000148
+	CmdCertifyCreation            tpmutil.Command = 0x0000014A
+	CmdReadNV                     tpmutil.Command = 0x0000014E
+	CmdReadLockNV                 tpmutil.Command = 0x0000014F
+	CmdPolicySecret               tpmutil.Command = 0x00000151
+	CmdCreate                     tpmutil.Command = 0x00000153
+	CmdECDHZGen                   tpmutil.Command = 0x00000154
+	CmdImport                     tpmutil.Command = 0x00000156
+	CmdLoad                       tpmutil.Command = 0x00000157
+	CmdQuote                      tpmutil.Command = 0x00000158
+	CmdRSADecrypt                 tpmutil.Command = 0x00000159
+	CmdSign                       tpmutil.Command = 0x0000015D
+	CmdUnseal                     tpmutil.Command = 0x0000015E
+	CmdContextLoad                tpmutil.Command = 0x00000161
+	CmdContextSave                tpmutil.Command = 0x00000162
+	CmdECDHKeyGen                 tpmutil.Command = 0x00000163
+	CmdEncryptDecrypt             tpmutil.Command = 0x00000164
+	CmdFlushContext               tpmutil.Command = 0x00000165
+	CmdLoadExternal               tpmutil.Command = 0x00000167
+	CmdMakeCredential             tpmutil.Command = 0x00000168
+	CmdReadPublicNV               tpmutil.Command = 0x00000169
+	CmdPolicyCommandCode          tpmutil.Command = 0x0000016C
+	CmdPolicyOr                   tpmutil.Command = 0x00000171
+	CmdReadPublic                 tpmutil.Command = 0x00000173
+	CmdRSAEncrypt                 tpmutil.Command = 0x00000174
+	CmdStartAuthSession           tpmutil.Command = 0x00000176
+	CmdGetCapability              tpmutil.Command = 0x0000017A
+	CmdGetRandom                  tpmutil.Command = 0x0000017B
+	CmdHash                       tpmutil.Command = 0x0000017D
+	CmdPCRRead                    tpmutil.Command = 0x0000017E
+	CmdPolicyPCR                  tpmutil.Command = 0x0000017F
+	CmdReadClock                  tpmutil.Command = 0x00000181
+	CmdPCRExtend                  tpmutil.Command = 0x00000182
+	CmdPolicyGetDigest            tpmutil.Command = 0x00000189
+	CmdPolicyPassword             tpmutil.Command = 0x0000018C
+	CmdEncryptDecrypt2            tpmutil.Command = 0x00000193
 )
 
 // Regular TPM 2.0 devices use 24-bit mask (3 bytes) for PCR selection.
 const sizeOfPCRSelect = 3
 
-// digestSize returns the size of a digest for hashing algorithm alg, or 0 if
-// it's not recognized.
-func digestSize(alg Algorithm) int {
-	switch alg {
-	case AlgSHA1:
-		return sha1.Size
-	case AlgSHA256:
-		return sha256.Size
-	case AlgSHA512:
-		return sha512.Size
-	default:
-		return 0
-	}
-}
-
 const defaultRSAExponent = 1<<16 + 1
-
-var hashConstructors = map[Algorithm]func() hash.Hash{
-	AlgSHA1:   sha1.New,
-	AlgSHA256: sha256.New,
-	AlgSHA384: sha512.New384,
-	AlgSHA512: sha512.New,
-}
 
 // NVAttr is a bitmask used in Attributes field of NV indexes. Individual
 // flags should be OR-ed to form a full mask.
@@ -350,3 +434,42 @@ const (
 	AttrPlatformCreate NVAttr = 0x40000000
 	AttrReadSTClear    NVAttr = 0x80000000
 )
+
+var permMap = map[NVAttr]string{
+	AttrPPWrite:        "PPWrite",
+	AttrOwnerWrite:     "OwnerWrite",
+	AttrAuthWrite:      "AuthWrite",
+	AttrPolicyWrite:    "PolicyWrite",
+	AttrPolicyDelete:   "PolicyDelete",
+	AttrWriteLocked:    "WriteLocked",
+	AttrWriteAll:       "WriteAll",
+	AttrWriteDefine:    "WriteDefine",
+	AttrWriteSTClear:   "WriteSTClear",
+	AttrGlobalLock:     "GlobalLock",
+	AttrPPRead:         "PPRead",
+	AttrOwnerRead:      "OwnerRead",
+	AttrAuthRead:       "AuthRead",
+	AttrPolicyRead:     "PolicyRead",
+	AttrNoDA:           "No Do",
+	AttrOrderly:        "Oderly",
+	AttrClearSTClear:   "ClearSTClear",
+	AttrReadLocked:     "ReadLocked",
+	AttrWritten:        "Writte",
+	AttrPlatformCreate: "PlatformCreate",
+	AttrReadSTClear:    "ReadSTClear",
+}
+
+// String returns a textual representation of the set of NVAttr
+func (p NVAttr) String() string {
+	var retString strings.Builder
+	for iterator, item := range permMap {
+		if (p & iterator) != 0 {
+			retString.WriteString(item + " + ")
+		}
+	}
+	if retString.String() == "" {
+		return "Permission/s not found"
+	}
+	return strings.TrimSuffix(retString.String(), " + ")
+
+}

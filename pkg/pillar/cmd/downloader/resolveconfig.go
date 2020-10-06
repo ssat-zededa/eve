@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
@@ -10,12 +13,11 @@ import (
 	zconfig "github.com/lf-edge/eve/api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedUpload"
-	log "github.com/sirupsen/logrus"
 )
 
-func runResolveHandler(ctx *downloaderContext, key string,
-	c <-chan Notify) {
+func runResolveHandler(ctx *downloaderContext, key string, c <-chan Notify) {
 
 	log.Infof("runResolveHandler starting")
 
@@ -51,8 +53,7 @@ func runResolveHandler(ctx *downloaderContext, key string,
 	log.Infof("runResolveHandler(%s) DONE", key)
 }
 
-func maybeRetryResolve(ctx *downloaderContext,
-	status *types.ResolveStatus) {
+func maybeRetryResolve(ctx *downloaderContext, status *types.ResolveStatus) {
 
 	// object is either in download progress or,
 	// successfully downloaded, nothing to do
@@ -90,7 +91,7 @@ func publishResolveStatus(ctx *downloaderContext,
 
 	key := status.Key()
 	log.Debugf("publishResolveStatus(%s)", key)
-	pub := ctx.pubAppImgResolveStatus
+	pub := ctx.pubResolveStatus
 	pub.Publish(key, *status)
 	log.Debugf("publishResolveStatus(%s) Done", key)
 }
@@ -100,15 +101,14 @@ func unpublishResolveStatus(ctx *downloaderContext,
 
 	key := status.Key()
 	log.Debugf("unpublishResolveStatus(%s)", key)
-	pub := ctx.pubAppImgResolveStatus
+	pub := ctx.pubResolveStatus
 	pub.Unpublish(key)
 	log.Debugf("unpublishResolveStatus(%s) Done", key)
 }
 
-func lookupResolveConfig(ctx *downloaderContext,
-	key string) *types.ResolveConfig {
+func lookupResolveConfig(ctx *downloaderContext, key string) *types.ResolveConfig {
 
-	sub := ctx.subAppImgResolveConfig
+	sub := ctx.subResolveConfig
 	c, _ := sub.Get(key)
 	if c == nil {
 		log.Infof("lookupResolveConfig(%s) not found", key)
@@ -121,7 +121,7 @@ func lookupResolveConfig(ctx *downloaderContext,
 func lookupResolveStatus(ctx *downloaderContext,
 	key string) *types.ResolveStatus {
 
-	pub := ctx.pubAppImgResolveStatus
+	pub := ctx.pubResolveStatus
 	c, _ := pub.Get(key)
 	if c == nil {
 		log.Infof("lookupResolveStatus(%s) not found", key)
@@ -157,12 +157,14 @@ func resolveTagsToHash(ctx *downloaderContext, rc types.ResolveConfig) {
 		return
 	}
 
-	dst, errStr := lookupDatastoreConfig(ctx, rc.DatastoreID, rc.Name)
-	if errStr != "" {
-		rs.SetErrorNow(errStr)
+	dst, err := utils.LookupDatastoreConfig(ctx.subDatastoreConfig, rc.DatastoreID)
+	if err != nil {
+		rs.SetErrorNow(err.Error())
 		publishResolveStatus(ctx, rs)
 		return
 	}
+	log.Debugf("Found datastore(%s) for %s", rc.DatastoreID.String(), rc.Name)
+
 	// construct the datastore context
 	dsCtx, err := constructDatastoreContext(ctx, rc.Name, false, *dst)
 	if err != nil {

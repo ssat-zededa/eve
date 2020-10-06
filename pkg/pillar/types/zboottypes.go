@@ -4,8 +4,8 @@
 package types
 
 import (
+	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/base"
-	log "github.com/sirupsen/logrus"
 )
 
 // ZbootConfig contains information fed from zedagent to baseosmgr.
@@ -21,42 +21,45 @@ func (config ZbootConfig) Key() string {
 }
 
 // LogCreate :
-func (config ZbootConfig) LogCreate() {
-	logObject := base.NewLogObject(base.ZbootConfigLogType, "",
+func (config ZbootConfig) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.ZbootConfigLogType, "",
 		nilUUID, config.LogKey())
 	if logObject == nil {
 		return
 	}
 	logObject.CloneAndAddField("test-complete-bool", config.TestComplete).
-		Infof("Zboot config create")
+		Noticef("Zboot config create")
 }
 
 // LogModify :
-func (config ZbootConfig) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.ZbootConfigLogType, "",
+func (config ZbootConfig) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.ZbootConfigLogType, "",
 		nilUUID, config.LogKey())
 
 	oldConfig, ok := old.(ZbootConfig)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of ZbootConfig type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of ZbootConfig type")
 	}
 	if oldConfig.TestComplete != config.TestComplete {
 
 		logObject.CloneAndAddField("test-complete-bool", config.TestComplete).
 			AddField("old-test-complete-bool", oldConfig.TestComplete).
-			Infof("Zboot config modify")
+			Noticef("Zboot config modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldConfig, config)).
+			Noticef("Zboot config modify other change")
 	}
-
 }
 
 // LogDelete :
-func (config ZbootConfig) LogDelete() {
-	logObject := base.EnsureLogObject(base.ZbootConfigLogType, "",
+func (config ZbootConfig) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.ZbootConfigLogType, "",
 		nilUUID, config.LogKey())
 	logObject.CloneAndAddField("test-complete-bool", config.TestComplete).
-		Infof("Zboot config delete")
+		Noticef("Zboot config delete")
 
-	base.DeleteLogObject(config.LogKey())
+	base.DeleteLogObject(logBase, config.LogKey())
 }
 
 // LogKey : XXX note that this only the IMGx, while Status includes ShortVersion for logs
@@ -79,8 +82,8 @@ func (status ZbootStatus) Key() string {
 }
 
 // LogCreate :
-func (status ZbootStatus) LogCreate() {
-	logObject := base.NewLogObject(base.ZbootStatusLogType, "",
+func (status ZbootStatus) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.ZbootStatusLogType, "",
 		nilUUID, status.LogKey())
 	if logObject == nil {
 		return
@@ -88,17 +91,17 @@ func (status ZbootStatus) LogCreate() {
 	logObject.CloneAndAddField("partition-state", status.PartitionState).
 		AddField("current-partition-bool", status.CurrentPartition).
 		AddField("test-complete-bool", status.TestComplete).
-		Infof("Zboot status create")
+		Noticef("Zboot status create")
 }
 
 // LogModify :
-func (status ZbootStatus) LogModify(old interface{}) {
-	logObject := base.EnsureLogObject(base.ZbootStatusLogType, "",
+func (status ZbootStatus) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.ZbootStatusLogType, "",
 		nilUUID, status.LogKey())
 
 	oldStatus, ok := old.(ZbootStatus)
 	if !ok {
-		log.Errorf("LogModify: Old object interface passed is not of ZbootStatus type")
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of ZbootStatus type")
 	}
 	if oldStatus.PartitionState != status.PartitionState ||
 		oldStatus.CurrentPartition != status.CurrentPartition ||
@@ -110,20 +113,24 @@ func (status ZbootStatus) LogModify(old interface{}) {
 			AddField("old-current-partition-bool", oldStatus.CurrentPartition).
 			AddField("test-complete-bool", status.TestComplete).
 			AddField("old-test-complete-bool", oldStatus.TestComplete).
-			Infof("Zboot status modify")
+			Noticef("Zboot status modify")
+	} else {
+		// XXX remove?
+		logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+			Noticef("Zboot status modify other change")
 	}
 }
 
 // LogDelete :
-func (status ZbootStatus) LogDelete() {
-	logObject := base.EnsureLogObject(base.ZbootStatusLogType, "",
+func (status ZbootStatus) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.ZbootStatusLogType, "",
 		nilUUID, status.LogKey())
 	logObject.CloneAndAddField("partition-state", status.PartitionState).
 		AddField("current-partition-bool", status.CurrentPartition).
 		AddField("test-complete-bool", status.TestComplete).
-		Infof("Zboot status delete")
+		Noticef("Zboot status delete")
 
-	base.DeleteLogObject(status.LogKey())
+	base.DeleteLogObject(logBase, status.LogKey())
 }
 
 // LogKey : XXX note that this includes the ShortVersion, while Status only the PartitionLabel

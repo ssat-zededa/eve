@@ -5,8 +5,9 @@ package base
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // LogEventType : Predefined object types
@@ -31,24 +32,30 @@ const (
 	UnknownLogType LogObjectType = ""
 	// ImageLogType :
 	ImageLogType LogObjectType = "image"
-	// NetworkInstanceLogType :
-	NetworkInstanceLogType LogObjectType = "network_instance"
 	// AppInstanceStatusLogType :
 	AppInstanceStatusLogType LogObjectType = "app_instance_status"
 	// AppInstanceConfigLogType :
 	AppInstanceConfigLogType LogObjectType = "app_instance_config"
-	// VolumeConfigLogType :
-	VolumeConfigLogType LogObjectType = "volume_config"
-	// VolumeStatusLogType :
-	VolumeStatusLogType LogObjectType = "volume_status"
+	// AppNetworkStatusLogType :
+	AppNetworkStatusLogType LogObjectType = "app_network_status"
+	// AppNetworkConfigLogType :
+	AppNetworkConfigLogType LogObjectType = "app_network_config"
+	// DatastoreConfigLogType :
+	DatastoreConfigLogType LogObjectType = "datastore_config"
 	// DomainConfigLogType :
 	DomainConfigLogType LogObjectType = "domain_config"
 	// DomainStatusLogType :
 	DomainStatusLogType LogObjectType = "domain_status"
+	// DomainMetricLogType :
+	DomainMetricLogType LogObjectType = "domain_metric"
 	// BaseOsConfigLogType :
 	BaseOsConfigLogType LogObjectType = "baseos_config"
 	// BaseOsStatusLogType :
 	BaseOsStatusLogType LogObjectType = "baseos_status"
+	// NodeAgentStatusLogType :
+	NodeAgentStatusLogType LogObjectType = "nodeagent_status"
+	// ZedAgentStatusLogType :
+	ZedAgentStatusLogType LogObjectType = "zedagent_status"
 	// ZbootConfigLogType :
 	ZbootConfigLogType LogObjectType = "zboot_config"
 	// ZbootStatusLogType :
@@ -65,10 +72,76 @@ const (
 	VerifyImageConfigLogType LogObjectType = "verifyimage_config"
 	// VerifyImageStatusLogType :
 	VerifyImageStatusLogType LogObjectType = "verifyimage_status"
-	// PersistImageConfigLogType :
-	PersistImageConfigLogType LogObjectType = "persistimage_config"
-	// PersistImageStatusLogType :
-	PersistImageStatusLogType LogObjectType = "persistimage_status"
+	// ContentTreeConfigLogType :
+	ContentTreeConfigLogType LogObjectType = "contenttree_config"
+	// ContentTreeStatusLogType :
+	ContentTreeStatusLogType LogObjectType = "contenttree_status"
+	// DevicePortConfig : object being logged
+	DevicePortConfigLogType LogObjectType = "deviceport_config"
+	// DevicePortConfigList :
+	DevicePortConfigListLogType LogObjectType = "deviceportconfig_list"
+	// DeviceNetworkStatus :
+	DeviceNetworkStatusLogType LogObjectType = "devicenetwork_status"
+	// BlobStatusType:
+	BlobStatusLogType LogObjectType = "blob_status"
+	// VolumeConfigLogType:
+	VolumeConfigLogType LogObjectType = "volume_config"
+	// VolumeStatusLogType:
+	VolumeStatusLogType LogObjectType = "volume_status"
+	// VolumeRefConfigLogType:
+	VolumeRefConfigLogType LogObjectType = "volume_ref_config"
+	// VolumeRefStatusLogType:
+	VolumeRefStatusLogType LogObjectType = "volume_ref_status"
+	// ServiceInitType:
+	ServiceInitLogType LogObjectType = "service_init"
+	// AppAndImageToHashLogType:
+	AppAndImageToHashLogType LogObjectType = "app_and_image_to_hash"
+	// AppContainerMetricsLogType:
+	AppContainerMetricsLogType LogObjectType = "app_container_metric"
+	// AssignableAdaptersLogType:
+	AssignableAdaptersLogType LogObjectType = "assignable_adapters"
+	// PhysicalIOAdapterListLogType:
+	PhysicalIOAdapterListLogType LogObjectType = "physical_io_adapter_list"
+	// AttestNonceLogType:
+	AttestNonceLogType LogObjectType = "attest_nonce"
+	// AttestQuoteLogType:
+	AttestQuoteLogType LogObjectType = "attest_quote"
+	// VaultStatusLogType:
+	VaultStatusLogType LogObjectType = "vault_status"
+	// CipherBlockStatusLogType:
+	CipherBlockStatusLogType LogObjectType = "cipher_block_status"
+	// CipherContextLogType:
+	CipherContextLogType LogObjectType = "cipher_context"
+	// CipherMetricsLogType:
+	CipherMetricsLogType LogObjectType = "cipher_metric"
+	// ControllerCertLogType:
+	ControllerCertLogType LogObjectType = "controller_cert"
+	// EdgeNodeCertLogType:
+	EdgeNodeCertLogType LogObjectType = "edge_node_cert"
+	// HostMemoryLogType:
+	HostMemoryLogType LogObjectType = "host_memory"
+	// IPFlowLogType:
+	IPFlowLogType LogObjectType = "ip_flow"
+	// VifIPTrigLogType:
+	VifIPTrigLogType LogObjectType = "vif_ip_trig"
+	// OnboardingStatusLogType:
+	OnboardingStatusLogType LogObjectType = "onboarding_status"
+	// NetworkInstanceConfigLogType:
+	NetworkInstanceConfigLogType LogObjectType = "network_instance_config"
+	// NetworkInstanceStatusLogType:
+	NetworkInstanceStatusLogType LogObjectType = "network_instance_status"
+	// NetworkInstanceMetricsLogType:
+	NetworkInstanceMetricsLogType LogObjectType = "network_instance_metrics"
+	// NetworkMetricsLogType:
+	NetworkMetricsLogType LogObjectType = "network_metrics"
+	// NetworkXObjectConfigLogType:
+	NetworkXObjectConfigLogType LogObjectType = "network_x_object"
+	// UUIDToNumLogType:
+	UUIDToNumLogType LogObjectType = "uuid_to_num"
+	// DiskMetricType:
+	DiskMetricType LogObjectType = "disk_metric"
+	// AppDiskMetricType:
+	AppDiskMetricType LogObjectType = "app_disk_metric"
 )
 
 // RelationObjectType :
@@ -87,16 +160,30 @@ const (
 type LogObject struct {
 	Initialized bool
 	Fields      map[string]interface{}
+	logger      *logrus.Logger
 }
 
-var logObjectMap = make(map[string]*LogObject)
+// logObjectMap tracks objects for NewLogObject
+// Needs to be a unique object for every thing which wants a unique
+// source/pid or other field set in LogObject
+var logObjectMap = NewLockedStringMap()
+
+// logSourceObjectMap tracks objects for NewSourceLogObject
+var logSourceObjectMap = NewLockedStringMap()
 
 // LoggableObject :
 type LoggableObject interface {
 	LogKey() string
-	LogCreate()
-	LogModify(old interface{})
-	LogDelete()
+	LogCreate(logBase *LogObject)
+	LogModify(logBase *LogObject, old interface{})
+	LogDelete(logBase *LogObject)
+}
+
+// Make sure we have a separate object for each agent aka log context.
+// This is critical to keep e.g., the subscribers and publishers for the same
+// objects apart when those subscribers and publishers run in the same process
+func (object *LogObject) mapKey(key string) string {
+	return fmt.Sprintf("%s:%p", key, object)
 }
 
 // NewLogObject :
@@ -106,29 +193,42 @@ type LoggableObject interface {
 // key     -> [MANDATORY] Key used for storing internal data. This should be the same Key your LoggableObject.Key()
 // would return. LogObject craeted here and the corresponding LoggableObject are linked using this key.
 // objType and objName are mandatory parameters
-func NewLogObject(objType LogObjectType, objName string, objUUID uuid.UUID, key string) *LogObject {
+func NewLogObject(logBase *LogObject, objType LogObjectType, objName string, objUUID uuid.UUID, key string) *LogObject {
+	if logBase == nil {
+		logrus.Fatalf("No logBase for %s/%s/%s/%s", string(objType),
+			objName, objUUID.String(), key)
+	}
 	if objType == UnknownLogType || len(key) == 0 {
-		log.Fatal("NewLogObject: objType and key parameters mandatory")
+		logrus.Fatal("NewLogObject: objType and key parameters mandatory")
 	}
 	// Check if we already have an object with the given key
-	object, ok := logObjectMap[key]
+	var object *LogObject
+	value, ok := logObjectMap.Load(logBase.mapKey(key))
 	if ok {
-		return object
+		object, ok = value.(*LogObject)
+		if ok {
+			return object
+		}
+		logrus.Fatalf("NewLogObject: Object found in key map is not of type *LogObject, found: %T", value)
 	}
 
 	object = new(LogObject)
-	InitLogObject(object, objType, objName, objUUID, key)
+	InitLogObject(logBase, object, objType, objName, objUUID, key)
 
 	return object
 }
 
 // InitLogObject : Initialize an already allocated LogObject
-func InitLogObject(object *LogObject, objType LogObjectType, objName string, objUUID uuid.UUID, key string) {
+func InitLogObject(logBase *LogObject, object *LogObject, objType LogObjectType, objName string, objUUID uuid.UUID, key string) {
+	if logBase == nil {
+		logrus.Fatalf("No logBase for %s/%s/%s/%s", string(objType),
+			objName, objUUID.String(), key)
+	}
 	if objType == UnknownLogType || len(key) == 0 {
-		log.Fatal("InitLogObject: objType and key parameters mandatory")
+		logrus.Fatal("InitLogObject: objType and key parameters mandatory")
 	}
 	if object == nil {
-		log.Fatal("InitLogObject: LogObject cannot be nil")
+		logrus.Fatal("InitLogObject: LogObject cannot be nil")
 	}
 	fields := make(map[string]interface{})
 	fields["log_event_type"] = LogObjectEventType
@@ -140,9 +240,38 @@ func InitLogObject(object *LogObject, objType LogObjectType, objName string, obj
 	if !uuid.Equal(objUUID, uuid.UUID{}) {
 		fields["obj_uuid"] = objUUID.String()
 	}
-	object.Initialized = true
 	object.Fields = fields
-	logObjectMap[key] = object
+	object.logger = logBase.logger
+	object.Merge(logBase)
+	object.Initialized = true
+	logObjectMap.Store(logBase.mapKey(key), object)
+}
+
+// NewSourceLogObject : create an object with agentName and agentPid
+// Since there might be multiple calls to this for the same agent
+// we check for an existing one for the agentName
+func NewSourceLogObject(logger *logrus.Logger, agentName string, agentPid int) *LogObject {
+	// Check if we already have an object with the given agentName
+	var object *LogObject
+	value, ok := logSourceObjectMap.Load(agentName)
+	if ok {
+		object, ok = value.(*LogObject)
+		if ok {
+			return object
+		}
+		logrus.Fatalf("NewSourceLogObject: Object found is not of type *LogObject, found: %T",
+			value)
+	}
+
+	object = new(LogObject)
+	object.logger = logger
+	object.Initialized = true
+	fields := make(map[string]interface{})
+	fields["source"] = agentName
+	fields["pid"] = agentPid
+	object.Fields = fields
+	logSourceObjectMap.Store(agentName, object)
+	return object
 }
 
 // NewRelationObject : Creates a relation object.
@@ -153,13 +282,18 @@ func InitLogObject(object *LogObject, objType LogObjectType, objName string, obj
 // fromObjName        -> Name of the source point of relation
 // toObjType          -> Type of the destination point of relation
 // toObjName          -> Name of the destination point of relation
-func NewRelationObject(relationObjectType RelationObjectType,
+func NewRelationObject(logBase *LogObject, relationObjectType RelationObjectType,
 	fromObjType LogObjectType, fromObjNameOrKey string,
 	toObjType LogObjectType, toObjNameOrKey string) *LogObject {
 
+	if logBase == nil {
+		logrus.Fatalf("No logBase for %s to %s",
+			fromObjNameOrKey, toObjNameOrKey)
+	}
+
 	object := new(LogObject)
 	if object == nil {
-		log.Fatal("Relation object allocation failed")
+		logrus.Fatal("Relation object allocation failed")
 	}
 
 	fields := make(map[string]interface{})
@@ -170,38 +304,52 @@ func NewRelationObject(relationObjectType RelationObjectType,
 	fields["to_obj_type"] = toObjType
 	fields["to_obj_name_or_key"] = toObjNameOrKey
 
+	object.logger = logBase.logger
 	object.Initialized = true
 	object.Fields = fields
-
+	object.Merge(logBase)
 	return object
 }
 
 // LookupLogObject :
-func LookupLogObject(key string) *LogObject {
-	object, ok := logObjectMap[key]
-	if ok {
-		return object
+func LookupLogObject(mapKey string) *LogObject {
+	var object *LogObject
+	value, ok := logObjectMap.Load(mapKey)
+	if !ok {
+		return nil
 	}
-	return nil
+	object, ok = value.(*LogObject)
+	if !ok {
+		logrus.Fatalf("LookupLogObject: Object found in key map is not of type *LogObject, found: %T", value)
+	}
+	return object
 }
 
 // EnsureLogObject : Look for log object with given key or create new if we do not already have one.
-func EnsureLogObject(objType LogObjectType, objName string, objUUID uuid.UUID, key string) *LogObject {
-	logObject := LookupLogObject(key)
+func EnsureLogObject(logBase *LogObject, objType LogObjectType, objName string, objUUID uuid.UUID, key string) *LogObject {
+	if logBase == nil {
+		logrus.Fatalf("No logBase for %s/%s/%s/%s", string(objType),
+			objName, objUUID.String(), key)
+	}
+	logObject := LookupLogObject(logBase.mapKey(key))
 	if logObject == nil {
-		logObject = NewLogObject(objType, objName, objUUID, key)
+		logObject = NewLogObject(logBase, objType, objName, objUUID, key)
 	}
 	return logObject
 }
 
 // DeleteLogObject :
-func DeleteLogObject(key string) {
-	_, ok := logObjectMap[key]
+func DeleteLogObject(logBase *LogObject, key string) {
+	if logBase == nil {
+		logrus.Fatalf("No logBase for %s", key)
+	}
+	mapKey := logBase.mapKey(key)
+	_, ok := logObjectMap.Load(mapKey)
 	if !ok {
-		log.Errorf("DeleteLogObject: LogObject with key %s not found in internal map", key)
+		logrus.Errorf("DeleteLogObject: LogObject with mapKey %s not found in internal map", mapKey)
 		return
 	}
-	delete(logObjectMap, key)
+	logObjectMap.Delete(mapKey)
 }
 
 // AddField : Add a key value pair to be logged
@@ -250,6 +398,7 @@ func (object *LogObject) Clone() *LogObject {
 	for key, value := range object.Fields {
 		newLogObject.Fields[key] = value
 	}
+	newLogObject.logger = object.logger
 	newLogObject.Initialized = true
 	return newLogObject
 }

@@ -8,31 +8,60 @@
 package zedcloud
 
 import (
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus" // OK for logrus.Fatal
 	"sync"
 	"time"
 )
 
-var metrics = make(types.MetricsMap)
+// agentMetrics has one entry per agentName aka LogObject
+// Makes it usable when multiple agents are running in the same process aka zedbox
+type agentMetrics struct {
+	metrics types.MetricsMap
+}
+
+type allMetricsMap map[*base.LogObject]agentMetrics
+
+var allMetrics = make(allMetricsMap)
 var mutex = &sync.Mutex{}
 
-func maybeInit(ifname string) {
-	if metrics == nil {
-		log.Fatal("no zedcloudmetric map\n")
+// getAgentIfnameMetrics assumes the caller is holding the mutex
+// The caller needs to call updateAgentIfnameMetrics after any update
+func getAgentIfnameMetrics(log *base.LogObject, ifname string) types.ZedcloudMetric {
+	if allMetrics == nil {
+		logrus.Fatal("no allMetrics")
 	}
+	if _, ok := allMetrics[log]; !ok {
+		allMetrics[log] = agentMetrics{metrics: make(types.MetricsMap)}
+	}
+	metrics := allMetrics[log].metrics
 	if _, ok := metrics[ifname]; !ok {
-		log.Debugf("create zedcloudmetric for %s\n", ifname)
 		metrics[ifname] = types.ZedcloudMetric{
 			URLCounters: make(map[string]types.UrlcloudMetrics),
 		}
+		allMetrics[log] = agentMetrics{metrics: metrics}
 	}
+	return metrics[ifname]
 }
 
-func ZedCloudFailure(ifname string, url string, reqLen int64, respLen int64, authenFail bool) {
+func updateAgentIfnameMetrics(log *base.LogObject, ifname string, m types.ZedcloudMetric) {
+	if allMetrics == nil {
+		logrus.Fatal("no allMetrics")
+	}
+	if _, ok := allMetrics[log]; !ok {
+		logrus.Fatal("allMetrics not initialized")
+	}
+	metrics := allMetrics[log].metrics
+	metrics[ifname] = m
+	allMetrics[log] = agentMetrics{metrics: metrics}
+}
+
+func ZedCloudFailure(log *base.LogObject, ifname string, url string, reqLen int64, respLen int64, authenFail bool) {
+	log.Debugf("ZedCloudFailure(%s, %s) %d %d",
+		ifname, url, reqLen, respLen)
 	mutex.Lock()
-	maybeInit(ifname)
-	m := metrics[ifname]
+	m := getAgentIfnameMetrics(log, ifname)
 	// if we have authen verify failure, the network part is success
 	if authenFail {
 		m.AuthFailCount++
@@ -53,14 +82,15 @@ func ZedCloudFailure(ifname string, url string, reqLen int64, respLen int64, aut
 		}
 		m.URLCounters[url] = u
 	}
-	metrics[ifname] = m
+	updateAgentIfnameMetrics(log, ifname, m)
 	mutex.Unlock()
 }
 
-func ZedCloudSuccess(ifname string, url string, reqLen int64, respLen int64) {
+func ZedCloudSuccess(log *base.LogObject, ifname string, url string, reqLen int64, respLen int64, timeSpent int64) {
+	log.Debugf("ZedCloudSuccess(%s, %s) %d %d",
+		ifname, url, reqLen, respLen)
 	mutex.Lock()
-	maybeInit(ifname)
-	m := metrics[ifname]
+	m := getAgentIfnameMetrics(log, ifname)
 	m.SuccessCount += 1
 	m.LastSuccess = time.Now()
 	var u types.UrlcloudMetrics
@@ -72,13 +102,20 @@ func ZedCloudSuccess(ifname string, url string, reqLen int64, respLen int64) {
 	u.SentByteCount += reqLen
 	u.RecvMsgCount += 1
 	u.RecvByteCount += respLen
+	u.TotalTimeSpent += timeSpent
 	m.URLCounters[url] = u
-	metrics[ifname] = m
+	updateAgentIfnameMetrics(log, ifname, m)
 	mutex.Unlock()
 }
 
-func GetCloudMetrics() types.MetricsMap {
-	return metrics
+func GetCloudMetrics(log *base.LogObject) types.MetricsMap {
+	if allMetrics == nil {
+		logrus.Fatal("no allMetrics")
+	}
+	if _, ok := allMetrics[log]; !ok {
+		allMetrics[log] = agentMetrics{metrics: make(types.MetricsMap)}
+	}
+	return allMetrics[log].metrics
 }
 
 // Concatenate different interfaces and URLs into a union map
@@ -86,9 +123,8 @@ func Append(cms types.MetricsMap, cms1 types.MetricsMap) types.MetricsMap {
 	for ifname, cm1 := range cms1 {
 		cm, ok := cms[ifname]
 		if !ok {
-			// New ifname; take all
-			cms[ifname] = cm
-			continue
+			// New ifname; take all but need to deepcopy
+			cm = types.ZedcloudMetric{}
 		}
 		if cm.LastFailure.IsZero() {
 			// Don't care if cm1 is zero
@@ -125,6 +161,7 @@ func Append(cms types.MetricsMap, cms1 types.MetricsMap) types.MetricsMap {
 			um.SentByteCount += um1.SentByteCount
 			um.RecvMsgCount += um1.RecvMsgCount
 			um.RecvByteCount += um1.RecvByteCount
+			um.TotalTimeSpent += um1.TotalTimeSpent
 			cmu[url] = um
 		}
 		cms[ifname] = cm

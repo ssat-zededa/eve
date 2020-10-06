@@ -9,6 +9,7 @@
 1. [Runtime Lifecycle](#runtime-lifecycle)
 1. [Building EVE](#building-eve)
 1. [EVE Internals](#eve-internals)
+1. [EVE CGroups](#eve-cgroups)
 
 ## Introduction
 
@@ -121,7 +122,7 @@ A good way to think about this is that Controller is to EVE what Kubernetes is
 to Docker Engine.
 
 An API between EVE and its Controller is considered a [public API of Project EVE](../api).
-Refer to [API documentation](../api/API.md) for detailed information on API
+Refer to [API documentation](../api/APIv2.md) for detailed information on API
 end points and message format.
 
 EVE design makes the trust between an EVE instance and its controller extremely
@@ -144,7 +145,7 @@ URL for the Controller and its Root x509 certificate are made available during
 
 ## Runtime Configuration
 
-The heart of EVE API is a self-contained [configuration object](../api/API.md#configuration)
+The heart of EVE API is a self-contained [configuration object](../api/APIv2.md#configuration)
 that each instance of EVE receives from its controller. This object is
 serialized into a protobuf message but it can also be represented as a JSON.
 It is self-contained in a sense that a running EVE instance doesn't need to
@@ -192,8 +193,7 @@ implementation would simply be able to consume exactly the same protobuf encoded
 binary blob that it receives from the Controller, currently we still have to
 rely on an ad-hoc collection of configuration files that serve the same purpose.
 We expect these configuration files to go away relatively quickly, but for now
-EVE is still stuck with at least *DevicePortConfig/global.json* and
-*GlobalConfig/global.json* and they are documented in [legacy configuration](CONFIG.md).
+EVE is still stuck with at least *DevicePortConfig/global.json* and it is documented in [legacy configuration](CONFIG.md).
 See [the following FAQ entry](FAQ.md) for how to manage both of these
 legacy files.
 
@@ -226,11 +226,6 @@ always start with debug.*microservice*.
 You can find a complete list of generic and microservices specific configuration
 properties in [configuration properties table](CONFIG-PROPERTIES.md).
 
-It goes without saying that runtime configuration properties can also be
-delivered out-of-band just like any other part of the EVE's configuration
-object. While in transition from legacy configuration files, you will have
-to use [GlobalConfig/global.json](FAQ.md) to make them available to EVE.
-
 ## Installing EVE on Edge Nodes
 
 EVE expects to be installed into a persistent storage medium (disk, flash, etc.)
@@ -254,7 +249,7 @@ EVE will have created the following entries in the GPT.
 * CONFIG (vfat formatted read-only filesystem that contains Edge Node Identity specific configuration)
 * P3 (read-write filesystem that extends to the rest of the available storage medium)
 
-The partitioning scheme is similar to how [CoreOS does its paritioning](https://coreos.com/os/docs/latest/sdk-disk-partitions.html).
+The partitioning scheme is similar to how [CoreOS does its partitioning](https://coreos.com/os/docs/latest/sdk-disk-partitions.html).
 EVE does, indeed, leveraging the good work that CoreOS folks have done so much so
 that we're using their patches for the GRUB bootloader to provide rootfs upgrade
 functionality between IMGA and IMGB root filesystems. Unlike CoreOS, though, EVE
@@ -301,7 +296,7 @@ and do all the necessary steps to boot EVE residing in an active partition.
 
 Because of how heterogenous all these initial boot environments are,
 EVE uses a number of techniques to maintain a single image that can
-be booted in a variety of different scenarious. You can read about this
+be booted in a variety of different scenarios. You can read about this
 in greater details in the [booting EVE](BOOTING.md) section of our docs.
 
 Regardless of the initial boot environment, though, after GRUB is done
@@ -343,3 +338,45 @@ For some of the details on EVE internals you may want to check out:
 
 * [Domain Manager](../pkg/pillar/docs/domainmgr.md)
 * [TPM Manager](../pkg/pillar/docs/tpmmgr.md)
+
+## EVE CGroups
+
+Resources like memory and CPU used by EVE services, containerd, memlogd and edge applications are controlled by their respective [CGroups](https://www.kernel.org/doc/Documentation/cgroup-v2.txt).
+CGroups in EVE follows the below hierarchy:
+
+```text
+Parent cgroup (/sys/fs/cgroup/<subsystems>/)
+├── eve
+│   └── services
+│   │   └── rsyslogd
+│   │   └── ntpd
+│   │   └── sshd
+│   │   └── wwan
+│   │   └── wlan
+│   │   └── lisp
+│   │   └── guacd
+│   │   └── pillar
+│   │   └── vtpm
+│   │   └── watchdog
+│   │   └── xen-tools
+│   │
+│   └── containerd
+│   └── memlogd
+│
+└── eve-user-apps
+    └── (edge applications)
+```
+
+Memory and CPU limits of `eve`, `eve/services` and `eve/containerd` cgroups can be changed via
+`hv_dom0_*`, `hv_eve_*` and `hv_ctrd_*` respectively in `/config/grup.cfg`.
+
+Example:
+
+```text
+set_global hv_dom0_mem_settings "dom0_mem=800M,max:800M"
+set_global hv_dom0_cpu_settings "dom0_max_vcpus=1 dom0_vcpus_pin"
+set_global hv_eve_mem_settings "eve_mem=500M,max:500M"
+set_global hv_eve_cpu_settings "eve_max_vcpus=1"
+set_global hv_ctrd_mem_settings "ctrd_mem=250M,max:250M"
+set_global hv_ctrd_cpu_settings "ctrd_max_vcpus=1"
+```

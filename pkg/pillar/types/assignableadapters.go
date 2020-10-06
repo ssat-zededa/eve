@@ -16,8 +16,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	zcommon "github.com/lf-edge/eve/api/go/evecommon"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
 )
 
 type AssignableAdapters struct {
@@ -62,6 +62,7 @@ type IoBundle struct {
 	Irq     string // E.g., "5"
 	Ioports string // E.g., "2f8-2ff"
 	Serial  string // E.g., "/dev/ttyS1"
+	UsbAddr string // E.g., "1:2.3"
 
 	// Attributes Derived and assigned locally ( not from controller)
 
@@ -87,7 +88,7 @@ var nilUUID = uuid.UUID{}
 // HasAdapterChanged - We store each Physical Adapter using the IoBundle object.
 // Compares IoBundle with Physical adapter and returns if they are the Same
 // or the Physical Adapter has changed.
-func (ib IoBundle) HasAdapterChanged(phyAdapter PhysicalIOAdapter) bool {
+func (ib IoBundle) HasAdapterChanged(log *base.LogObject, phyAdapter PhysicalIOAdapter) bool {
 	if IoType(phyAdapter.Ptype) != ib.Type {
 		log.Infof("Type changed from %d to %d", ib.Type, phyAdapter.Ptype)
 		return true
@@ -109,6 +110,11 @@ func (ib IoBundle) HasAdapterChanged(phyAdapter PhysicalIOAdapter) bool {
 	if phyAdapter.Phyaddr.Serial != ib.Serial {
 		log.Infof("Serial changed from %s to %s",
 			ib.Serial, phyAdapter.Phyaddr.Serial)
+		return true
+	}
+	if phyAdapter.Phyaddr.UsbAddr != ib.UsbAddr {
+		log.Infof("USB address changed from %s to %s",
+			ib.UsbAddr, phyAdapter.Phyaddr.UsbAddr)
 		return true
 	}
 	if phyAdapter.Phyaddr.Irq != ib.Irq {
@@ -143,7 +149,7 @@ func (ib IoBundle) HasAdapterChanged(phyAdapter PhysicalIOAdapter) bool {
 }
 
 // IoBundleFromPhyAdapter - Creates an IoBundle from the given PhyAdapter
-func IoBundleFromPhyAdapter(phyAdapter PhysicalIOAdapter) *IoBundle {
+func IoBundleFromPhyAdapter(log *base.LogObject, phyAdapter PhysicalIOAdapter) *IoBundle {
 	// XXX - We should really change IoType to type zcommon.PhyIoType
 	ib := IoBundle{}
 	ib.Type = IoType(phyAdapter.Ptype)
@@ -152,6 +158,7 @@ func IoBundleFromPhyAdapter(phyAdapter PhysicalIOAdapter) *IoBundle {
 	ib.AssignmentGroup = phyAdapter.Assigngrp
 	ib.Ifname = phyAdapter.Phyaddr.Ifname
 	ib.PciLong = phyAdapter.Phyaddr.PciLong
+	ib.UsbAddr = phyAdapter.Phyaddr.UsbAddr
 	ib.Irq = phyAdapter.Phyaddr.Irq
 	ib.Ioports = phyAdapter.Phyaddr.Ioports
 	ib.Serial = phyAdapter.Phyaddr.Serial
@@ -196,12 +203,55 @@ func (ioType IoType) IsNet() bool {
 	}
 }
 
+// Key is used with pubsub
+func (aa AssignableAdapters) Key() string {
+	return "global"
+}
+
+// LogCreate :
+func (aa AssignableAdapters) LogCreate(logBase *base.LogObject) {
+	logObject := base.NewLogObject(logBase, base.AssignableAdaptersLogType, "",
+		nilUUID, aa.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.Noticef("Assignable adapters create")
+}
+
+// LogModify :
+func (aa AssignableAdapters) LogModify(logBase *base.LogObject, old interface{}) {
+	logObject := base.EnsureLogObject(logBase, base.AssignableAdaptersLogType, "",
+		nilUUID, aa.LogKey())
+
+	oldAa, ok := old.(AssignableAdapters)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of AssignableAdapters type")
+	}
+	// XXX remove? XXX huge?
+	logObject.CloneAndAddField("diff", cmp.Diff(oldAa, aa)).
+		Noticef("Assignable adapters modify")
+}
+
+// LogDelete :
+func (aa AssignableAdapters) LogDelete(logBase *base.LogObject) {
+	logObject := base.EnsureLogObject(logBase, base.AssignableAdaptersLogType, "",
+		nilUUID, aa.LogKey())
+	logObject.Noticef("Assignable adapters delete")
+
+	base.DeleteLogObject(logBase, aa.LogKey())
+}
+
+// LogKey :
+func (aa AssignableAdapters) LogKey() string {
+	return string(base.AssignableAdaptersLogType) + "-" + aa.Key()
+}
+
 // AddOrUpdateIoBundle - Add an Io bundle to AA. If the bundle already exists,
 // the function updates it, while preserving the most specific information.
 // The information we preserve are of two kinds:
 // - IsPort/IsPCIBack/UsedByUUID which come from interaction with nim
 // - Unique/MacAddr which come from the PhysicalIoAdapter
-func (aa *AssignableAdapters) AddOrUpdateIoBundle(ib IoBundle) {
+func (aa *AssignableAdapters) AddOrUpdateIoBundle(log *base.LogObject, ib IoBundle) {
 	curIbPtr := aa.LookupIoBundlePhylabel(ib.Phylabel)
 	if curIbPtr == nil {
 		log.Infof("AddOrUpdateIoBundle(%d %s %s) New bundle",

@@ -13,21 +13,21 @@ from google.protobuf import symbol_database as _symbol_database
 _sym_db = _symbol_database.Default()
 
 
-from evecommon import evecommon_pb2 as evecommon_dot_evecommon__pb2
+from certs import certs_pb2 as certs_dot_certs__pb2
 
 
 DESCRIPTOR = _descriptor.FileDescriptor(
   name='attest/attest.proto',
-  package='',
+  package='org.lfedge.eve.attest',
   syntax='proto3',
   serialized_options=_b('\n\025org.lfedge.eve.attestZ$github.com/lf-edge/eve/api/go/attest'),
-  serialized_pb=_b('\n\x13\x61ttest/attest.proto\x1a\x19\x65vecommon/evecommon.proto\"f\n\nZAttestReq\x12 \n\x07reqType\x18\x01 \x01(\x0e\x32\x0f.ZAttestReqType\x12\x1c\n\x05quote\x18\x02 \x01(\x0b\x32\r.ZAttestQuote\x12\x18\n\x05\x63\x65rts\x18\x03 \x03(\x0b\x32\t.ZEveCert\"}\n\x0fZAttestResponse\x12\"\n\x08respType\x18\x01 \x01(\x0e\x32\x10.ZAttestRespType\x12 \n\x05nonce\x18\x02 \x01(\x0b\x32\x11.ZAttestNonceResp\x12$\n\tquoteResp\x18\x03 \x01(\x0b\x32\x11.ZAttestQuoteResp\"!\n\x10ZAttestNonceResp\x12\r\n\x05nonce\x18\x01 \x01(\x0c\"5\n\x0cZAttestQuote\x12\x12\n\nattestData\x18\x01 \x01(\x0c\x12\x11\n\tsignature\x18\x02 \x01(\x0c\":\n\x10ZAttestQuoteResp\x12&\n\x08response\x18\x01 \x01(\x0e\x32\x14.ZAttestResponseCode\"\xa2\x01\n\x08ZEveCert\x12\x36\n\x08hashAlgo\x18\x01 \x01(\x0e\x32$.org.lfedge.eve.common.HashAlgorithm\x12\x10\n\x08\x63\x65rtHash\x18\x02 \x01(\x0c\x12\x1b\n\x04type\x18\x03 \x01(\x0e\x32\r.ZEveCertType\x12\x0c\n\x04\x63\x65rt\x18\x04 \x01(\x0c\x12!\n\nattributes\x18\x05 \x01(\x0b\x32\r.ZEveCertAttr\"!\n\x0cZEveCertAttr\x12\x11\n\tisMutable\x18\x01 \x01(\x08*f\n\x0eZAttestReqType\x12\x13\n\x0f\x41TTEST_REQ_NONE\x10\x00\x12\x13\n\x0f\x41TTEST_REQ_CERT\x10\x01\x12\x14\n\x10\x41TTEST_REQ_NONCE\x10\x02\x12\x14\n\x10\x41TTEST_REQ_QUOTE\x10\x03*p\n\x0fZAttestRespType\x12\x14\n\x10\x41TTEST_RESP_NONE\x10\x00\x12\x14\n\x10\x41TTEST_RESP_CERT\x10\x01\x12\x15\n\x11\x41TTEST_RESP_NONCE\x10\x02\x12\x1a\n\x16\x41TTEST_RESP_QUOTE_RESP\x10\x03*i\n\x13ZAttestResponseCode\x12\x18\n\x14\x41TTEST_RESPONSE_NONE\x10\x00\x12\x1b\n\x17\x41TTEST_RESPONSE_SUCCESS\x10\x01\x12\x1b\n\x17\x41TTEST_RESPONSE_FAILURE\x10\x02*\xbd\x01\n\x0cZEveCertType\x12\x19\n\x15\x43\x45RT_TYPE_DEVICE_NONE\x10\x00\x12\x1f\n\x1b\x43\x45RT_TYPE_DEVICE_ONBOARDING\x10\x01\x12\'\n#CERT_TYPE_DEVICE_RESTRICTED_SIGNING\x10\x02\x12$\n CERT_TYPE_DEVICE_ENDORSEMENT_RSA\x10\x03\x12\"\n\x1e\x43\x45RT_TYPE_DEVICE_ECDH_EXCHANGE\x10\x04\x42=\n\x15org.lfedge.eve.attestZ$github.com/lf-edge/eve/api/go/attestb\x06proto3')
+  serialized_pb=_b('\n\x13\x61ttest/attest.proto\x12\x15org.lfedge.eve.attest\x1a\x11\x63\x65rts/certs.proto\"\xe4\x01\n\nZAttestReq\x12\x36\n\x07reqType\x18\x01 \x01(\x0e\x32%.org.lfedge.eve.attest.ZAttestReqType\x12\x32\n\x05quote\x18\x02 \x01(\x0b\x32#.org.lfedge.eve.attest.ZAttestQuote\x12*\n\x05\x63\x65rts\x18\x03 \x03(\x0b\x32\x1b.org.lfedge.eve.certs.ZCert\x12>\n\x0cstorage_keys\x18\x04 \x01(\x0b\x32(.org.lfedge.eve.attest.AttestStorageKeys\"\x88\x02\n\x0fZAttestResponse\x12\x38\n\x08respType\x18\x01 \x01(\x0e\x32&.org.lfedge.eve.attest.ZAttestRespType\x12\x36\n\x05nonce\x18\x02 \x01(\x0b\x32\'.org.lfedge.eve.attest.ZAttestNonceResp\x12:\n\tquoteResp\x18\x03 \x01(\x0b\x32\'.org.lfedge.eve.attest.ZAttestQuoteResp\x12G\n\x11storage_keys_resp\x18\x04 \x01(\x0b\x32,.org.lfedge.eve.attest.AttestStorageKeysResp\"!\n\x10ZAttestNonceResp\x12\r\n\x05nonce\x18\x01 \x01(\x0c\"W\n\x0eTpmEventDigest\x12\x35\n\thash_algo\x18\x01 \x01(\x0e\x32\".org.lfedge.eve.attest.TpmHashAlgo\x12\x0e\n\x06\x64igest\x18\x02 \x01(\x0c\"\xb5\x01\n\x10TpmEventLogEntry\x12\r\n\x05index\x18\x01 \x01(\r\x12\x11\n\tpcr_index\x18\x02 \x01(\r\x12\x12\n\nevent_type\x18\x03 \x01(\r\x12\x35\n\x06\x64igest\x18\x04 \x01(\x0b\x32%.org.lfedge.eve.attest.TpmEventDigest\x12\x19\n\x11\x65vent_data_binary\x18\x05 \x01(\x0c\x12\x19\n\x11\x65vent_data_string\x18\x06 \x01(\t\"u\n\x14\x41ttestGPSCoordinates\x12\x38\n\tgps_input\x18\x01 \x01(\x0e\x32%.org.lfedge.eve.attest.AttestGPSInput\x12\x10\n\x08latitude\x18\x02 \x01(\x01\x12\x11\n\tlongitude\x18\x03 \x01(\x01\"d\n\x11\x41ttestVersionInfo\x12>\n\x0cversion_type\x18\x01 \x01(\x0e\x32(.org.lfedge.eve.attest.AttestVersionType\x12\x0f\n\x07version\x18\x02 \x01(\t\"b\n\x0bTpmPCRValue\x12\r\n\x05index\x18\x01 \x01(\r\x12\x35\n\thash_algo\x18\x02 \x01(\x0e\x32\".org.lfedge.eve.attest.TpmHashAlgo\x12\r\n\x05value\x18\x03 \x01(\x0c\"\xa4\x02\n\x0cZAttestQuote\x12\x12\n\nattestData\x18\x01 \x01(\x0c\x12\x11\n\tsignature\x18\x02 \x01(\x0c\x12\x36\n\npcr_values\x18\x03 \x03(\x0b\x32\".org.lfedge.eve.attest.TpmPCRValue\x12:\n\tevent_log\x18\x04 \x03(\x0b\x32\'.org.lfedge.eve.attest.TpmEventLogEntry\x12:\n\x08versions\x18\x05 \x03(\x0b\x32(.org.lfedge.eve.attest.AttestVersionInfo\x12=\n\x08gps_info\x18\x06 \x01(\x0b\x32+.org.lfedge.eve.attest.AttestGPSCoordinates\"\\\n\x0f\x41ttestVolumeKey\x12<\n\x08key_type\x18\x01 \x01(\x0e\x32*.org.lfedge.eve.attest.AttestVolumeKeyType\x12\x0b\n\x03key\x18\x02 \x01(\x0c\"\x9f\x01\n\x10ZAttestQuoteResp\x12<\n\x08response\x18\x01 \x01(\x0e\x32*.org.lfedge.eve.attest.ZAttestResponseCode\x12\x17\n\x0fintegrity_token\x18\x02 \x01(\x0c\x12\x34\n\x04keys\x18\x03 \x03(\x0b\x32&.org.lfedge.eve.attest.AttestVolumeKey\"b\n\x11\x41ttestStorageKeys\x12\x17\n\x0fintegrity_token\x18\x01 \x01(\x0c\x12\x34\n\x04keys\x18\x02 \x03(\x0b\x32&.org.lfedge.eve.attest.AttestVolumeKey\"_\n\x15\x41ttestStorageKeysResp\x12\x46\n\x08response\x18\x01 \x01(\x0e\x32\x34.org.lfedge.eve.attest.AttestStorageKeysResponseCode\"C\n\x13\x41ttestVolumeKeyData\x12\x15\n\rencrypted_key\x18\x01 \x01(\x0c\x12\x15\n\rdigest_sha256\x18\x02 \x01(\x0c*\x88\x01\n\x0eZAttestReqType\x12\x13\n\x0f\x41TTEST_REQ_NONE\x10\x00\x12\x13\n\x0f\x41TTEST_REQ_CERT\x10\x01\x12\x14\n\x10\x41TTEST_REQ_NONCE\x10\x02\x12\x14\n\x10\x41TTEST_REQ_QUOTE\x10\x03\x12 \n\x1cZ_ATTEST_REQ_TYPE_STORE_KEYS\x10\x04*\x93\x01\n\x0fZAttestRespType\x12\x14\n\x10\x41TTEST_RESP_NONE\x10\x00\x12\x14\n\x10\x41TTEST_RESP_CERT\x10\x01\x12\x15\n\x11\x41TTEST_RESP_NONCE\x10\x02\x12\x1a\n\x16\x41TTEST_RESP_QUOTE_RESP\x10\x03\x12!\n\x1dZ_ATTEST_RESP_TYPE_STORE_KEYS\x10\x04*t\n\x0bTpmHashAlgo\x12\x19\n\x15TPM_HASH_ALGO_INVALID\x10\x00\x12\x16\n\x12TPM_HASH_ALGO_SHA1\x10\x01\x12\x18\n\x14TPM_HASH_ALGO_SHA256\x10\x02\x12\x18\n\x14TPM_HASH_ALGO_SHA512\x10\x03*i\n\x0e\x41ttestGPSInput\x12\x1c\n\x18\x41TTEST_GPS_INPUT_INVALID\x10\x00\x12\x1c\n\x18\x41TTEST_GPS_INPUT_PRESENT\x10\x01\x12\x1b\n\x17\x41TTEST_GPS_INPUT_ABSENT\x10\x02*s\n\x11\x41ttestVersionType\x12\x1f\n\x1b\x41TTEST_VERSION_TYPE_INVALID\x10\x00\x12\x1b\n\x17\x41TTEST_VERSION_TYPE_EVE\x10\x01\x12 \n\x1c\x41TTEST_VERSION_TYPE_FIRMWARE\x10\x02*\xdb\x01\n\x13ZAttestResponseCode\x12\"\n\x1eZ_ATTEST_RESPONSE_CODE_INVALID\x10\x00\x12\"\n\x1eZ_ATTEST_RESPONSE_CODE_SUCCESS\x10\x01\x12)\n%Z_ATTEST_RESPONSE_CODE_NONCE_MISMATCH\x10\x02\x12(\n$Z_ATTEST_RESPONSE_CODE_NO_CERT_FOUND\x10\x03\x12\'\n#Z_ATTEST_RESPONSE_CODE_QUOTE_FAILED\x10\x04*Y\n\x13\x41ttestVolumeKeyType\x12\"\n\x1e\x41TTEST_VOLUME_KEY_TYPE_INVALID\x10\x00\x12\x1e\n\x1a\x41TTEST_VOLUME_KEY_TYPE_VSK\x10\x01*\xb4\x01\n\x1d\x41ttestStorageKeysResponseCode\x12-\n)ATTEST_STORAGE_KEYS_RESPONSE_CODE_INVALID\x10\x00\x12-\n)ATTEST_STORAGE_KEYS_RESPONSE_CODE_SUCCESS\x10\x01\x12\x35\n1ATTEST_STORAGE_KEYS_RESPONSE_CODE_ITOKEN_MISMATCH\x10\x02\x42=\n\x15org.lfedge.eve.attestZ$github.com/lf-edge/eve/api/go/attestb\x06proto3')
   ,
-  dependencies=[evecommon_dot_evecommon__pb2.DESCRIPTOR,])
+  dependencies=[certs_dot_certs__pb2.DESCRIPTOR,])
 
 _ZATTESTREQTYPE = _descriptor.EnumDescriptor(
   name='ZAttestReqType',
-  full_name='ZAttestReqType',
+  full_name='org.lfedge.eve.attest.ZAttestReqType',
   filename=None,
   file=DESCRIPTOR,
   values=[
@@ -47,18 +47,22 @@ _ZATTESTREQTYPE = _descriptor.EnumDescriptor(
       name='ATTEST_REQ_QUOTE', index=3, number=3,
       serialized_options=None,
       type=None),
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_REQ_TYPE_STORE_KEYS', index=4, number=4,
+      serialized_options=None,
+      type=None),
   ],
   containing_type=None,
   serialized_options=None,
-  serialized_start=631,
-  serialized_end=733,
+  serialized_start=2010,
+  serialized_end=2146,
 )
 _sym_db.RegisterEnumDescriptor(_ZATTESTREQTYPE)
 
 ZAttestReqType = enum_type_wrapper.EnumTypeWrapper(_ZATTESTREQTYPE)
 _ZATTESTRESPTYPE = _descriptor.EnumDescriptor(
   name='ZAttestRespType',
-  full_name='ZAttestRespType',
+  full_name='org.lfedge.eve.attest.ZAttestRespType',
   filename=None,
   file=DESCRIPTOR,
   values=[
@@ -78,119 +82,716 @@ _ZATTESTRESPTYPE = _descriptor.EnumDescriptor(
       name='ATTEST_RESP_QUOTE_RESP', index=3, number=3,
       serialized_options=None,
       type=None),
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_RESP_TYPE_STORE_KEYS', index=4, number=4,
+      serialized_options=None,
+      type=None),
   ],
   containing_type=None,
   serialized_options=None,
-  serialized_start=735,
-  serialized_end=847,
+  serialized_start=2149,
+  serialized_end=2296,
 )
 _sym_db.RegisterEnumDescriptor(_ZATTESTRESPTYPE)
 
 ZAttestRespType = enum_type_wrapper.EnumTypeWrapper(_ZATTESTRESPTYPE)
-_ZATTESTRESPONSECODE = _descriptor.EnumDescriptor(
-  name='ZAttestResponseCode',
-  full_name='ZAttestResponseCode',
+_TPMHASHALGO = _descriptor.EnumDescriptor(
+  name='TpmHashAlgo',
+  full_name='org.lfedge.eve.attest.TpmHashAlgo',
   filename=None,
   file=DESCRIPTOR,
   values=[
     _descriptor.EnumValueDescriptor(
-      name='ATTEST_RESPONSE_NONE', index=0, number=0,
+      name='TPM_HASH_ALGO_INVALID', index=0, number=0,
       serialized_options=None,
       type=None),
     _descriptor.EnumValueDescriptor(
-      name='ATTEST_RESPONSE_SUCCESS', index=1, number=1,
+      name='TPM_HASH_ALGO_SHA1', index=1, number=1,
       serialized_options=None,
       type=None),
     _descriptor.EnumValueDescriptor(
-      name='ATTEST_RESPONSE_FAILURE', index=2, number=2,
+      name='TPM_HASH_ALGO_SHA256', index=2, number=2,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='TPM_HASH_ALGO_SHA512', index=3, number=3,
       serialized_options=None,
       type=None),
   ],
   containing_type=None,
   serialized_options=None,
-  serialized_start=849,
-  serialized_end=954,
+  serialized_start=2298,
+  serialized_end=2414,
+)
+_sym_db.RegisterEnumDescriptor(_TPMHASHALGO)
+
+TpmHashAlgo = enum_type_wrapper.EnumTypeWrapper(_TPMHASHALGO)
+_ATTESTGPSINPUT = _descriptor.EnumDescriptor(
+  name='AttestGPSInput',
+  full_name='org.lfedge.eve.attest.AttestGPSInput',
+  filename=None,
+  file=DESCRIPTOR,
+  values=[
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_GPS_INPUT_INVALID', index=0, number=0,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_GPS_INPUT_PRESENT', index=1, number=1,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_GPS_INPUT_ABSENT', index=2, number=2,
+      serialized_options=None,
+      type=None),
+  ],
+  containing_type=None,
+  serialized_options=None,
+  serialized_start=2416,
+  serialized_end=2521,
+)
+_sym_db.RegisterEnumDescriptor(_ATTESTGPSINPUT)
+
+AttestGPSInput = enum_type_wrapper.EnumTypeWrapper(_ATTESTGPSINPUT)
+_ATTESTVERSIONTYPE = _descriptor.EnumDescriptor(
+  name='AttestVersionType',
+  full_name='org.lfedge.eve.attest.AttestVersionType',
+  filename=None,
+  file=DESCRIPTOR,
+  values=[
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_VERSION_TYPE_INVALID', index=0, number=0,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_VERSION_TYPE_EVE', index=1, number=1,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_VERSION_TYPE_FIRMWARE', index=2, number=2,
+      serialized_options=None,
+      type=None),
+  ],
+  containing_type=None,
+  serialized_options=None,
+  serialized_start=2523,
+  serialized_end=2638,
+)
+_sym_db.RegisterEnumDescriptor(_ATTESTVERSIONTYPE)
+
+AttestVersionType = enum_type_wrapper.EnumTypeWrapper(_ATTESTVERSIONTYPE)
+_ZATTESTRESPONSECODE = _descriptor.EnumDescriptor(
+  name='ZAttestResponseCode',
+  full_name='org.lfedge.eve.attest.ZAttestResponseCode',
+  filename=None,
+  file=DESCRIPTOR,
+  values=[
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_RESPONSE_CODE_INVALID', index=0, number=0,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_RESPONSE_CODE_SUCCESS', index=1, number=1,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_RESPONSE_CODE_NONCE_MISMATCH', index=2, number=2,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_RESPONSE_CODE_NO_CERT_FOUND', index=3, number=3,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='Z_ATTEST_RESPONSE_CODE_QUOTE_FAILED', index=4, number=4,
+      serialized_options=None,
+      type=None),
+  ],
+  containing_type=None,
+  serialized_options=None,
+  serialized_start=2641,
+  serialized_end=2860,
 )
 _sym_db.RegisterEnumDescriptor(_ZATTESTRESPONSECODE)
 
 ZAttestResponseCode = enum_type_wrapper.EnumTypeWrapper(_ZATTESTRESPONSECODE)
-_ZEVECERTTYPE = _descriptor.EnumDescriptor(
-  name='ZEveCertType',
-  full_name='ZEveCertType',
+_ATTESTVOLUMEKEYTYPE = _descriptor.EnumDescriptor(
+  name='AttestVolumeKeyType',
+  full_name='org.lfedge.eve.attest.AttestVolumeKeyType',
   filename=None,
   file=DESCRIPTOR,
   values=[
     _descriptor.EnumValueDescriptor(
-      name='CERT_TYPE_DEVICE_NONE', index=0, number=0,
+      name='ATTEST_VOLUME_KEY_TYPE_INVALID', index=0, number=0,
       serialized_options=None,
       type=None),
     _descriptor.EnumValueDescriptor(
-      name='CERT_TYPE_DEVICE_ONBOARDING', index=1, number=1,
-      serialized_options=None,
-      type=None),
-    _descriptor.EnumValueDescriptor(
-      name='CERT_TYPE_DEVICE_RESTRICTED_SIGNING', index=2, number=2,
-      serialized_options=None,
-      type=None),
-    _descriptor.EnumValueDescriptor(
-      name='CERT_TYPE_DEVICE_ENDORSEMENT_RSA', index=3, number=3,
-      serialized_options=None,
-      type=None),
-    _descriptor.EnumValueDescriptor(
-      name='CERT_TYPE_DEVICE_ECDH_EXCHANGE', index=4, number=4,
+      name='ATTEST_VOLUME_KEY_TYPE_VSK', index=1, number=1,
       serialized_options=None,
       type=None),
   ],
   containing_type=None,
   serialized_options=None,
-  serialized_start=957,
-  serialized_end=1146,
+  serialized_start=2862,
+  serialized_end=2951,
 )
-_sym_db.RegisterEnumDescriptor(_ZEVECERTTYPE)
+_sym_db.RegisterEnumDescriptor(_ATTESTVOLUMEKEYTYPE)
 
-ZEveCertType = enum_type_wrapper.EnumTypeWrapper(_ZEVECERTTYPE)
+AttestVolumeKeyType = enum_type_wrapper.EnumTypeWrapper(_ATTESTVOLUMEKEYTYPE)
+_ATTESTSTORAGEKEYSRESPONSECODE = _descriptor.EnumDescriptor(
+  name='AttestStorageKeysResponseCode',
+  full_name='org.lfedge.eve.attest.AttestStorageKeysResponseCode',
+  filename=None,
+  file=DESCRIPTOR,
+  values=[
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_STORAGE_KEYS_RESPONSE_CODE_INVALID', index=0, number=0,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_STORAGE_KEYS_RESPONSE_CODE_SUCCESS', index=1, number=1,
+      serialized_options=None,
+      type=None),
+    _descriptor.EnumValueDescriptor(
+      name='ATTEST_STORAGE_KEYS_RESPONSE_CODE_ITOKEN_MISMATCH', index=2, number=2,
+      serialized_options=None,
+      type=None),
+  ],
+  containing_type=None,
+  serialized_options=None,
+  serialized_start=2954,
+  serialized_end=3134,
+)
+_sym_db.RegisterEnumDescriptor(_ATTESTSTORAGEKEYSRESPONSECODE)
+
+AttestStorageKeysResponseCode = enum_type_wrapper.EnumTypeWrapper(_ATTESTSTORAGEKEYSRESPONSECODE)
 ATTEST_REQ_NONE = 0
 ATTEST_REQ_CERT = 1
 ATTEST_REQ_NONCE = 2
 ATTEST_REQ_QUOTE = 3
+Z_ATTEST_REQ_TYPE_STORE_KEYS = 4
 ATTEST_RESP_NONE = 0
 ATTEST_RESP_CERT = 1
 ATTEST_RESP_NONCE = 2
 ATTEST_RESP_QUOTE_RESP = 3
-ATTEST_RESPONSE_NONE = 0
-ATTEST_RESPONSE_SUCCESS = 1
-ATTEST_RESPONSE_FAILURE = 2
-CERT_TYPE_DEVICE_NONE = 0
-CERT_TYPE_DEVICE_ONBOARDING = 1
-CERT_TYPE_DEVICE_RESTRICTED_SIGNING = 2
-CERT_TYPE_DEVICE_ENDORSEMENT_RSA = 3
-CERT_TYPE_DEVICE_ECDH_EXCHANGE = 4
+Z_ATTEST_RESP_TYPE_STORE_KEYS = 4
+TPM_HASH_ALGO_INVALID = 0
+TPM_HASH_ALGO_SHA1 = 1
+TPM_HASH_ALGO_SHA256 = 2
+TPM_HASH_ALGO_SHA512 = 3
+ATTEST_GPS_INPUT_INVALID = 0
+ATTEST_GPS_INPUT_PRESENT = 1
+ATTEST_GPS_INPUT_ABSENT = 2
+ATTEST_VERSION_TYPE_INVALID = 0
+ATTEST_VERSION_TYPE_EVE = 1
+ATTEST_VERSION_TYPE_FIRMWARE = 2
+Z_ATTEST_RESPONSE_CODE_INVALID = 0
+Z_ATTEST_RESPONSE_CODE_SUCCESS = 1
+Z_ATTEST_RESPONSE_CODE_NONCE_MISMATCH = 2
+Z_ATTEST_RESPONSE_CODE_NO_CERT_FOUND = 3
+Z_ATTEST_RESPONSE_CODE_QUOTE_FAILED = 4
+ATTEST_VOLUME_KEY_TYPE_INVALID = 0
+ATTEST_VOLUME_KEY_TYPE_VSK = 1
+ATTEST_STORAGE_KEYS_RESPONSE_CODE_INVALID = 0
+ATTEST_STORAGE_KEYS_RESPONSE_CODE_SUCCESS = 1
+ATTEST_STORAGE_KEYS_RESPONSE_CODE_ITOKEN_MISMATCH = 2
 
 
 
 _ZATTESTREQ = _descriptor.Descriptor(
   name='ZAttestReq',
-  full_name='ZAttestReq',
+  full_name='org.lfedge.eve.attest.ZAttestReq',
   filename=None,
   file=DESCRIPTOR,
   containing_type=None,
   fields=[
     _descriptor.FieldDescriptor(
-      name='reqType', full_name='ZAttestReq.reqType', index=0,
+      name='reqType', full_name='org.lfedge.eve.attest.ZAttestReq.reqType', index=0,
       number=1, type=14, cpp_type=8, label=1,
       has_default_value=False, default_value=0,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR),
     _descriptor.FieldDescriptor(
-      name='quote', full_name='ZAttestReq.quote', index=1,
+      name='quote', full_name='org.lfedge.eve.attest.ZAttestReq.quote', index=1,
       number=2, type=11, cpp_type=10, label=1,
       has_default_value=False, default_value=None,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR),
     _descriptor.FieldDescriptor(
-      name='certs', full_name='ZAttestReq.certs', index=2,
+      name='certs', full_name='org.lfedge.eve.attest.ZAttestReq.certs', index=2,
+      number=3, type=11, cpp_type=10, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='storage_keys', full_name='org.lfedge.eve.attest.ZAttestReq.storage_keys', index=3,
+      number=4, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=66,
+  serialized_end=294,
+)
+
+
+_ZATTESTRESPONSE = _descriptor.Descriptor(
+  name='ZAttestResponse',
+  full_name='org.lfedge.eve.attest.ZAttestResponse',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='respType', full_name='org.lfedge.eve.attest.ZAttestResponse.respType', index=0,
+      number=1, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='nonce', full_name='org.lfedge.eve.attest.ZAttestResponse.nonce', index=1,
+      number=2, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='quoteResp', full_name='org.lfedge.eve.attest.ZAttestResponse.quoteResp', index=2,
+      number=3, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='storage_keys_resp', full_name='org.lfedge.eve.attest.ZAttestResponse.storage_keys_resp', index=3,
+      number=4, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=297,
+  serialized_end=561,
+)
+
+
+_ZATTESTNONCERESP = _descriptor.Descriptor(
+  name='ZAttestNonceResp',
+  full_name='org.lfedge.eve.attest.ZAttestNonceResp',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='nonce', full_name='org.lfedge.eve.attest.ZAttestNonceResp.nonce', index=0,
+      number=1, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=563,
+  serialized_end=596,
+)
+
+
+_TPMEVENTDIGEST = _descriptor.Descriptor(
+  name='TpmEventDigest',
+  full_name='org.lfedge.eve.attest.TpmEventDigest',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='hash_algo', full_name='org.lfedge.eve.attest.TpmEventDigest.hash_algo', index=0,
+      number=1, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='digest', full_name='org.lfedge.eve.attest.TpmEventDigest.digest', index=1,
+      number=2, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=598,
+  serialized_end=685,
+)
+
+
+_TPMEVENTLOGENTRY = _descriptor.Descriptor(
+  name='TpmEventLogEntry',
+  full_name='org.lfedge.eve.attest.TpmEventLogEntry',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='index', full_name='org.lfedge.eve.attest.TpmEventLogEntry.index', index=0,
+      number=1, type=13, cpp_type=3, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='pcr_index', full_name='org.lfedge.eve.attest.TpmEventLogEntry.pcr_index', index=1,
+      number=2, type=13, cpp_type=3, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='event_type', full_name='org.lfedge.eve.attest.TpmEventLogEntry.event_type', index=2,
+      number=3, type=13, cpp_type=3, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='digest', full_name='org.lfedge.eve.attest.TpmEventLogEntry.digest', index=3,
+      number=4, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='event_data_binary', full_name='org.lfedge.eve.attest.TpmEventLogEntry.event_data_binary', index=4,
+      number=5, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='event_data_string', full_name='org.lfedge.eve.attest.TpmEventLogEntry.event_data_string', index=5,
+      number=6, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b("").decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=688,
+  serialized_end=869,
+)
+
+
+_ATTESTGPSCOORDINATES = _descriptor.Descriptor(
+  name='AttestGPSCoordinates',
+  full_name='org.lfedge.eve.attest.AttestGPSCoordinates',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='gps_input', full_name='org.lfedge.eve.attest.AttestGPSCoordinates.gps_input', index=0,
+      number=1, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='latitude', full_name='org.lfedge.eve.attest.AttestGPSCoordinates.latitude', index=1,
+      number=2, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='longitude', full_name='org.lfedge.eve.attest.AttestGPSCoordinates.longitude', index=2,
+      number=3, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=871,
+  serialized_end=988,
+)
+
+
+_ATTESTVERSIONINFO = _descriptor.Descriptor(
+  name='AttestVersionInfo',
+  full_name='org.lfedge.eve.attest.AttestVersionInfo',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='version_type', full_name='org.lfedge.eve.attest.AttestVersionInfo.version_type', index=0,
+      number=1, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='version', full_name='org.lfedge.eve.attest.AttestVersionInfo.version', index=1,
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b("").decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=990,
+  serialized_end=1090,
+)
+
+
+_TPMPCRVALUE = _descriptor.Descriptor(
+  name='TpmPCRValue',
+  full_name='org.lfedge.eve.attest.TpmPCRValue',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='index', full_name='org.lfedge.eve.attest.TpmPCRValue.index', index=0,
+      number=1, type=13, cpp_type=3, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='hash_algo', full_name='org.lfedge.eve.attest.TpmPCRValue.hash_algo', index=1,
+      number=2, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='value', full_name='org.lfedge.eve.attest.TpmPCRValue.value', index=2,
+      number=3, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=1092,
+  serialized_end=1190,
+)
+
+
+_ZATTESTQUOTE = _descriptor.Descriptor(
+  name='ZAttestQuote',
+  full_name='org.lfedge.eve.attest.ZAttestQuote',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='attestData', full_name='org.lfedge.eve.attest.ZAttestQuote.attestData', index=0,
+      number=1, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='signature', full_name='org.lfedge.eve.attest.ZAttestQuote.signature', index=1,
+      number=2, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='pcr_values', full_name='org.lfedge.eve.attest.ZAttestQuote.pcr_values', index=2,
+      number=3, type=11, cpp_type=10, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='event_log', full_name='org.lfedge.eve.attest.ZAttestQuote.event_log', index=3,
+      number=4, type=11, cpp_type=10, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='versions', full_name='org.lfedge.eve.attest.ZAttestQuote.versions', index=4,
+      number=5, type=11, cpp_type=10, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='gps_info', full_name='org.lfedge.eve.attest.ZAttestQuote.gps_info', index=5,
+      number=6, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=1193,
+  serialized_end=1485,
+)
+
+
+_ATTESTVOLUMEKEY = _descriptor.Descriptor(
+  name='AttestVolumeKey',
+  full_name='org.lfedge.eve.attest.AttestVolumeKey',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='key_type', full_name='org.lfedge.eve.attest.AttestVolumeKey.key_type', index=0,
+      number=1, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='key', full_name='org.lfedge.eve.attest.AttestVolumeKey.key', index=1,
+      number=2, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=1487,
+  serialized_end=1579,
+)
+
+
+_ZATTESTQUOTERESP = _descriptor.Descriptor(
+  name='ZAttestQuoteResp',
+  full_name='org.lfedge.eve.attest.ZAttestQuoteResp',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='response', full_name='org.lfedge.eve.attest.ZAttestQuoteResp.response', index=0,
+      number=1, type=14, cpp_type=8, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='integrity_token', full_name='org.lfedge.eve.attest.ZAttestQuoteResp.integrity_token', index=1,
+      number=2, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='keys', full_name='org.lfedge.eve.attest.ZAttestQuoteResp.keys', index=2,
       number=3, type=11, cpp_type=10, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
@@ -208,39 +809,63 @@ _ZATTESTREQ = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=50,
-  serialized_end=152,
+  serialized_start=1582,
+  serialized_end=1741,
 )
 
 
-_ZATTESTRESPONSE = _descriptor.Descriptor(
-  name='ZAttestResponse',
-  full_name='ZAttestResponse',
+_ATTESTSTORAGEKEYS = _descriptor.Descriptor(
+  name='AttestStorageKeys',
+  full_name='org.lfedge.eve.attest.AttestStorageKeys',
   filename=None,
   file=DESCRIPTOR,
   containing_type=None,
   fields=[
     _descriptor.FieldDescriptor(
-      name='respType', full_name='ZAttestResponse.respType', index=0,
+      name='integrity_token', full_name='org.lfedge.eve.attest.AttestStorageKeys.integrity_token', index=0,
+      number=1, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='keys', full_name='org.lfedge.eve.attest.AttestStorageKeys.keys', index=1,
+      number=2, type=11, cpp_type=10, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=1743,
+  serialized_end=1841,
+)
+
+
+_ATTESTSTORAGEKEYSRESP = _descriptor.Descriptor(
+  name='AttestStorageKeysResp',
+  full_name='org.lfedge.eve.attest.AttestStorageKeysResp',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='response', full_name='org.lfedge.eve.attest.AttestStorageKeysResp.response', index=0,
       number=1, type=14, cpp_type=8, label=1,
       has_default_value=False, default_value=0,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR),
-    _descriptor.FieldDescriptor(
-      name='nonce', full_name='ZAttestResponse.nonce', index=1,
-      number=2, type=11, cpp_type=10, label=1,
-      has_default_value=False, default_value=None,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-    _descriptor.FieldDescriptor(
-      name='quoteResp', full_name='ZAttestResponse.quoteResp', index=2,
-      number=3, type=11, cpp_type=10, label=1,
-      has_default_value=False, default_value=None,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
   ],
   extensions=[
   ],
@@ -253,58 +878,27 @@ _ZATTESTRESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=154,
-  serialized_end=279,
+  serialized_start=1843,
+  serialized_end=1938,
 )
 
 
-_ZATTESTNONCERESP = _descriptor.Descriptor(
-  name='ZAttestNonceResp',
-  full_name='ZAttestNonceResp',
+_ATTESTVOLUMEKEYDATA = _descriptor.Descriptor(
+  name='AttestVolumeKeyData',
+  full_name='org.lfedge.eve.attest.AttestVolumeKeyData',
   filename=None,
   file=DESCRIPTOR,
   containing_type=None,
   fields=[
     _descriptor.FieldDescriptor(
-      name='nonce', full_name='ZAttestNonceResp.nonce', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=_b(""),
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-  ],
-  extensions=[
-  ],
-  nested_types=[],
-  enum_types=[
-  ],
-  serialized_options=None,
-  is_extendable=False,
-  syntax='proto3',
-  extension_ranges=[],
-  oneofs=[
-  ],
-  serialized_start=281,
-  serialized_end=314,
-)
-
-
-_ZATTESTQUOTE = _descriptor.Descriptor(
-  name='ZAttestQuote',
-  full_name='ZAttestQuote',
-  filename=None,
-  file=DESCRIPTOR,
-  containing_type=None,
-  fields=[
-    _descriptor.FieldDescriptor(
-      name='attestData', full_name='ZAttestQuote.attestData', index=0,
+      name='encrypted_key', full_name='org.lfedge.eve.attest.AttestVolumeKeyData.encrypted_key', index=0,
       number=1, type=12, cpp_type=9, label=1,
       has_default_value=False, default_value=_b(""),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR),
     _descriptor.FieldDescriptor(
-      name='signature', full_name='ZAttestQuote.signature', index=1,
+      name='digest_sha256', full_name='org.lfedge.eve.attest.AttestVolumeKeyData.digest_sha256', index=1,
       number=2, type=12, cpp_type=9, label=1,
       has_default_value=False, default_value=_b(""),
       message_type=None, enum_type=None, containing_type=None,
@@ -322,202 +916,153 @@ _ZATTESTQUOTE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=316,
-  serialized_end=369,
-)
-
-
-_ZATTESTQUOTERESP = _descriptor.Descriptor(
-  name='ZAttestQuoteResp',
-  full_name='ZAttestQuoteResp',
-  filename=None,
-  file=DESCRIPTOR,
-  containing_type=None,
-  fields=[
-    _descriptor.FieldDescriptor(
-      name='response', full_name='ZAttestQuoteResp.response', index=0,
-      number=1, type=14, cpp_type=8, label=1,
-      has_default_value=False, default_value=0,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-  ],
-  extensions=[
-  ],
-  nested_types=[],
-  enum_types=[
-  ],
-  serialized_options=None,
-  is_extendable=False,
-  syntax='proto3',
-  extension_ranges=[],
-  oneofs=[
-  ],
-  serialized_start=371,
-  serialized_end=429,
-)
-
-
-_ZEVECERT = _descriptor.Descriptor(
-  name='ZEveCert',
-  full_name='ZEveCert',
-  filename=None,
-  file=DESCRIPTOR,
-  containing_type=None,
-  fields=[
-    _descriptor.FieldDescriptor(
-      name='hashAlgo', full_name='ZEveCert.hashAlgo', index=0,
-      number=1, type=14, cpp_type=8, label=1,
-      has_default_value=False, default_value=0,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-    _descriptor.FieldDescriptor(
-      name='certHash', full_name='ZEveCert.certHash', index=1,
-      number=2, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=_b(""),
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-    _descriptor.FieldDescriptor(
-      name='type', full_name='ZEveCert.type', index=2,
-      number=3, type=14, cpp_type=8, label=1,
-      has_default_value=False, default_value=0,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-    _descriptor.FieldDescriptor(
-      name='cert', full_name='ZEveCert.cert', index=3,
-      number=4, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=_b(""),
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-    _descriptor.FieldDescriptor(
-      name='attributes', full_name='ZEveCert.attributes', index=4,
-      number=5, type=11, cpp_type=10, label=1,
-      has_default_value=False, default_value=None,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-  ],
-  extensions=[
-  ],
-  nested_types=[],
-  enum_types=[
-  ],
-  serialized_options=None,
-  is_extendable=False,
-  syntax='proto3',
-  extension_ranges=[],
-  oneofs=[
-  ],
-  serialized_start=432,
-  serialized_end=594,
-)
-
-
-_ZEVECERTATTR = _descriptor.Descriptor(
-  name='ZEveCertAttr',
-  full_name='ZEveCertAttr',
-  filename=None,
-  file=DESCRIPTOR,
-  containing_type=None,
-  fields=[
-    _descriptor.FieldDescriptor(
-      name='isMutable', full_name='ZEveCertAttr.isMutable', index=0,
-      number=1, type=8, cpp_type=7, label=1,
-      has_default_value=False, default_value=False,
-      message_type=None, enum_type=None, containing_type=None,
-      is_extension=False, extension_scope=None,
-      serialized_options=None, file=DESCRIPTOR),
-  ],
-  extensions=[
-  ],
-  nested_types=[],
-  enum_types=[
-  ],
-  serialized_options=None,
-  is_extendable=False,
-  syntax='proto3',
-  extension_ranges=[],
-  oneofs=[
-  ],
-  serialized_start=596,
-  serialized_end=629,
+  serialized_start=1940,
+  serialized_end=2007,
 )
 
 _ZATTESTREQ.fields_by_name['reqType'].enum_type = _ZATTESTREQTYPE
 _ZATTESTREQ.fields_by_name['quote'].message_type = _ZATTESTQUOTE
-_ZATTESTREQ.fields_by_name['certs'].message_type = _ZEVECERT
+_ZATTESTREQ.fields_by_name['certs'].message_type = certs_dot_certs__pb2._ZCERT
+_ZATTESTREQ.fields_by_name['storage_keys'].message_type = _ATTESTSTORAGEKEYS
 _ZATTESTRESPONSE.fields_by_name['respType'].enum_type = _ZATTESTRESPTYPE
 _ZATTESTRESPONSE.fields_by_name['nonce'].message_type = _ZATTESTNONCERESP
 _ZATTESTRESPONSE.fields_by_name['quoteResp'].message_type = _ZATTESTQUOTERESP
+_ZATTESTRESPONSE.fields_by_name['storage_keys_resp'].message_type = _ATTESTSTORAGEKEYSRESP
+_TPMEVENTDIGEST.fields_by_name['hash_algo'].enum_type = _TPMHASHALGO
+_TPMEVENTLOGENTRY.fields_by_name['digest'].message_type = _TPMEVENTDIGEST
+_ATTESTGPSCOORDINATES.fields_by_name['gps_input'].enum_type = _ATTESTGPSINPUT
+_ATTESTVERSIONINFO.fields_by_name['version_type'].enum_type = _ATTESTVERSIONTYPE
+_TPMPCRVALUE.fields_by_name['hash_algo'].enum_type = _TPMHASHALGO
+_ZATTESTQUOTE.fields_by_name['pcr_values'].message_type = _TPMPCRVALUE
+_ZATTESTQUOTE.fields_by_name['event_log'].message_type = _TPMEVENTLOGENTRY
+_ZATTESTQUOTE.fields_by_name['versions'].message_type = _ATTESTVERSIONINFO
+_ZATTESTQUOTE.fields_by_name['gps_info'].message_type = _ATTESTGPSCOORDINATES
+_ATTESTVOLUMEKEY.fields_by_name['key_type'].enum_type = _ATTESTVOLUMEKEYTYPE
 _ZATTESTQUOTERESP.fields_by_name['response'].enum_type = _ZATTESTRESPONSECODE
-_ZEVECERT.fields_by_name['hashAlgo'].enum_type = evecommon_dot_evecommon__pb2._HASHALGORITHM
-_ZEVECERT.fields_by_name['type'].enum_type = _ZEVECERTTYPE
-_ZEVECERT.fields_by_name['attributes'].message_type = _ZEVECERTATTR
+_ZATTESTQUOTERESP.fields_by_name['keys'].message_type = _ATTESTVOLUMEKEY
+_ATTESTSTORAGEKEYS.fields_by_name['keys'].message_type = _ATTESTVOLUMEKEY
+_ATTESTSTORAGEKEYSRESP.fields_by_name['response'].enum_type = _ATTESTSTORAGEKEYSRESPONSECODE
 DESCRIPTOR.message_types_by_name['ZAttestReq'] = _ZATTESTREQ
 DESCRIPTOR.message_types_by_name['ZAttestResponse'] = _ZATTESTRESPONSE
 DESCRIPTOR.message_types_by_name['ZAttestNonceResp'] = _ZATTESTNONCERESP
+DESCRIPTOR.message_types_by_name['TpmEventDigest'] = _TPMEVENTDIGEST
+DESCRIPTOR.message_types_by_name['TpmEventLogEntry'] = _TPMEVENTLOGENTRY
+DESCRIPTOR.message_types_by_name['AttestGPSCoordinates'] = _ATTESTGPSCOORDINATES
+DESCRIPTOR.message_types_by_name['AttestVersionInfo'] = _ATTESTVERSIONINFO
+DESCRIPTOR.message_types_by_name['TpmPCRValue'] = _TPMPCRVALUE
 DESCRIPTOR.message_types_by_name['ZAttestQuote'] = _ZATTESTQUOTE
+DESCRIPTOR.message_types_by_name['AttestVolumeKey'] = _ATTESTVOLUMEKEY
 DESCRIPTOR.message_types_by_name['ZAttestQuoteResp'] = _ZATTESTQUOTERESP
-DESCRIPTOR.message_types_by_name['ZEveCert'] = _ZEVECERT
-DESCRIPTOR.message_types_by_name['ZEveCertAttr'] = _ZEVECERTATTR
+DESCRIPTOR.message_types_by_name['AttestStorageKeys'] = _ATTESTSTORAGEKEYS
+DESCRIPTOR.message_types_by_name['AttestStorageKeysResp'] = _ATTESTSTORAGEKEYSRESP
+DESCRIPTOR.message_types_by_name['AttestVolumeKeyData'] = _ATTESTVOLUMEKEYDATA
 DESCRIPTOR.enum_types_by_name['ZAttestReqType'] = _ZATTESTREQTYPE
 DESCRIPTOR.enum_types_by_name['ZAttestRespType'] = _ZATTESTRESPTYPE
+DESCRIPTOR.enum_types_by_name['TpmHashAlgo'] = _TPMHASHALGO
+DESCRIPTOR.enum_types_by_name['AttestGPSInput'] = _ATTESTGPSINPUT
+DESCRIPTOR.enum_types_by_name['AttestVersionType'] = _ATTESTVERSIONTYPE
 DESCRIPTOR.enum_types_by_name['ZAttestResponseCode'] = _ZATTESTRESPONSECODE
-DESCRIPTOR.enum_types_by_name['ZEveCertType'] = _ZEVECERTTYPE
+DESCRIPTOR.enum_types_by_name['AttestVolumeKeyType'] = _ATTESTVOLUMEKEYTYPE
+DESCRIPTOR.enum_types_by_name['AttestStorageKeysResponseCode'] = _ATTESTSTORAGEKEYSRESPONSECODE
 _sym_db.RegisterFileDescriptor(DESCRIPTOR)
 
 ZAttestReq = _reflection.GeneratedProtocolMessageType('ZAttestReq', (_message.Message,), dict(
   DESCRIPTOR = _ZATTESTREQ,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZAttestReq)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.ZAttestReq)
   ))
 _sym_db.RegisterMessage(ZAttestReq)
 
 ZAttestResponse = _reflection.GeneratedProtocolMessageType('ZAttestResponse', (_message.Message,), dict(
   DESCRIPTOR = _ZATTESTRESPONSE,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZAttestResponse)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.ZAttestResponse)
   ))
 _sym_db.RegisterMessage(ZAttestResponse)
 
 ZAttestNonceResp = _reflection.GeneratedProtocolMessageType('ZAttestNonceResp', (_message.Message,), dict(
   DESCRIPTOR = _ZATTESTNONCERESP,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZAttestNonceResp)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.ZAttestNonceResp)
   ))
 _sym_db.RegisterMessage(ZAttestNonceResp)
+
+TpmEventDigest = _reflection.GeneratedProtocolMessageType('TpmEventDigest', (_message.Message,), dict(
+  DESCRIPTOR = _TPMEVENTDIGEST,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.TpmEventDigest)
+  ))
+_sym_db.RegisterMessage(TpmEventDigest)
+
+TpmEventLogEntry = _reflection.GeneratedProtocolMessageType('TpmEventLogEntry', (_message.Message,), dict(
+  DESCRIPTOR = _TPMEVENTLOGENTRY,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.TpmEventLogEntry)
+  ))
+_sym_db.RegisterMessage(TpmEventLogEntry)
+
+AttestGPSCoordinates = _reflection.GeneratedProtocolMessageType('AttestGPSCoordinates', (_message.Message,), dict(
+  DESCRIPTOR = _ATTESTGPSCOORDINATES,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.AttestGPSCoordinates)
+  ))
+_sym_db.RegisterMessage(AttestGPSCoordinates)
+
+AttestVersionInfo = _reflection.GeneratedProtocolMessageType('AttestVersionInfo', (_message.Message,), dict(
+  DESCRIPTOR = _ATTESTVERSIONINFO,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.AttestVersionInfo)
+  ))
+_sym_db.RegisterMessage(AttestVersionInfo)
+
+TpmPCRValue = _reflection.GeneratedProtocolMessageType('TpmPCRValue', (_message.Message,), dict(
+  DESCRIPTOR = _TPMPCRVALUE,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.TpmPCRValue)
+  ))
+_sym_db.RegisterMessage(TpmPCRValue)
 
 ZAttestQuote = _reflection.GeneratedProtocolMessageType('ZAttestQuote', (_message.Message,), dict(
   DESCRIPTOR = _ZATTESTQUOTE,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZAttestQuote)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.ZAttestQuote)
   ))
 _sym_db.RegisterMessage(ZAttestQuote)
+
+AttestVolumeKey = _reflection.GeneratedProtocolMessageType('AttestVolumeKey', (_message.Message,), dict(
+  DESCRIPTOR = _ATTESTVOLUMEKEY,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.AttestVolumeKey)
+  ))
+_sym_db.RegisterMessage(AttestVolumeKey)
 
 ZAttestQuoteResp = _reflection.GeneratedProtocolMessageType('ZAttestQuoteResp', (_message.Message,), dict(
   DESCRIPTOR = _ZATTESTQUOTERESP,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZAttestQuoteResp)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.ZAttestQuoteResp)
   ))
 _sym_db.RegisterMessage(ZAttestQuoteResp)
 
-ZEveCert = _reflection.GeneratedProtocolMessageType('ZEveCert', (_message.Message,), dict(
-  DESCRIPTOR = _ZEVECERT,
+AttestStorageKeys = _reflection.GeneratedProtocolMessageType('AttestStorageKeys', (_message.Message,), dict(
+  DESCRIPTOR = _ATTESTSTORAGEKEYS,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZEveCert)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.AttestStorageKeys)
   ))
-_sym_db.RegisterMessage(ZEveCert)
+_sym_db.RegisterMessage(AttestStorageKeys)
 
-ZEveCertAttr = _reflection.GeneratedProtocolMessageType('ZEveCertAttr', (_message.Message,), dict(
-  DESCRIPTOR = _ZEVECERTATTR,
+AttestStorageKeysResp = _reflection.GeneratedProtocolMessageType('AttestStorageKeysResp', (_message.Message,), dict(
+  DESCRIPTOR = _ATTESTSTORAGEKEYSRESP,
   __module__ = 'attest.attest_pb2'
-  # @@protoc_insertion_point(class_scope:ZEveCertAttr)
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.AttestStorageKeysResp)
   ))
-_sym_db.RegisterMessage(ZEveCertAttr)
+_sym_db.RegisterMessage(AttestStorageKeysResp)
+
+AttestVolumeKeyData = _reflection.GeneratedProtocolMessageType('AttestVolumeKeyData', (_message.Message,), dict(
+  DESCRIPTOR = _ATTESTVOLUMEKEYDATA,
+  __module__ = 'attest.attest_pb2'
+  # @@protoc_insertion_point(class_scope:org.lfedge.eve.attest.AttestVolumeKeyData)
+  ))
+_sym_db.RegisterMessage(AttestVolumeKeyData)
 
 
 DESCRIPTOR._options = None

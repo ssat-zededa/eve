@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package pubsub
 
 // Driver a backend driver for pubsub
@@ -35,6 +38,10 @@ type DriverSubscriber interface {
 	// stored: disk, databases, or vellum. All it cares about is that it gets
 	// a key-value list.
 	Load() (map[string][]byte, bool, error)
+
+	// Stop subscribing to a name and topic
+	// This is expected to return immediately.
+	Stop() error
 }
 
 // DriverPublisher interface that a driver for publishing must implement
@@ -58,6 +65,10 @@ type DriverPublisher interface {
 	// Restart set the state of the topic to restarted, or cancel the restarted
 	// state
 	Restart(restarted bool) error
+
+	// Stop publishing
+	// This is expected to return immediately.
+	Stop() error
 }
 
 // Restarted interface that lets you determine if a Publication has been restarted
@@ -68,5 +79,5 @@ type Restarted interface {
 // Differ interface that updates a LocalCollection from previous state to current state,
 // and returns a slice of keys that have changed
 type Differ interface {
-	DetermineDiffs(slaveCollection LocalCollection) []string
+	DetermineDiffs(localCollection LocalCollection) []string
 }

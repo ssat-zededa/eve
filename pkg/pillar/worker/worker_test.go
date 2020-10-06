@@ -12,6 +12,9 @@ import (
 	"log"
 	"testing"
 	"time"
+
+	"github.com/lf-edge/eve/pkg/pillar/base"
+	"github.com/sirupsen/logrus"
 )
 
 var timestamp time.Time
@@ -46,7 +49,9 @@ func TestWork(t *testing.T) {
 		},
 	}
 	ctx := dummyContext{contextName: "testContext"}
-	worker := NewWorker(dummyWorker, &ctx, 1)
+	worker := NewWorker(
+		base.NewSourceLogObject(logrus.StandardLogger(), "test", 1234),
+		dummyWorker, &ctx, 1)
 	for testname, test := range testMatrix {
 		t.Logf("Running test case %s", testname)
 		t.Run(testname, func(t *testing.T) {
@@ -98,7 +103,9 @@ var sleep3 = dummyDescription{
 // TestLength verifies that the channel length causes delay
 func TestLength(t *testing.T) {
 	ctx := dummyContext{contextName: "testContext"}
-	worker := NewWorker(dummyWorker, &ctx, 1)
+	worker := NewWorker(
+		base.NewSourceLogObject(logrus.StandardLogger(), "test", 1234),
+		dummyWorker, &ctx, 1)
 	testname := "testlength"
 
 	t.Logf("Running test case %s", testname)

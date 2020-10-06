@@ -35,8 +35,8 @@ RUN apk add \
     zlib-dev \
     openssl
 
-ARG KERNEL_VERSION_aarch64=5.6.1
-ARG KERNEL_VERSION_x86_64=5.6.1
+ARG KERNEL_VERSION_aarch64=5.4.51
+ARG KERNEL_VERSION_x86_64=5.4.51
 ARG KERNEL_SOURCE
 ARG KERNEL_SHA256_SUMS
 ARG KERNEL_PGP2_SIGN
@@ -109,19 +109,56 @@ RUN make -j "$(getconf _NPROCESSORS_ONLN)" KCFLAGS="-fno-pie" && \
 
 # Modules
 RUN make INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
+
+# Out-of-tree, open source modules
+#  * ZFS on Linux
+RUN apk add --no-cache \
+    attr-dev=2.4.47-r7 \
+    autoconf=2.69-r2 \
+    file=5.36-r0 \
+    libtirpc-dev=1.0.3-r0 \
+    libtool=2.4.6-r5 \
+    util-linux-dev=2.33-r0
+ENV ZFS_VERSION=0.8.4
+ENV ZFS_COMMIT=zfs-${ZFS_VERSION}
+ENV ZFS_REPO=https://github.com/zfsonlinux/zfs.git
+
+WORKDIR /tmp/zfs
+RUN git clone --depth 1 -b ${ZFS_COMMIT} ${ZFS_REPO} .
+RUN ./autogen.sh && \
+    ./configure --with-linux=/linux && \
+    ./scripts/make_gitrev.sh && \
+    make -C module -j "$(getconf _NPROCESSORS_ONLN)" && \
+    make -C module INSTALL_MOD_PATH=/tmp/kernel-modules install # cd /lib/modules && depmod -ae *
+
 # Out-of-tree, creepy modules
 #  * Maxlinear USB (option #2 https://github.com/lipnitsk/xr/archive/master.zip)
+WORKDIR /linux
 ADD https://www.maxlinear.com/document?id=21651 /tmp/xr.zip
 RUN unzip -d /tmp /tmp/xr.zip ;\
     make -C /linux INSTALL_MOD_PATH=/tmp/kernel-modules \
                    M=/tmp/xr_usb_serial_common_lnx-3.6-and-newer-pak \
          modules modules_install
+#  * Realtek rtl8821CU (waiting for a fix for ARM64 build)
+RUN if [ "$(uname -m)" != aarch64 ]; then \
+       git clone https://github.com/brektrou/rtl8821CU.git /tmp/rtl8821CU &&\
+       (cd /tmp/rtl8821CU ; git checkout 93b04bfcd293fdd7d98d5a7c964ae9416a40159c) &&\
+       make -C /tmp/rtl8821CU KSRC=/linux modules &&\
+       install -D -p -m 644 /tmp/rtl8821CU/8821cu.ko $(echo /tmp/kernel-modules/lib/modules/*)/kernel/drivers/net/wireless/realtek/rtl8821cu/8821cu.ko ;\
+     fi
+
+# Strip at least some of the modules to conserve space
+RUN if [ "$(uname -m)" = aarch64 ];then strip --strip-debug `find /tmp/kernel-modules/lib/modules/*/extra -name \*.ko` ;fi
+
+# Device Tree Blobs
+RUN if [ "$(uname -m)" = aarch64 ];then make INSTALL_DTBS_PATH=/tmp/kernel-modules/boot/dtb dtbs_install ;fi
+
 # Package all the modules up
 RUN ( DVER=$(basename $(find /tmp/kernel-modules/lib/modules/ -mindepth 1 -maxdepth 1)) && \
       cd /tmp/kernel-modules/lib/modules/$DVER && \
       rm build source && \
       ln -s /usr/src/linux-headers-$DVER build ) && \
-    ( cd /tmp/kernel-modules && tar cf /out/kernel.tar lib )
+    ( cd /tmp/kernel-modules && tar cf /out/kernel.tar . )
 
 # Headers (userspace API)
 RUN mkdir -p /tmp/kernel-headers/usr && \

@@ -1,75 +1,95 @@
-// Copyright (c) 2017-2018 Zededa, Inc.
+// Copyright (c) 2017-2020 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 package volumemgr
 
 import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 )
 
-func lookupVerifyImageConfig(ctx *volumemgrContext, objType,
+// Note that this function returns the entry even if Expired is set.
+// Most callers should ignore such entries
+func lookupVerifyImageConfig(ctx *volumemgrContext,
 	key string) *types.VerifyImageConfig {
 
-	pub := ctx.publication(types.VerifyImageConfig{}, objType)
+	pub := ctx.pubVerifyImageConfig
 	c, _ := pub.Get(key)
 	if c == nil {
-		log.Infof("lookupVerifyImageConfig(%s) not found for %s",
-			key, objType)
+		log.Debugf("lookupVerifyImageConfig(%s) not found", key)
 		return nil
 	}
 	config := c.(types.VerifyImageConfig)
 	return &config
 }
 
-func lookupPersistImageConfig(ctx *volumemgrContext, objType string,
-	sha string) *types.PersistImageConfig {
+func publishVerifyImageConfig(ctx *volumemgrContext,
+	config *types.VerifyImageConfig) {
 
-	pub := ctx.publication(types.PersistImageConfig{}, objType)
-	c, _ := pub.Get(sha)
-	if c == nil {
-		log.Infof("lookupPersistImageConfig(%s) not found for %s",
-			sha, objType)
-		return nil
-	}
-	config := c.(types.PersistImageConfig)
-	return &config
+	key := config.Key()
+	log.Debugf("publishVerifyImageConfig(%s)", key)
+	pub := ctx.pubVerifyImageConfig
+	pub.Publish(key, *config)
 }
 
-// If checkCerts is set this can return false. Otherwise not.
-func MaybeAddVerifyImageConfig(ctx *volumemgrContext,
-	status types.VolumeStatus, checkCerts bool) (bool, types.ErrorAndTime) {
+func unpublishVerifyImageConfig(ctx *volumemgrContext, key string) {
 
-	log.Infof("MaybeAddVerifyImageConfig for %s, checkCerts: %v",
-		status.BlobSha256, checkCerts)
-
-	// check the certificate files, if not present,
-	// we can not start verification
-	if checkCerts {
-		certObjStatus := lookupCertObjStatus(ctx, status.AppInstID.String())
-		displaystr := status.VolumeID.String()
-		ret, err := status.IsCertsAvailable(displaystr)
-		if err != nil {
-			log.Fatalf("%s, invalid certificate configuration", displaystr)
-		}
-		if ret {
-			if ret, errInfo := status.HandleCertStatus(displaystr, *certObjStatus); !ret {
-				return false, errInfo
-			}
-		}
+	log.Debugf("unpublishVerifyImageConfig(%s)", key)
+	pub := ctx.pubVerifyImageConfig
+	c, _ := pub.Get(key)
+	if c == nil {
+		log.Errorf("unpublishVerifyImageConfig(%s) not found", key)
+		return
 	}
-	AddOrRefcountVerifyConfig(ctx, &status)
-	log.Infof("MaybeAddVerifyImageConfig done for %s", status.BlobSha256)
+	pub.Unpublish(key)
+}
+
+// MaybeAddVerifyImageConfigBlob publishes the verifier config
+func MaybeAddVerifyImageConfigBlob(ctx *volumemgrContext, blob types.BlobStatus) (bool, types.ErrorAndTime) {
+
+	log.Infof("MaybeAddVerifyImageConfigBlob for %s", blob.Sha256)
+
+	var vic *types.VerifyImageConfig
+	vic = lookupVerifyImageConfig(ctx, blob.Sha256)
+	// If we have expired it we will create a new one and replace the old.
+	// See delete handshake comment below.
+	if vic != nil && !vic.Expired {
+		vic.RefCount++
+		log.Infof("MaybeAddVerifyImageConfigBlob: refcnt to %d for %s",
+			vic.RefCount, blob.Sha256)
+	} else {
+		// If Expired this will overwrite the VerifyImageConfig
+		// cancelling the expiration. Preserve any refcount if
+		// multiple such cancellations.
+		var refcount uint
+		if vic != nil {
+			refcount = vic.RefCount
+		}
+		refcount++
+		log.Infof("MaybeAddVerifyImageConfigBlob: add for %s", blob.Sha256)
+		vic = &types.VerifyImageConfig{
+			FileLocation: blob.Path,   // the source of the file to verify
+			ImageSha256:  blob.Sha256, // the sha to verify
+			Name:         blob.Sha256, // we are just going to use the sha for the verifier display
+			RefCount:     refcount,
+		}
+		log.Debugf("MaybeAddVerifyImageConfigBlob - config: %+v", vic)
+	}
+	publishVerifyImageConfig(ctx, vic)
+	log.Infof("MaybeAddVerifyImageConfigBlob done for %s", blob.Sha256)
 	return true, types.ErrorAndTime{}
 }
 
-// MaybeRemoveVerifyImageConfig decreases the refcount and if it
-// reaches zero the verifier might start a GC using the Expired exchange
-func MaybeRemoveVerifyImageConfig(ctx *volumemgrContext, objType, imageSha string) {
+// MaybeRemoveVerifyImageConfig decreases the refcount
+// The object deletion handshake doesn't start until deleteVerifyImageConfig
+// is called which we do when the refcount reaches zero.
+// However, MaybeAddVerifyImageConfig can be called to increment the refcount
+// since the handshake with the verifier will not conclude until the
+// VerifyImageConfig is unpublished
+func MaybeRemoveVerifyImageConfig(ctx *volumemgrContext, imageSha string) {
 
-	log.Infof("MaybeRemoveVerifyImageConfig(%s) for %s", imageSha, objType)
+	log.Infof("MaybeRemoveVerifyImageConfig(%s)", imageSha)
 
-	m := lookupVerifyImageConfig(ctx, objType, imageSha)
+	m := lookupVerifyImageConfig(ctx, imageSha)
 	if m == nil {
 		log.Infof("MaybeRemoveVerifyImageConfig: config missing for %s",
 			imageSha)
@@ -77,167 +97,123 @@ func MaybeRemoveVerifyImageConfig(ctx *volumemgrContext, objType, imageSha strin
 	}
 	if m.RefCount == 0 {
 		log.Fatalf("MaybeRemoveVerifyImageConfig: Attempting to reduce "+
-			"0 RefCount. Image Details - Name: %s, ImageID: %s, "+
-			"ImageSha256:%s, IsContainer: %t",
-			m.Name, m.ImageID, m.ImageSha256, m.IsContainer)
+			"0 RefCount. ImageSha256: %s", m.ImageSha256)
 	}
 	m.RefCount -= 1
 	log.Infof("MaybeRemoveVerifyImageConfig: RefCount to %d for %s",
 		m.RefCount, imageSha)
+
 	if m.RefCount == 0 {
-		unpublishVerifyImageConfig(ctx, objType, m.Key())
+		log.Infof("MaybeRemoveVerifyImageConfig(%s): marking VerifyImageConfig as expired", imageSha)
+		deleteVerifyImageConfig(ctx, m)
 	} else {
-		publishVerifyImageConfig(ctx, objType, m)
+		publishVerifyImageConfig(ctx, m)
 	}
 	log.Infof("MaybeRemoveVerifyImageConfig done for %s", imageSha)
 }
 
-func publishVerifyImageConfig(ctx *volumemgrContext, objType string,
-	config *types.VerifyImageConfig) {
+// deleteVerifyImageConfig checks the refcount and if it is zero it
+// initiates the delete handshake with the verifier. That handshake occurs
+// after a MaybeRemoveVerifyImageConfig has dropped the refcount to zero
+// thus after:
+// 1. volumemgr publishes the VIC with RefCount=0
+// 2. verifier publishes the VIS with RefCount=0
+// At that point in time MaybeAddVerifyImageConfig can be called to increment
+// the refcount, but if deleteVerifyImageConfig is called we proceed with
+// 3. volumemgr publishes the VIC with Expired=true (RefCount=0)
+// 4. verifier publishes the VIS with Expired=true (RefCount=0) in response
+// 5. handleVerifyImageStatusModify will check if a new VIC has been created
+// in volumemgr post #4. If VIC has been recreated, it will do nothing.
+// Otherwise it unpublishes the VIC. (A recreated VIC has Expired=false)
+//
+// Note that a VIC with Expired=true is effectively ignored; a replacement
+// VIC is created should MaybeAddVerifyImage be called after #3.
+// Also, any code doing a lookupVerifyImageStatus should ignore an Expired result
+//
+// 6. upon seeing the unpublish of the VIC the verifier deletes file and unpublishes the VIS
+// at this point in time verifier might see a new VIC from volumemgr if it recreated it
+// 7. handleVerifyImageStatusDelete will the unpublish the VIC if it has Expired set (if it was recreated it will not have Expired set)
+func deleteVerifyImageConfig(ctx *volumemgrContext, config *types.VerifyImageConfig) {
 
-	key := config.Key()
-	log.Debugf("publishVerifyImageConfig(%s/%s)", key, objType)
-	pub := ctx.publication(*config, objType)
-	pub.Publish(key, *config)
-}
-
-func unpublishVerifyImageConfig(ctx *volumemgrContext, objType string, key string) {
-
-	log.Debugf("unpublishVerifyImageConfig(%s)", key)
-	pub := ctx.publication(types.VerifyImageConfig{}, objType)
-	c, _ := pub.Get(key)
-	if c == nil {
-		log.Errorf("unpublishVerifyImageConfig(%s) not found for %s", key, objType)
-		return
+	log.Infof("deleteVerifyImageConfig(%s)", config.ImageSha256)
+	if config.Expired {
+		log.Fatalf("deleteVerifyImageConfig: already Expired for %s",
+			config.ImageSha256)
 	}
-	pub.Unpublish(key)
-}
-
-func publishPersistImageConfig(ctx *volumemgrContext, objType string,
-	config *types.PersistImageConfig) {
-
-	key := config.Key()
-	log.Debugf("publishPersistImageConfig(%s)", key)
-	pub := ctx.publication(*config, objType)
-	pub.Publish(key, *config)
-}
-
-func unpublishPersistImageConfig(ctx *volumemgrContext, objType string, key string) {
-
-	log.Debugf("unpublishPersistImageConfig(%s)", key)
-	pub := ctx.publication(types.PersistImageConfig{}, objType)
-	c, _ := pub.Get(key)
-	if c == nil {
-		log.Errorf("unpublishPersistImageConfig(%s) not found for %s", key, objType)
-		return
+	if config.RefCount != 0 {
+		log.Fatalf("deleteVerifyImageConfig: Attempting to delete but not zero "+
+			"RefCount %d, sha:%s",
+			config.RefCount, config.ImageSha256)
 	}
-	pub.Unpublish(key)
+	config.Expired = true
+	publishVerifyImageConfig(ctx, config)
+	log.Infof("deleteVerifyImageConfig done for %s", config.ImageSha256)
 }
 
 func handleVerifyImageStatusModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
-
 	status := statusArg.(types.VerifyImageStatus)
 	ctx := ctxArg.(*volumemgrContext)
 	log.Infof("handleVerifyImageStatusModify for ImageSha256: %s, "+
-		" RefCount %d", status.ImageSha256, status.RefCount)
+		" RefCount %d Expired %t", status.ImageSha256, status.RefCount,
+		status.Expired)
+
+	// We handle two special cases in the handshake here
+	// 1. verifier added a status with RefCount=0 based on
+	// an existing file. We echo that with a config with RefCount=0
+	// 2. verifier set Expired in status in response to us setting Expired
+	// in config. If we still have Expired and RefCount zero in the config
+	// we delete the config, which will result in the file being deleted
+	// in the verifier.
+
+	config := lookupVerifyImageConfig(ctx, status.ImageSha256)
+	if config == nil && status.RefCount == 0 {
+		log.Infof("handleVerifyImageStatusModify adding RefCount=0 config %s",
+			key)
+
+		// Note: signature-related fields are filled in when
+		// RefCount increases from zero in MaybeAddVerifyImageConfig
+		n := types.VerifyImageConfig{
+			Name:         status.Name,
+			ImageSha256:  status.ImageSha256,
+			Size:         status.Size,
+			FileLocation: status.FileLocation,
+			RefCount:     0,
+		}
+		publishVerifyImageConfig(ctx, &n)
+		return
+	}
+
+	// If we still publish an Expired config with RefCount == 0 we unpublish it.
+	// If config is not Expired it means it was recreated and we
+	// ignore the Expired status
+	if status.Expired && config != nil && config.RefCount == 0 && config.Expired {
+		log.Infof("handleVerifyImageStatusModify delete config for %s",
+			key)
+		unpublishVerifyImageConfig(ctx, config.Key())
+	} else if status.Expired {
+		log.Infof("handleVerifyImageStatusModify ignore expired VerifyImageStatus; config not Expired for %s",
+			key)
+	}
 	// Ignore if any Pending* flag is set
 	if status.Pending() {
 		log.Infof("handleVerifyImageStatusModify skipped due to Pending* for"+
 			" ImageSha256: %s", status.ImageSha256)
 		return
 	}
-	// Make sure the PersistImageConfig has the sum of the refcounts
-	// for the sha
-	if status.ImageSha256 != "" {
-		updatePersistImageConfig(ctx, status.ObjType, status.ImageSha256)
-	}
-	updateVolumeStatus(ctx, status.ObjType, status.ImageSha256, status.ImageID)
+	updateStatusByBlob(ctx, status.ImageSha256)
 	log.Infof("handleVerifyImageStatusModify done for %s", status.ImageSha256)
 }
 
-// Make sure the PersistImageConfig has the sum of the refcounts
-// for the sha
-func updatePersistImageConfig(ctx *volumemgrContext, objType, imageSha string) {
-	log.Infof("updatePersistImageConfig(%s) for %s", imageSha, objType)
-	if imageSha == "" {
-		return
-	}
-	var refcount uint
-	sub := ctx.subscription(types.VerifyImageStatus{}, objType)
-	items := sub.GetAll()
-	name := ""
-	fileLocation := ""
-	var size int64
-	for _, s := range items {
-		status := s.(types.VerifyImageStatus)
-		if status.ImageSha256 == imageSha {
-			log.Infof("Adding RefCount %d from %s to %s",
-				status.RefCount, status.ImageID, imageSha)
-			refcount += status.RefCount
-			//Name, Size and FileLocation are expected to be same as it belongs to same sha.
-			name = status.Name
-			size = status.Size
-			fileLocation = status.FileLocation
-		}
-	}
-	config := lookupPersistImageConfig(ctx, objType, imageSha)
-	if config == nil {
-		log.Infof("updatePersistImageConfig(%s): config not found",
-			imageSha)
-		if refcount == 0 {
-			return
-		}
-		n := types.PersistImageConfig{
-			VerifyConfig: types.VerifyConfig{
-				Name:         name,
-				ImageSha256:  imageSha,
-				FileLocation: fileLocation,
-				Size:         size,
-			},
-			RefCount: refcount,
-		}
-		config = &n
-	} else if config.RefCount == refcount {
-		log.Infof("updatePersistImageConfig(%s): no RefCount change %d",
-			imageSha, refcount)
-		return
-	}
-	log.Infof("updatePersistImageConfig(%s): RefCount change %d to %d",
-		imageSha, config.RefCount, refcount)
-	config.RefCount = refcount
-	publishPersistImageConfig(ctx, objType, config)
-}
-
-// Calculate sum of the refcounts for the config for a particular sha
-func sumVerifyImageRefCount(ctx *volumemgrContext, objType string, imageSha string) uint {
-	log.Infof("sumVerifyImageRefCount(%s)", imageSha)
-	if imageSha == "" {
-		return 0
-	}
-	var refcount uint
-	pub := ctx.publication(types.VerifyImageConfig{}, objType)
-	items := pub.GetAll()
-	for _, c := range items {
-		config := c.(types.VerifyImageConfig)
-		if config.ImageSha256 == imageSha {
-			log.Infof("Adding RefCount %d from %s to %s",
-				config.RefCount, config.ImageID, imageSha)
-			refcount += config.RefCount
-		}
-	}
-	return refcount
-}
-
-// Note that this function returns the entry even if Pending* is set.
-func lookupVerifyImageStatus(ctx *volumemgrContext, objType,
+// Note that this function returns the entry even if Pending* or Expired is set.
+// Most callers should ignore such entries
+func lookupVerifyImageStatus(ctx *volumemgrContext,
 	key string) *types.VerifyImageStatus {
 
-	sub := ctx.subscription(types.VerifyImageStatus{}, objType)
+	sub := ctx.subVerifyImageStatus
 	s, _ := sub.Get(key)
 	if s == nil {
-		log.Infof("lookupVerifyImageStatus(%s) not found for %s",
-			key, objType)
+		log.Debugf("lookupVerifyImageStatus(%s) not found", key)
 		return nil
 	}
 	status := s.(types.VerifyImageStatus)
@@ -250,113 +226,19 @@ func handleVerifyImageStatusDelete(ctxArg interface{}, key string,
 	status := statusArg.(types.VerifyImageStatus)
 	log.Infof("handleVerifyImageStatusDelete for %s", key)
 	ctx := ctxArg.(*volumemgrContext)
-	updateVolumeStatus(ctx, status.ObjType, status.ImageSha256, status.ImageID)
-	// If we still publish a config with RefCount == 0 we delete it.
-	config := lookupVerifyImageConfig(ctx, status.ObjType, status.ImageSha256)
-	if config != nil && config.RefCount == 0 {
-		log.Infof("handleVerifyImageStatusDelete delete config for %s",
-			key)
-		unpublishVerifyImageConfig(ctx, status.ObjType, config.Key())
-	}
-	// Make sure the PersistImageConfig has the sum of the refcounts
-	// for the sha
-	if status.ImageSha256 != "" {
-		updatePersistImageConfig(ctx, status.ObjType, status.ImageSha256)
-	}
+	updateStatusByBlob(ctx, status.ImageSha256)
 	log.Infof("handleVerifyImageStatusDelete done for %s", key)
 }
 
-func lookupPersistImageStatus(ctx *volumemgrContext, objType string,
-	imageSha string) *types.PersistImageStatus {
+//gcVerifyImageConfig marks all VerifyImageConfig with refCount = 0 as expired
+func gcVerifyImageConfig(ctx *volumemgrContext) {
+	verifyImageConfigMap := ctx.pubVerifyImageConfig.GetAll()
 
-	if imageSha == "" {
-		return nil
-	}
-	sub := ctx.subscription(types.PersistImageStatus{}, objType)
-	s, _ := sub.Get(imageSha)
-	if s == nil {
-		log.Infof("lookupPersistImageStatus(%s) not found for %s", imageSha, objType)
-		return nil
-	}
-	status := s.(types.PersistImageStatus)
-	return &status
-}
-
-func handlePersistImageStatusModify(ctxArg interface{}, key string,
-	statusArg interface{}) {
-
-	status := statusArg.(types.PersistImageStatus)
-	ctx := ctxArg.(*volumemgrContext)
-
-	log.Infof("handlePersistImageStatusModify for sha: %s, "+
-		" RefCount %d Expired %t", status.ImageSha256, status.RefCount,
-		status.Expired)
-
-	// We handle two special cases in the handshake here
-	// 1. verifier added a status with RefCount=0 based on
-	// an existing file. We echo that with a config with RefCount=0
-	// 2. verifier set Expired in status when garbage collecting.
-	// If we have no RefCount we delete the config.
-
-	config := lookupPersistImageConfig(ctx, status.ObjType, status.ImageSha256)
-	if config == nil && status.RefCount == 0 {
-		log.Infof("handlePersistImageStatusModify adding RefCount=0 config %s",
-			key)
-		n := types.PersistImageConfig{
-			VerifyConfig: types.VerifyConfig{
-				Name:         status.Name,
-				ImageSha256:  status.ImageSha256,
-				FileLocation: status.FileLocation,
-				Size:         status.Size,
-			},
-			RefCount: 0,
+	for _, verifyImageConfigIntf := range verifyImageConfigMap {
+		verifyImageConfig := verifyImageConfigIntf.(types.VerifyImageConfig)
+		if verifyImageConfig.RefCount == 0 && !verifyImageConfig.Expired {
+			log.Infof("gcVerifyImageConfig(%s): marking VerifyImageConfig as expired", verifyImageConfig.Key())
+			deleteVerifyImageConfig(ctx, &verifyImageConfig)
 		}
-		publishPersistImageConfig(ctx, status.ObjType, &n)
-	} else if config != nil && config.RefCount == 0 && status.Expired &&
-		sumVerifyImageRefCount(ctx, status.ObjType, status.ImageSha256) == 0 {
-		log.Infof("handlePersistImageStatusModify expired - deleting config %s",
-			key)
-		unpublishPersistImageConfig(ctx, status.ObjType, config.Key())
-	}
-	log.Infof("handlePersistImageStatusModify done %s", key)
-}
-
-func handlePersistImageStatusDelete(ctxArg interface{}, key string,
-	statusArg interface{}) {
-
-	status := statusArg.(types.PersistImageStatus)
-	log.Infof("handlePersistImageStatusDelete for %s refcount %d expired %t",
-		key, status.RefCount, status.Expired)
-	ctx := ctxArg.(*volumemgrContext)
-	unpublishPersistImageConfig(ctx, status.ObjType, key)
-	log.Infof("handlePersistImageStatusDelete done %s", key)
-}
-
-//AddOrRefcountVerifyConfig increments refCount of VerifyImageConfig by 1.
-// In case of no VerifyImageConfig, creates a new VerifyImageConfig with refCount = 1
-func AddOrRefcountVerifyConfig(ctx *volumemgrContext, status *types.VolumeStatus) {
-	m := lookupVerifyImageConfig(ctx, status.ObjType, status.BlobSha256)
-	if m != nil {
-		m.RefCount++
-		log.Infof("AddOrRefcountVerifyConfig: refcnt to %d for %s",
-			m.RefCount, status.BlobSha256)
-		publishVerifyImageConfig(ctx, status.ObjType, m)
-	} else {
-		log.Infof("AddOrRefcountVerifyConfig: add for %s, IsContainer: %t",
-			status.BlobSha256, status.DownloadOrigin.IsContainer)
-		n := types.VerifyImageConfig{
-			ImageID: status.VolumeID,
-			VerifyConfig: types.VerifyConfig{
-				Name:             status.DisplayName,
-				ImageSha256:      status.BlobSha256,
-				CertificateChain: status.DownloadOrigin.CertificateChain,
-				ImageSignature:   status.DownloadOrigin.ImageSignature,
-				SignatureKey:     status.DownloadOrigin.SignatureKey,
-			},
-			IsContainer: status.DownloadOrigin.IsContainer,
-			RefCount:    1,
-		}
-		publishVerifyImageConfig(ctx, status.ObjType, &n)
-		log.Debugf("AddOrRefcountVerifyConfig - config: %+v", n)
 	}
 }

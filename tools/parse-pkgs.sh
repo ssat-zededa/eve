@@ -78,9 +78,10 @@ sed -e '/-.*linuxkit\/.*:/s# *$#'${ARCH}# \
     -e "s#GPTTOOLS_TAG#$GPTTOOLS_TAG#" \
     -e "s#WATCHDOG_TAG#$WATCHDOG_TAG#" \
     -e "s#MKRAW_TAG#$MKRAW_TAG#" \
+    -e "s#MKISO_TAG#$MKISO_TAG#" \
+    -e "s#MKCONF_TAG#$MKCONF_TAG#" \
     -e "s#DEBUG_TAG#$DEBUG_TAG#" \
     -e "s#LISP_TAG#$LISP_TAG#" \
-    -e "s#FSCRYPT_TAG#${FSCRYPT_TAG}#" \
     -e "s#VTPM_TAG#${VTPM_TAG}#" \
     -e "s#UEFI_TAG#${UEFI_TAG}#" \
     -e "s#EVE_TAG#${EVE_TAG}#" \
@@ -124,8 +125,9 @@ STORAGE_INIT_TAG=$(linuxkit_tag pkg/storage-init)
 GPTTOOLS_TAG=$(linuxkit_tag pkg/gpt-tools)
 WATCHDOG_TAG=$(linuxkit_tag pkg/watchdog)
 MKRAW_TAG=$(linuxkit_tag pkg/mkimage-raw-efi)
+MKISO_TAG=$(linuxkit_tag pkg/mkimage-iso-efi)
+MKCONF_TAG=$(linuxkit_tag pkg/mkconf)
 DEBUG_TAG=$(linuxkit_tag pkg/debug)
-FSCRYPT_TAG=$(linuxkit_tag pkg/fscrypt)
 VTPM_TAG=$(linuxkit_tag pkg/vtpm)
 UEFI_TAG=$(linuxkit_tag pkg/uefi)
 

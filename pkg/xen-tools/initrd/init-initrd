@@ -15,9 +15,9 @@ fi
 
 mkdir /mnt >/dev/null 2>&1
 if [ "$root" = "9p-xen" ]; then
-    mount -t 9p -o msize=131072,trans=xen share_dir /mnt
+    mount -t 9p -o msize=131072,trans=xen,version=9p2000.L,cache=mmap share_dir /mnt
 elif [ "$root" = "9p-kvm" ]; then
-    mount -t 9p -o msize=131072,trans=virtio,version=9p2000.L hostshare /mnt
+    mount -t 9p -o msize=131072,trans=virtio,version=9p2000.L,cache=mmap hostshare /mnt
 else
     mount $root /mnt
 fi
@@ -27,11 +27,22 @@ mkdir /mnt/rootfs/sys >/dev/null 2>&1
 mkdir /mnt/rootfs/proc >/dev/null 2>&1
 mkdir /dev/pts >/dev/null 2>&1
 mkdir /dev/shm >/dev/null 2>&1
-mount -o bind /dev /mnt/rootfs/dev
+mkdir /dev/mqueue >/dev/null 2>&1
+if [ -d /mnt/rootfs/dev/eve ]; then
+   mkdir -p /dev/eve
+   mount -o bind /mnt/rootfs/dev/eve /dev/eve
+fi
+mount -o rbind /dev /mnt/rootfs/dev
 mount -o bind /sys /mnt/rootfs/sys
 mount -o bind /proc /mnt/rootfs/proc
 mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /mnt/rootfs/dev/pts
-mount -t tmpfs -o nodev,nosuid,noexec shm /mnt/rootfs/dev/shm
+mount -t tmpfs -o nodev,nosuid,noexec,size=20% shm /mnt/rootfs/dev/shm
+mount -t tmpfs -o nodev,nosuid,noexec,size=20% tmp /mnt/rootfs/tmp
+mount -t mqueue -o nodev,nosuid,noexec none /mnt/rootfs/dev/mqueue
+ln -s /proc/self/fd /mnt/rootfs/dev/fd
+ln -s /proc/self/fd/0 /mnt/rootfs/dev/stdin
+ln -s /proc/self/fd/1 /mnt/rootfs/dev/stdout
+ln -s /proc/self/fd/2 /mnt/rootfs/dev/stderr
 
 ip=`cat /proc/cmdline | grep -o '\bip=[^ ]*' | cut -d = -f 2`
 gw=`cat /proc/cmdline | grep -o '\bgw=[^ ]*' | cut -d = -f 2`
@@ -69,8 +80,13 @@ then
 elif test "$dhcp"
 then
     ip link set dev lo up
-    ip link set dev eth0 up
-    udhcpc --interface=eth0 --script=/udhcpc_script.sh
+    mkdir -p /mnt/rootfs/etc
+    echo "127.0.0.1 localhost" > /mnt/rootfs/etc/hosts
+    echo "::1 localhost" >> /mnt/rootfs/etc/hosts
+    for i in $(cd /sys/class/net && echo eth*); do
+        ip link set dev "$i" up
+        udhcpc --interface="$i" --script=/udhcpc_script.sh -O staticroutes
+    done
 fi
 
 # Mounting requested volumes
@@ -79,6 +95,9 @@ echo "Executing /mount_disk.sh"
 
 # Commence launch sequence
 source /mnt/environment
+
+echo "Run acpid daemon"
+acpid -l /proc/self/fd/1
 
 cmd=`cat /mnt/cmdline`
 echo "Executing $cmd"

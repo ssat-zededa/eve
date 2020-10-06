@@ -4,6 +4,10 @@
 # https://github.com/debian-pi/raspbian-ua-netinst/blob/master/scripts/etc/udhcpc/default.script
 # and modified as per EVE requirement
 
+: "${staticroutes:=}"
+: "${ip:=}"
+: "${hostname:=}"
+
 [ -z "$1" ] && echo 'Error: should be called from udhcpc' && exit 1
 
 # create etc directory if not already done
@@ -17,16 +21,57 @@ RESOLV_CONF='/mnt/rootfs/etc/resolv.conf'
 # interface for which DNS is to be configured
 PEERDNS_IF=eth0
 
+update_ip_hosts()
+{
+    if [ -n "$1" ]; then
+      if [ -n "$2" ]; then
+          # refresh ips for renew
+          sed -i "s/$1/$2/g" /mnt/rootfs/etc/hosts
+      else
+          # delete removed ip
+          sed -i "/$1/d" /mnt/rootfs/etc/hosts
+      fi
+    fi
+}
+
+update_hosts()
+{
+    if [ -n "${hostname}" ] && [ "${hostname}" != "(none)" ]; then
+      if [ -n "$(hostname)" ] && [ "$(hostname)" != "${hostname}" ]; then
+            # if hostname changed, update it
+            sed -i "s/$(hostname)/${hostname}/g" /mnt/rootfs/etc/hosts
+            echo "${hostname}" > /mnt/rootfs/etc/hostname
+            hostname -F /mnt/rootfs/etc/hostname
+      fi
+      if ! grep -Fxq "${ip}" /mnt/rootfs/etc/hosts; then
+            # if ip not defined, add it
+            echo "${ip} ${hostname}" >> /mnt/rootfs/etc/hosts
+      fi
+    fi
+}
+
+install_classless_routes()
+{
+    while [ -n "$1" ] && [ -n "$2" ]; do
+        if [ "$2" == '0.0.0.0' ]; then
+            ip route add "$1" dev "$interface" src "$ip"
+        else
+            ip route add "$1" via "$2" dev "$interface"
+        fi
+        shift 2
+    done
+}
+
 case "$1" in
   deconfig)
     echo "udhcpc op deconfig interface ${interface}"
     # bring interface up, but with no IP configured
     ip addr flush dev $interface
     ip link set $interface up
+    # shellcheck source=/dev/null
+    [ -f "$CFG" ] && update_ip_hosts "$(source "${CFG}"; echo "$ip")"
     # remove any stored config info for this $interface
     rm -f $CFG
-    # remove previous dns
-    rm -f $RESOLV_CONF
     ;;
   bound)
     echo "udhcpc op bound interface ${interface}"
@@ -35,7 +80,8 @@ case "$1" in
     # configure interface and routes
     ip addr flush dev $interface
     ip addr add ${ip}/${mask} dev $interface
-    [ -n "$router" ] && ip route add default via ${router%% *} dev $interface
+    # shellcheck disable=SC2086
+    [ -n "$router" ] && [ -n "$staticroutes" ] && install_classless_routes $staticroutes
     # setup dns
     if [ "$interface" == "$PEERDNS_IF" ] ; then
       [ -n "$domain" ] && echo search $domain > $RESOLV_CONF
@@ -43,6 +89,7 @@ case "$1" in
         echo nameserver $i >> $RESOLV_CONF
       done
     fi
+    update_hosts
     ;;
   renew)
     echo "udhcpc op renew interface ${interface}"
@@ -58,15 +105,22 @@ case "$1" in
         domain|dns)
           REDO_DNS='yes'
           ;;
+        hostname)
+          REDO_HOSTNAME='yes'
+          ;;
       esac
     done
+    # shellcheck source=/dev/null
+    old_ip="$(source "${CFG}"; echo "$ip")"
     # save new config info:
     mv -f ${CFG}.new $CFG
     # make only necessary changes, as per config comparison:
     if [ -n "$REDO_NET" ] ; then
       ip addr flush dev $interface
       ip addr add ${ip}/${mask} dev $interface
-      [ -n "$router" ] && ip route add default via ${router%% *} dev $interface
+      # shellcheck disable=SC2086
+      [ -n "$router" ] && [ -n "$staticroutes" ] && install_classless_routes $staticroutes
+      update_ip_hosts "$old_ip" $ip
     fi
     if [ -n "$REDO_DNS" -a "$interface" == "$PEERDNS_IF" ] ; then
       # remove previous dns
@@ -75,6 +129,9 @@ case "$1" in
       for i in $dns ; do
         echo nameserver $i >> $RESOLV_CONF
       done
+    fi
+    if [ -n "$REDO_HOSTNAME" ]; then
+      update_hosts
     fi
     ;;
 esac

@@ -3,25 +3,14 @@
 # Copyright (c) 2018 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-PERSISTDIR=/var/persist
-CONFIGDIR=/var/config
+PERSISTDIR=/persist
+CONFIGDIR=/config
 
-# The only bit of initialization we do is to point containerd to /persist
-# The trick here is to only do it if /persist is available and otherwise
-# allow containerd to run with /var/lib/containerd on tmpfs (to make sure
-# that the system comes up somehow)
-init_containerd() {
-    mkdir -p "$PERSISTDIR/containerd"
-    mkdir -p /hostfs/var/lib
-    ln -s "$PERSISTDIR/containerd" /hostfs/var/lib/containerd
-}
+# the following is here just for compatibility reasons and it should go away soon
+ln -s "$CONFIGDIR" "/var/$CONFIGDIR"
+ln -s "$PERSISTDIR" "/var/$PERSISTDIR"
 
-mkdir -p $PERSISTDIR
-chmod 700 $PERSISTDIR
-mkdir -p $CONFIGDIR
-chmod 700 $CONFIGDIR
-
-if CONFIG=$(/hostfs/sbin/findfs PARTLABEL=CONFIG) && [ -n "$CONFIG" ]; then
+if CONFIG=$(findfs PARTLABEL=CONFIG) && [ -n "$CONFIG" ]; then
     if ! fsck.vfat -y "$CONFIG"; then
         echo "$(date -Ins -u) fsck.vfat $CONFIG failed"
     fi
@@ -48,9 +37,9 @@ FSCK_FAILED=0
 # manipulate partition table. The logic here is simple: if we're missing
 # both IMGB and P3 the following code is probably the *least* risky thing
 # we can do.
-P3=$(/hostfs/sbin/findfs PARTLABEL=P3)
-IMGA=$(/hostfs/sbin/findfs PARTLABEL=IMGA)
-IMGB=$(/hostfs/sbin/findfs PARTLABEL=IMGB)
+P3=$(findfs PARTLABEL=P3)
+IMGA=$(findfs PARTLABEL=IMGA)
+IMGB=$(findfs PARTLABEL=IMGB)
 if [ -n "$IMGA" ] && [ -z "$P3" ] && [ -z "$IMGB" ]; then
    DEV=$(echo /sys/block/*/"${IMGA#/dev/}")
    DEV="/dev/$(echo "$DEV" | cut -f4 -d/)"
@@ -90,24 +79,47 @@ if [ -n "$IMGA" ] && [ -z "$P3" ] && [ -z "$IMGB" ]; then
    partx -a --nr "$IMGB_ID:$P3_ID" "$DEV"
 fi
 
-#For systems with ext3 filesystem, try not to change to ext4, since it will brick
-#the device when falling back to old images expecting P3 to be ext3. Migrate to ext4
-#when we do usb install, this way the transition is more controlled.
-if P3=$(/hostfs/sbin/findfs PARTLABEL=P3) && [ -n "$P3" ]; then
-    P3_FS_TYPE=$(blkid "$P3"| awk '{print $3}' | sed 's/TYPE=//' | sed 's/"//g')
+# We support P3 partition either formatted as ext3/4 or as part of ZFS pool
+# Priorities are: ext3, ext4, zfs
+if P3=$(findfs PARTLABEL=P3) && [ -n "$P3" ]; then
+    P3_FS_TYPE=$(blkid "$P3"| tr ' ' '\012' | awk -F= '/^TYPE/{print $2;}' | sed 's/"//g')
     echo "$(date -Ins -u) Using $P3 (formatted with $P3_FS_TYPE), for $PERSISTDIR"
 
-    if [ "$P3_FS_TYPE" = "ext3" ]; then
-        if ! fsck.ext3 -y "$P3"; then
-            FSCK_FAILED=1
-        fi
-    else
-        P3_FS_TYPE="ext4"
-        if ! fsck.ext4 -y "$P3"; then
-            FSCK_FAILED=1
-        fi
+    # Loading zfs modules to see if we have any zpools attached to the system
+    # We will unload them later (if they do unload it meands we didn't find zpools)
+    modprobe zfs
+
+    # XXX FIXME: the following hack MUST go away when/if we decide to officially support ZFS
+    # Note that for whatever reason, it appears that blkid can only identify zfs after it has
+    # been populated with some data (not just initialized). Hence this block is AFTER blkid above
+    if [ "$(dd if="$P3" bs=8 count=1 2>/dev/null)" = "eve<3zfs" ]; then
+        # zero out the request (regardless of whether we can convert to zfs)
+        dd if=/dev/zero of="$P3" bs=8 count=1 conv=noerror,sync,notrunc
+        chroot /hostfs zpool create -f -m "$PERSISTDIR" -o feature@encryption=enabled persist "$P3"
+        # we immediately create a zfs dataset for containerd, since otherwise the init sequence will fail
+        #   https://bugs.launchpad.net/ubuntu/+source/zfs-linux/+bug/1718761
+        chroot /hostfs zfs create -p -o mountpoint="$PERSISTDIR/containerd/io.containerd.snapshotter.v1.zfs" persist/snapshots
+        P3_FS_TYPE=zfs_member
     fi
 
+    case "$P3_FS_TYPE" in
+         ext3|ext4) if ! "fsck.$P3_FS_TYPE" -y "$P3"; then
+                        FSCK_FAILED=1
+                    fi
+                    ;;
+        zfs_member) P3_FS_TYPE=zfs
+                    if ! chroot /hostfs zpool import -f persist; then
+                        FSCK_FAILED=1
+                    fi
+                    ;;
+                 *) echo "P3 partition $P3 appears to have unrecognized type $P3_FS_TYPE"
+                    FSCK_FAILED=1
+                    ;;
+    esac
+
+    #For systems with ext3 filesystem, try not to change to ext4, since it will brick
+    #the device when falling back to old images expecting P3 to be ext3. Migrate to ext4
+    #when we do usb install, this way the transition is more controlled.
     #Any fsck error (ext3 or ext4), will lead to formatting P3 with ext4
     if [ $FSCK_FAILED = 1 ]; then
         echo "$(date -Ins -u) mkfs.ext4 on $P3 for $PERSISTDIR"
@@ -123,8 +135,6 @@ if P3=$(/hostfs/sbin/findfs PARTLABEL=P3) && [ -n "$P3" ]; then
     if [ "$P3_FS_TYPE" = "ext3" ]; then
         if ! mount -t ext3 -o dirsync,noatime "$P3" $PERSISTDIR; then
             echo "$(date -Ins -u) mount $P3 failed"
-        else
-            init_containerd
         fi
     fi
     #On ext4, enable encryption support before mounting.
@@ -132,10 +142,14 @@ if P3=$(/hostfs/sbin/findfs PARTLABEL=P3) && [ -n "$P3" ]; then
         tune2fs -O encrypt "$P3"
         if ! mount -t ext4 -o dirsync,noatime "$P3" $PERSISTDIR; then
             echo "$(date -Ins -u) mount $P3 failed"
-        else
-            init_containerd
         fi
     fi
+
+    # deposit fs type into /run
+    echo "$P3_FS_TYPE" > /run/eve.persist_type
+    # this is safe, since if the mount fails the following will fail too
+    # shellcheck disable=SC2046
+    rmmod $(lsmod | grep zfs | awk '{print $1;}') || :
 else
     echo "$(date -Ins -u) No separate $PERSISTDIR partition"
 fi
@@ -150,3 +164,12 @@ for BLK_DEVICE in $BLK_DEVICES; do
         ln -s "/dev/$BLK_DEVICE" "$UUID_SYMLINK_PATH/$BLK_UUID"
     fi
 done
+
+# Uncomment the following block if you want storage-init to replace
+# rootfs of service containers with a copy under /persist/services/X
+# each of these is considered to be a proper lowerFS
+# for s in "$PERSISTDIR"/services/* ; do
+#   if [ -d "$s" ]; then
+#      mount --bind "$s" "/containers/services/$(basename "$s")/lower"
+#   fi
+# done

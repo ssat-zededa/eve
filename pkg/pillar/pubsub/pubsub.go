@@ -11,7 +11,8 @@ import (
 	"reflect"
 	"time"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/lf-edge/eve/pkg/pillar/base"
+	"github.com/sirupsen/logrus"
 )
 
 // SubscriptionOptions options to pass when creating a Subscription
@@ -29,6 +30,7 @@ type SubscriptionOptions struct {
 	Activate       bool
 	Ctx            interface{}
 	Persistent     bool
+	MyAgentName    string // For logging
 }
 
 // SubHandler is a generic handler to handle create, modify and delete
@@ -56,7 +58,7 @@ type SubRestartHandler func(ctx interface{}, restarted bool)
 // We use StringMap with a RWlock to allow concurrent access.
 type keyMap struct {
 	restarted bool
-	key       *LockedStringMap
+	key       *base.LockedStringMap
 }
 
 // PubSub is a system for publishing and subscribing to messages
@@ -67,12 +69,16 @@ type keyMap struct {
 type PubSub struct {
 	driver      Driver
 	updaterList *Updaters
+	logger      *logrus.Logger
+	log         *base.LogObject
 }
 
 // New create a new `PubSub` with a given `Driver`.
-func New(driver Driver) *PubSub {
+func New(driver Driver, logger *logrus.Logger, log *base.LogObject) *PubSub {
 	return &PubSub{
 		driver: driver,
+		logger: logger,
+		log:    log,
 	}
 }
 
@@ -88,7 +94,9 @@ func (p *PubSub) NewSubscription(options SubscriptionOptions) (Subscription, err
 
 	topic := TypeToName(options.TopicImpl)
 	topicType := reflect.TypeOf(options.TopicImpl)
-	changes := make(chan Change)
+	// Need some buffering to make sure that when we Close the subscription
+	// the goroutines exit
+	changes := make(chan Change, 3)
 	sub := &SubscriptionImpl{
 		C:                   changes,
 		agentName:           options.AgentName,
@@ -96,7 +104,7 @@ func (p *PubSub) NewSubscription(options SubscriptionOptions) (Subscription, err
 		topic:               topic,
 		topicType:           topicType,
 		userCtx:             options.Ctx,
-		km:                  keyMap{key: NewLockedStringMap()},
+		km:                  keyMap{key: base.NewLockedStringMap()},
 		defaultName:         p.driver.DefaultName(),
 		CreateHandler:       options.CreateHandler,
 		ModifyHandler:       options.ModifyHandler,
@@ -106,6 +114,10 @@ func (p *PubSub) NewSubscription(options SubscriptionOptions) (Subscription, err
 		MaxProcessTimeWarn:  options.WarningTime,
 		MaxProcessTimeError: options.ErrorTime,
 		Persistent:          options.Persistent,
+		logger:              p.logger,
+		log:                 p.log,
+		myAgentName:         options.MyAgentName,
+		ps:                  p,
 	}
 	name := sub.nameString()
 	global := options.AgentName == ""
@@ -115,7 +127,7 @@ func (p *PubSub) NewSubscription(options SubscriptionOptions) (Subscription, err
 	}
 	sub.driver = driver
 
-	log.Infof("Subscribe(%s)\n", name)
+	sub.log.Infof("Subscribe(%s)\n", name)
 	if options.Activate {
 		if err := sub.Activate(); err != nil {
 			return sub, err
@@ -154,14 +166,16 @@ func (p *PubSub) NewPublication(options PublicationOptions) (Publication, error)
 		agentScope:  options.AgentScope,
 		topic:       topic,
 		topicType:   reflect.TypeOf(options.TopicType),
-		km:          keyMap{key: NewLockedStringMap()},
+		km:          keyMap{key: base.NewLockedStringMap()},
 		updaterList: p.updaterList,
 		defaultName: p.driver.DefaultName(),
+		logger:      p.logger,
+		log:         p.log,
 	}
 	// create the driver
 	name := pub.nameString()
 	global := options.AgentName == ""
-	log.Debugf("publishImpl agentName(%s), agentScope(%s), topic(%s), nameString(%s), global(%v), persistent(%v)\n",
+	pub.log.Debugf("publishImpl agentName(%s), agentScope(%s), topic(%s), nameString(%s), global(%v), persistent(%v)\n",
 		options.AgentName, options.AgentScope, topic, name, global, options.Persistent)
 	driver, err := p.driver.Publisher(global, name, topic, options.Persistent, p.updaterList, pub, pub)
 	if err != nil {
@@ -170,10 +184,10 @@ func (p *PubSub) NewPublication(options PublicationOptions) (Publication, error)
 	pub.driver = driver
 
 	pub.populate()
-	if log.GetLevel() == log.DebugLevel {
+	if pub.logger.GetLevel() == logrus.TraceLevel {
 		pub.dump("after populate")
 	}
-	log.Debugf("Publish(%s)\n", name)
+	pub.log.Debugf("Publish(%s)\n", name)
 
 	pub.publisher()
 

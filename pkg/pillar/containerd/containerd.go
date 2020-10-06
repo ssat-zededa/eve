@@ -4,407 +4,355 @@
 package containerd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/containerd/typeurl"
-	"github.com/eriknordmark/netlink"
-	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/opencontainers/image-spec/identity"
-	uuid "github.com/satori/go.uuid"
-	"golang.org/x/sys/unix"
+	"io"
 	"io/ioutil"
+	"math/rand"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	v1stat "github.com/containerd/cgroups/stats/v1"
+	"golang.org/x/sys/unix"
+
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
-	log "github.com/sirupsen/logrus"
+	"github.com/containerd/typeurl"
+	"github.com/eriknordmark/netlink"
+	"github.com/lf-edge/edge-containers/pkg/resolver"
+	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
+
+	v1stat "github.com/containerd/cgroups/stats/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	spec "github.com/opencontainers/image-spec/specs-go/v1"
+	log "github.com/sirupsen/logrus" // XXX add log argument
 )
 
 const (
+	// EVE persist storage type file (content can be: ext3, ext4, zfs)
+	eveStorageTypeFile = "/run/eve.persist_type"
 	// containerd socket
 	ctrdSocket = "/run/containerd/containerd.sock"
-	// ctrdServicesNamespace containerd namespace for running containers
+	// ctrdSystemServicesNamespace containerd namespace for EVE system containers
+	ctrdSystemServicesNamespace = "services.linuxkit"
+	// ctrdServicesNamespace containerd namespace for running user containers
 	ctrdServicesNamespace = "eve-user-apps"
 	//containerdRunTime - default runtime of containerd
 	containerdRunTime = "io.containerd.runtime.v1.linux"
-
-	// root path to all containers
-	containersRoot = types.ROContImgDirname
-	// relative path to rootfs for an individual container
-	containerRootfsPath = "rootfs/"
 	// container config file name
 	imageConfigFilename = "image-config.json"
-	// default snapshotter used by containerd
-	defaultSnapshotter = "overlayfs"
 	// default socket to connect tasks to memlogd
 	logWriteSocket = "/var/run/linuxkit-external-logging.sock"
 	// default socket to read from memlogd
 	logReadSocket = "/var/run/memlogdq.sock"
+
+	//TBD: Have a better way to calculate this number.
+	//For now it is based on some trial-and-error experiments
+	qemuOverHead = int64(500 * 1024 * 1024)
+
 	// default signal to kill tasks
 	defaultSignal = "SIGTERM"
 )
 
 var (
-	ctrdCtx context.Context
+	// default snapshotter used by containerd
+	defaultSnapshotter = "overlayfs"
+	ctrdCtx            context.Context
+	ctrdSystemCtx      context.Context
 	// CtrdClient is a handle to the current containerd client API
-	CtrdClient *containerd.Client
+	CtrdClient   *containerd.Client
+	contentStore content.Store
 )
 
 // InitContainerdClient initializes CtrdClient and ctrdCtx
 func InitContainerdClient() error {
+	log.Infof("InitContainerdClient")
 	var err error
-	ctrdCtx = namespaces.WithNamespace(context.Background(), ctrdServicesNamespace)
-	CtrdClient, err = containerd.New(ctrdSocket, containerd.WithDefaultRuntime(containerdRunTime))
-	if err != nil {
-		log.Errorf("could not create containerd client. %v", err.Error())
-		return fmt.Errorf("initContainerdClient: could not create containerd client. %v", err.Error())
-	}
-	return nil
-}
-
-// GetContainerPath return the path to the root of the container. This is *not*
-// necessarily the rootfs, which may be a layer below
-func GetContainerPath(containerDir string) string {
-	return path.Join(containersRoot, containerDir)
-}
-
-// containerdLoadImageTar load an image tar into the containerd content store
-func containerdLoadImageTar(filename string) (map[string]images.Image, error) {
-	// load the content into the containerd content store
-	var err error
-
-	if CtrdClient == nil {
-		return nil, fmt.Errorf("containerdLoadImageTar: Container client is nil")
-	}
-
 	if ctrdCtx == nil {
-		return nil, fmt.Errorf("containerdLoadImageTar: Container context is nil")
+		ctrdCtx = namespaces.WithNamespace(context.Background(), ctrdServicesNamespace)
 	}
-
-	tarReader, err := os.Open(filename)
-	if err != nil {
-		log.Errorf("could not open tar file for reading at %s: %+s", filename, err.Error())
-		return nil, err
+	if ctrdSystemCtx == nil {
+		ctrdSystemCtx = namespaces.WithNamespace(context.Background(), ctrdSystemServicesNamespace)
 	}
-
-	imgs, err := CtrdClient.Import(ctrdCtx, tarReader)
-	if err != nil {
-		log.Errorf("could not load image tar at %s into containerd: %+s", filename, err.Error())
-		return nil, err
+	if CtrdClient == nil {
+		CtrdClient, err = containerd.New(ctrdSocket, containerd.WithDefaultRuntime(containerdRunTime))
+		if err != nil {
+			log.Errorf("InitContainerdClient: could not create containerd client. %v", err.Error())
+			return fmt.Errorf("initContainerdClient: could not create containerd client. %v", err.Error())
+		}
 	}
-	// successful, so return the list of images we imported
-	names := make(map[string]images.Image)
-	for _, tag := range imgs {
-		names[tag.Name] = tag
-	}
-	return names, nil
-}
-
-// SnapshotRm removes existing snapshot. If silent is true, then operation failures are ignored and no error is returned
-func SnapshotRm(rootPath string, silent bool) error {
-	log.Infof("snapshotRm %s\n", rootPath)
-
-	snapshotID := filepath.Base(rootPath)
-
-	if err := syscall.Unmount(filepath.Join(rootPath, containerRootfsPath), 0); err != nil {
-		err = fmt.Errorf("snapshotRm: exception while unmounting: %v/%v. %v", rootPath, containerRootfsPath, err)
-		log.Error(err.Error())
-		if !silent {
-			return err
+	if contentStore == nil {
+		contentStore = CtrdClient.ContentStore()
+		// see if we need to fine-tune default snapshotter based on what flavor of storage persist partition is
+		persistType, err := ioutil.ReadFile(eveStorageTypeFile)
+		if err == nil && strings.TrimSpace(string(persistType)) == "zfs" {
+			defaultSnapshotter = "zfs"
 		}
 	}
 
-	if err := os.RemoveAll(rootPath); err != nil {
-		err = fmt.Errorf("snapshotRm: exception while deleting: %v. %v", rootPath, err)
-		log.Error(err.Error())
-		if !silent {
-			return err
-		}
-	}
-
-	snapshotter := CtrdClient.SnapshotService(defaultSnapshotter)
-	if err := snapshotter.Remove(ctrdCtx, snapshotID); err != nil {
-		err = fmt.Errorf("snapshotRm: unable to remove snapshot: %v. %v", snapshotID, err)
-		log.Error(err.Error())
-		if !silent {
-			return err
-		}
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("InitContainerdClient: exception while verifying ctrd client: %s", err.Error())
 	}
 	return nil
 }
 
-// SnapshotPrepare prepares a writable snapshot from an OCI layers bundle
-// We always do it from scratch all the way, ignoring any existing state
-// that may have accumulated (like existing snapshots being avilable, etc.)
-// This effectively voids any kind of caching, but on the flip side frees us
-// from cache invalidation. Additionally we deposit an OCI config json file
-// next to the rootfs so that the effective structure becomes:
-//    rootPath/rootfs, rootPath/image-config.json
-// We also expect rootPath to end in a basename that becomes containerd's
-// snapshotID
-func SnapshotPrepare(rootPath string, ociFilename string) error {
-	log.Infof("snapshotPrepare(%s, %s)", rootPath, ociFilename)
-	// On device restart, the existing bundle is not deleted, we need to delete the
-	// existing bundle of the container and recreate it. This is safe to run even
-	// when bundle doesn't exist
-	if SnapshotRm(rootPath, true) != nil {
-		log.Infof("snapshotPrepare: tried to clean up any existing state, hopefully it worked")
+//CloseClient closes containerd client
+func CloseClient() error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CloseClient: exception while verifying ctrd client: %s", err.Error())
 	}
-
-	loadedImages, err := containerdLoadImageTar(ociFilename)
-	if err != nil {
-		log.Errorf("failed to load Image File at %s into containerd: %+s", ociFilename, err.Error())
+	if err := CtrdClient.Close(); err != nil {
+		err = fmt.Errorf("CloseClient: exception while closing containerd client. %v", err.Error())
+		log.Errorf(err.Error())
 		return err
 	}
-
-	// we currently only support one image per file; will change eventually
-	if len(loadedImages) != 1 {
-		log.Errorf("loaded %d images, expected just 1", len(loadedImages))
-	}
-	var image images.Image
-	for _, imgObj := range loadedImages {
-		image = imgObj
-	}
-	// doing this step as we need the image in containerd.Image structure for container create.
-	ctrdImage := containerd.NewImage(CtrdClient, image)
-	imageInfo, err := getImageInfo(ctrdCtx, ctrdImage)
-	if err != nil {
-		return fmt.Errorf("ctrPrepare: unable to get image: %v config: %v", ctrdImage.Name(), err)
-	}
-	mountpoints := imageInfo.Config.Volumes
-	execpath := imageInfo.Config.Entrypoint
-	cmd := imageInfo.Config.Cmd
-	workdir := imageInfo.Config.WorkingDir
-	unProcessedEnv := imageInfo.Config.Env
-	log.Infof("mountPoints %+v execpath %+v cmd %+v workdir %+v env %+v",
-		mountpoints, execpath, cmd, workdir, unProcessedEnv)
-
-	// unpack the rootfs Image if needed
-	unpacked, err := ctrdImage.IsUnpacked(ctrdCtx, defaultSnapshotter)
-	if err != nil {
-		return fmt.Errorf("snapshotPrepare: unable to get image metadata: %v config: %v", ctrdImage.Name(), err)
-	}
-	if !unpacked {
-		if err := ctrdImage.Unpack(ctrdCtx, defaultSnapshotter); err != nil {
-			return fmt.Errorf("snapshotPrepare: unable to unpack image: %v config: %v", ctrdImage.Name(), err)
-		}
-	}
-
-	// use rootfs unpacked image to create a writable snapshot with default snapshotter
-	diffIDs, err := ctrdImage.RootFS(ctrdCtx)
-	if err != nil {
-		log.Errorf("Could not load rootfs of image: %v. %v", ctrdImage.Name(), err)
-		return fmt.Errorf("snapshotPrepare: Could not load rootfs of image: %v. %v", ctrdImage.Name(), err)
-	}
-
-	snapshotter := CtrdClient.SnapshotService(defaultSnapshotter)
-	parent := identity.ChainID(diffIDs).String()
-	snapshotID := filepath.Base(rootPath)
-	labels := map[string]string{"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339)}
-	mounts, err := snapshotter.Prepare(ctrdCtx, snapshotID, parent, snapshots.WithLabels(labels))
-	if err != nil {
-		log.Errorf("Could not create a snapshot from: %s. %v", parent, err)
-		return fmt.Errorf("snapshotPrepare: Could not create a snapshot from: %s. %v", parent, err)
-	} else {
-		if len(mounts) > 1 {
-			return fmt.Errorf("More than 1 mount-point for snapshot %v %v", rootPath, mounts)
-		} else {
-			log.Infof("snapshotPrepare: preared a snapshot for %v with the following mounts: %v", snapshotID, mounts)
-		}
-	}
-
-	// final step is to mount the snapshot into rootPath/containerRootfsPath and unpack
-	// image config OCI json into rootPath/imageConfigFilename
-	rootFsDir := path.Join(rootPath, containerRootfsPath)
-	if err := os.MkdirAll(rootFsDir, 0766); err != nil {
-		return fmt.Errorf("createBundle: Exception while creating rootFS dir. %v", err)
-	}
-	if err = mounts[0].Mount(rootFsDir); err != nil {
-		return fmt.Errorf("Exception while mounting rootfs %v via %v. Error: %v", rootFsDir, mounts, err)
-	}
-
-	// final step is to deposit OCI image config json
-	imageConfigJSON, err := getImageInfoJSON(ctrdCtx, ctrdImage)
-	if err != nil {
-		log.Errorf("Could not build json of image: %v. %v", ctrdImage.Name(), err.Error())
-		return fmt.Errorf("snapshotPrepare: Could not build json of image: %v. %v", ctrdImage.Name(), err.Error())
-	}
-	if err := ioutil.WriteFile(filepath.Join(rootPath, imageConfigFilename), []byte(imageConfigJSON), 0666); err != nil {
-		return fmt.Errorf("createBundle: Exception while writing image info to %v/%v. %v", rootPath, imageConfigFilename, err)
-	}
-
 	return nil
 }
 
-func loadContainer(containerID string) (containerd.Container, error) {
-	if CtrdClient == nil {
-		return nil, fmt.Errorf("loadContainer: Container client is nil")
-	}
-
-	if ctrdCtx == nil {
-		return nil, fmt.Errorf("loadContainer: Container context is nil")
-	}
-
-	container, err := CtrdClient.LoadContainer(ctrdCtx, containerID)
-	if err != nil {
-		err = fmt.Errorf("loadContainer: Exception while loading container: %v", err)
-	}
-	return container, err
-}
-
-func getImageInfo(ctrdCtx context.Context, image containerd.Image) (v1.Image, error) {
-	var ociimage v1.Image
-	ic, err := image.Config(ctrdCtx)
-	if err != nil {
-		return ociimage, fmt.Errorf("getImageConfig: ubable to fetch image: %v config. %v", image.Name(), err.Error())
-	}
-	switch ic.MediaType {
-	case v1.MediaTypeImageConfig, images.MediaTypeDockerSchema2Config:
-		p, err := content.ReadBlob(ctrdCtx, image.ContentStore(), ic)
-		if err != nil {
-			return ociimage, fmt.Errorf("getImageConfig: ubable to read cotentStore of image: %v config. %v", image.Name(), err.Error())
+//CtrWriteBlob reads the blob as raw data from `reader` and writes it into containerd.
+// Accepts a custom context. If ctx is nil, then default context will be used.
+func CtrWriteBlob(ctx context.Context, blobHash string, expectedSize uint64, reader io.Reader) error {
+	if ctx == nil {
+		log.Infof("CtrWriteBlob: No ctx passed. Using default ctrdCtx")
+		if err := verifyCtr(); err != nil {
+			return fmt.Errorf("CtrWriteBlob: exception while verifying ctrd client: %s", err.Error())
 		}
-
-		if err := json.Unmarshal(p, &ociimage); err != nil {
-			return ociimage, fmt.Errorf("getImageConfig: ubable to marshal cotentStore of image: %v config. %v", image.Name(), err.Error())
-
-		}
-	default:
-		return ociimage, fmt.Errorf("unknown image config media type %s", ic.MediaType)
-	}
-	return ociimage, nil
-}
-
-func getImageInfoJSON(ctrdCtx context.Context, image containerd.Image) (string, error) {
-	ociimage, err := getImageInfo(ctrdCtx, image)
-	if err != nil {
-		return "", fmt.Errorf("getImageInfoJSON: ubable to fetch image: %v. %v", image.Name(), err.Error())
-	}
-	return getJSON(ociimage)
-}
-
-// Util methods
-
-// getJSON - returns input in JSON format
-func getJSON(x interface{}) (string, error) {
-	b, err := json.MarshalIndent(x, "", "    ")
-	if err != nil {
-		return "", fmt.Errorf("getJSON: Exception while marshalling container spec JSON. %v", err)
-	}
-	return fmt.Sprint(string(b)), nil
-}
-
-func isContainerNotFound(e error) bool {
-	return strings.HasSuffix(e.Error(), ": not found")
-}
-
-// getContainerPath return the path to the root of the container. This is *not*
-// necessarily the rootfs, which may be a layer below.
-func getContainerPath(containerID string) string {
-	if filepath.IsAbs(containerID) {
-		return containerID
+		ctx = ctrdCtx
 	} else {
-		return path.Join(containersRoot, containerID)
+		if CtrdClient == nil {
+			return fmt.Errorf("CtrWriteBlob: exception while verifying ctrd client: %s",
+				"Container client is nil")
+		}
 	}
+
+	// Check if ctx has a lease before writing a blob to make sure that it doesn't get GCed
+	leaseID, _ := leases.FromContext(ctx)
+	leaseList, _ := CtrdClient.LeasesService().List(ctx, fmt.Sprintf("id==%s", leaseID))
+	if len(leaseList) < 1 {
+		return fmt.Errorf("CtrWriteBlob: could not find lease: %s", leaseID)
+	}
+
+	expectedDigest := digest.Digest(blobHash)
+	if err := expectedDigest.Validate(); err != nil {
+		return fmt.Errorf("CtrWriteBlob: exception while validating hash format of %s. %v", blobHash, err)
+	}
+	if err := content.WriteBlob(ctx, contentStore, blobHash, reader,
+		spec.Descriptor{Digest: expectedDigest, Size: int64(expectedSize)}); err != nil {
+		return fmt.Errorf("CtrWriteBlob: Exception while writing blob: %s. %s", blobHash, err.Error())
+	}
+	return nil
 }
 
-func getSavedImageInfo(containerPath string) (v1.Image, error) {
-	var image v1.Image
-
-	appDir := getContainerPath(containerPath)
-	data, err := ioutil.ReadFile(filepath.Join(appDir, imageConfigFilename))
-	if err != nil {
-		return image, err
+//CtrUpdateBlobInfo updates blobs info
+func CtrUpdateBlobInfo(updatedContentInfo content.Info, updatedFields []string) error {
+	if _, err := contentStore.Update(ctrdCtx, updatedContentInfo, updatedFields...); err != nil {
+		return fmt.Errorf("CtrUpdateBlobInfo: exception while update blobInfo of %s: %s",
+			updatedContentInfo.Digest.String(), err.Error())
 	}
-	if err := json.Unmarshal(data, &image); err != nil {
-		return image, err
+	return nil
+}
+
+//CtrReadBlob return a reader for the blob with given blobHash. Error is returned if no blob is found for the blobHash
+func CtrReadBlob(blobHash string) (io.Reader, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrReadBlob: exception while verifying ctrd client: %s", err.Error())
+	}
+	shaDigest := digest.Digest(blobHash)
+	_, err := contentStore.Info(ctrdCtx, shaDigest)
+	if err != nil {
+		return nil, fmt.Errorf("CtrReadBlob: Exception getting info of blob: %s. %s", blobHash, err.Error())
+	}
+	readerAt, err := contentStore.ReaderAt(ctrdCtx, spec.Descriptor{Digest: shaDigest})
+	if err != nil {
+		return nil, fmt.Errorf("CtrReadBlob: Exception while reading blob: %s. %s", blobHash, err.Error())
+	}
+	return content.NewReader(readerAt), nil
+}
+
+//CtrGetBlobInfo returns a bolb's info as content.Info
+func CtrGetBlobInfo(blobHash string) (content.Info, error) {
+	if err := verifyCtr(); err != nil {
+		return content.Info{}, fmt.Errorf("CtrReadBlob: exception while verifying ctrd client: %s", err.Error())
+	}
+	return contentStore.Info(ctrdCtx, digest.Digest(blobHash))
+}
+
+//CtrListBlobInfo returns a list of blob infos as []content.Info
+func CtrListBlobInfo() ([]content.Info, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrListBlobInfo: exception while verifying ctrd client: %s", err.Error())
+	}
+	infos := make([]content.Info, 0)
+	walkFn := func(info content.Info) error {
+		infos = append(infos, info)
+		return nil
+	}
+	if err := contentStore.Walk(ctrdCtx, walkFn); err != nil {
+		return nil, fmt.Errorf("CtrListBlobInfo: Exception while getting content list. %s", err.Error())
+	}
+	return infos, nil
+}
+
+//CtrDeleteBlob deletes blob with the given blobHash
+func CtrDeleteBlob(blobHash string) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrDeleteBlob: exception while verifying ctrd client: %s", err.Error())
+	}
+	return contentStore.Delete(ctrdCtx, digest.Digest(blobHash))
+}
+
+//CtrCreateImage create an image in containerd's image store
+func CtrCreateImage(image images.Image) (images.Image, error) {
+	if err := verifyCtr(); err != nil {
+		return images.Image{}, fmt.Errorf("CtrCreateImage: exception while verifying ctrd client: %s", err.Error())
+	}
+	return CtrdClient.ImageService().Create(ctrdCtx, image)
+}
+
+//CtrLoadImage reads image as raw data from `reader` and loads it into containerd
+func CtrLoadImage(ctx context.Context, reader *os.File) ([]images.Image, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrLoadImage: exception while verifying ctrd client: %s", err.Error())
+	}
+	imgs, err := CtrdClient.Import(ctx, reader)
+	if err != nil {
+		log.Errorf("CtrLoadImage: could not load image %s into containerd: %+s", reader.Name(), err.Error())
+		return nil, err
+	}
+	return imgs, nil
+}
+
+//CtrGetImage returns image object for the reference. Returns error if no image is found for the reference.
+func CtrGetImage(reference string) (containerd.Image, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrGetImage: exception while verifying ctrd client: %s", err.Error())
+	}
+	image, err := CtrdClient.GetImage(ctrdCtx, reference)
+	if err != nil {
+		log.Errorf("CtrGetImage: could not get image %s from containerd: %+s", reference, err.Error())
+		return nil, err
 	}
 	return image, nil
 }
 
-// bind mount a namespace file
-func bindNS(ns string, path string, pid int) error {
-	if path == "" {
-		return nil
+//CtrListImages returns a list of images object from ontainerd's image store
+func CtrListImages() ([]images.Image, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrListImages: exception while verifying ctrd client: %s", err.Error())
 	}
-	// the path and file need to exist for the bind to succeed, so try to create
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("Cannot create leading directories %s for bind mount destination: %v", dir, err)
+	return CtrdClient.ImageService().List(ctrdCtx)
+}
+
+//CtrUpdateImage updates the files provided in fieldpaths of the image in containerd'd image store
+func CtrUpdateImage(image images.Image, fieldpaths ...string) (images.Image, error) {
+	if err := verifyCtr(); err != nil {
+		return images.Image{}, fmt.Errorf("CtrUpdateImage: exception while verifying ctrd client: %s", err.Error())
 	}
-	fi, err := os.Create(path)
+	return CtrdClient.ImageService().Update(ctrdCtx, image, fieldpaths...)
+}
+
+//CtrDeleteImage deletes an image with the given reference
+func CtrDeleteImage(reference string) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrDeleteImage: exception while verifying ctrd client: %s", err.Error())
+	}
+	return CtrdClient.ImageService().Delete(ctrdCtx, reference)
+}
+
+//CtrPrepareSnapshot creates snapshot for the given image
+func CtrPrepareSnapshot(snapshotID string, image containerd.Image) ([]mount.Mount, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrPrepareSnapshot: exception while verifying ctrd client: %s", err.Error())
+	}
+	// use rootfs unpacked image to create a writable snapshot with default snapshotter
+	diffIDs, err := image.RootFS(ctrdCtx)
 	if err != nil {
-		return fmt.Errorf("Cannot create a mount point for namespace bind at %s: %v", path, err)
+		err = fmt.Errorf("CtrPrepareSnapshot: Could not load rootfs of image: %v. %v", image.Name(), err)
+		return nil, err
 	}
-	if err := fi.Close(); err != nil {
+
+	snapshotter := CtrdClient.SnapshotService(defaultSnapshotter)
+	parent := identity.ChainID(diffIDs).String()
+	labels := map[string]string{"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339)}
+	return snapshotter.Prepare(ctrdCtx, snapshotID, parent, snapshots.WithLabels(labels))
+}
+
+//CtrMountSnapshot mounts the snapshot with snapshotID on the given targetPath.
+func CtrMountSnapshot(snapshotID, targetPath string) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrMountSnapshot: exception while verifying ctrd client: %s", err.Error())
+	}
+	snapshotter := CtrdClient.SnapshotService(defaultSnapshotter)
+	mounts, err := snapshotter.Mounts(ctrdCtx, snapshotID)
+	if err != nil {
+		return fmt.Errorf("CtrMountSnapshot: Exception while fetching mounts of snapshot: %s. %s", snapshotID, err)
+	}
+	if err := os.MkdirAll(targetPath, 0766); err != nil {
+		return fmt.Errorf("CtrMountSnapshot: Exception while creating targetPath dir. %v", err)
+	}
+	return mounts[0].Mount(targetPath)
+}
+
+//CtrListSnapshotInfo returns a list of all snapshot's info present in containerd's snapshot store.
+func CtrListSnapshotInfo() ([]snapshots.Info, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrListSnapshotInfo: exception while verifying ctrd client: %s", err.Error())
+	}
+	snapshotter := CtrdClient.SnapshotService(defaultSnapshotter)
+	snapshotInfoList := make([]snapshots.Info, 0)
+	if err := snapshotter.Walk(ctrdCtx, func(i context.Context, info snapshots.Info) error {
+		snapshotInfoList = append(snapshotInfoList, info)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("CtrListSnapshotInfo: Execption while fetching snapshot list. %s", err.Error())
+	}
+	return snapshotInfoList, nil
+}
+
+//CtrRemoveSnapshot removed snapshot by ID from containerd
+func CtrRemoveSnapshot(snapshotID string) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrRemoveSnapshot: exception while verifying ctrd client: %s", err.Error())
+	}
+	snapshotter := CtrdClient.SnapshotService(defaultSnapshotter)
+	if err := snapshotter.Remove(ctrdCtx, snapshotID); err != nil {
+		log.Errorf("CtrRemoveSnapshot: unable to remove snapshot: %v. %v", snapshotID, err)
 		return err
 	}
-	if err := unix.Mount(fmt.Sprintf("/proc/%d/ns/%s", pid, ns), path, "", unix.MS_BIND, ""); err != nil {
-		return fmt.Errorf("Failed to bind %s namespace at %s: %v", ns, path, err)
-	}
 	return nil
 }
 
-// prepareProcess sets up anything that needs to be done after the container process is created,
-// but before it runs (for example networking)
-func prepareProcess(pid int, VifList []types.VifInfo) error {
-	log.Infof("prepareProcess(%d, %v)", pid, VifList)
-	for _, iface := range VifList {
-		if iface.Vif == "" {
-			return fmt.Errorf("Interface requires a name")
-		}
-
-		var link netlink.Link
-		var err error
-
-		link, err = netlink.LinkByName(iface.Vif)
-		if err != nil {
-			return fmt.Errorf("Cannot find interface %s: %v", iface.Vif, err)
-		}
-
-		if err := netlink.LinkSetNsPid(link, int(pid)); err != nil {
-			return fmt.Errorf("Cannot move interface %s into namespace: %v", iface.Vif, err)
-		}
+//CtrLoadContainer returns conatiner with the given `containerID`. Error is returned if there no container is found.
+func CtrLoadContainer(containerID string) (containerd.Container, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrLoadContainer: exception while verifying ctrd client: %s", err.Error())
 	}
-
-	binds := []struct {
-		ns   string
-		path string
-	}{
-		{"cgroup", ""},
-		{"ipc", ""},
-		{"mnt", ""},
-		{"net", ""},
-		{"pid", ""},
-		{"user", ""},
-		{"uts", ""},
+	container, err := CtrdClient.LoadContainer(ctrdCtx, containerID)
+	if err != nil {
+		err = fmt.Errorf("CtrLoadContainer: Exception while loading container: %v", err)
 	}
-
-	for _, b := range binds {
-		if err := bindNS(b.ns, b.path, pid); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return container, err
 }
 
-// CtrList returns a list of all known container IDs
-func CtrList() ([]string, error) {
+//CtrListContainerIds returns a list of all known container IDs
+func CtrListContainerIds() ([]string, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrListContainerIds: exception while verifying ctrd client: %s", err.Error())
+	}
 	res := []string{}
-	ctrs, err := CtrdClient.Containers(ctrdCtx)
+	ctrs, err := CtrListContainer()
 	if err != nil {
 		return nil, err
 	}
@@ -414,9 +362,20 @@ func CtrList() ([]string, error) {
 	return res, nil
 }
 
-// GetMetrics returns all runtime metrics associated with a container ID
-func GetMetrics(ctrID string) (*v1stat.Metrics, error) {
-	c, err := CtrdClient.LoadContainer(ctrdCtx, ctrID)
+//CtrListContainer returns a list of containerd.Container ibjects
+func CtrListContainer() ([]containerd.Container, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrListContainer: exception while verifying ctrd client: %s", err.Error())
+	}
+	return CtrdClient.Containers(ctrdCtx)
+}
+
+// CtrGetContainerMetrics returns all runtime metrics associated with a container ID
+func CtrGetContainerMetrics(containerID string) (*v1stat.Metrics, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrGetContainerMetrics: exception while verifying ctrd client: %s", err.Error())
+	}
+	c, err := CtrLoadContainer(containerID)
 	if err != nil {
 		return nil, err
 	}
@@ -444,53 +403,52 @@ func GetMetrics(ctrID string) (*v1stat.Metrics, error) {
 	}
 }
 
-// CtrInfo looks up
-func CtrInfo(name string) (int, string, error) {
-	c, err := loadContainer(name)
-	if err == nil {
-		if t, err := c.Task(ctrdCtx, nil); err == nil {
-			if stat, err := t.Status(ctrdCtx); err == nil {
-				return int(t.Pid()), string(stat.Status), nil
-			}
-		}
+// CtrContainerInfo returns PID, exit code and status of a container's main task
+// Status can be one of the: created, running, pausing, paused, stopped, unknown
+// For tasks that are in the running, pausing or paused state the PID is also provided
+// and the exit code is set to 0. For tasks in the stopped state, exit code is provided
+// and the PID is set to 0.
+func CtrContainerInfo(name string) (int, int, string, error) {
+	if err := verifyCtr(); err != nil {
+		return 0, 0, "", fmt.Errorf("CtrContainerInfo: exception while verifying ctrd client: %s", err.Error())
 	}
-	return 0, "", err
+
+	c, err := CtrLoadContainer(name)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("CtrContainerInfo: couldn't load container %s: %v", name, err)
+	}
+
+	t, err := c.Task(ctrdCtx, nil)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("CtrContainerInfo: couldn't load task for container %s: %v", name, err)
+	}
+
+	stat, err := t.Status(ctrdCtx)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("CtrContainerInfo: couldn't determine task status for container %s: %v", name, err)
+	}
+
+	return int(t.Pid()), int(stat.ExitStatus), string(stat.Status), nil
 }
 
-// CtrStart starts the default task in a pre-existing container and attaches its logging to memlogd
-func CtrStart(domainName string) (int, error) {
-	ctr, err := loadContainer(domainName)
+// CtrCreateTask creates (but doesn't start) the default task in a pre-existing container and attaches its logging to memlogd
+func CtrCreateTask(domainName string) (int, error) {
+	if err := verifyCtr(); err != nil {
+		return 0, fmt.Errorf("CtrStartContainer: exception while verifying ctrd client: %s", err.Error())
+	}
+	ctr, err := CtrLoadContainer(domainName)
 	if err != nil {
 		return 0, err
 	}
 
 	logger := GetLog()
 
-	// This is silly but necessary due to containerd bug
-	// https://github.com/containerd/containerd/issues/4019
-	// essentially, when you create a container and then remove it,
-	// containerd blows away everything in the parent dir of the first one it finds,
-	// in this case, "/dev/null", so it blows away everything in "/dev".
-	// This most certainly is a "bad thing".
-	//
-	// To fix it temporarily, we are creating a tmpdir and creating a null
-	// device there, so that it can blow away the tempdir
-	stdinDir := path.Join("/run", "containers-stdin", domainName)
-	if err := os.MkdirAll(stdinDir, 0700); err != nil {
-		return 0, err
-	}
-	stdinFile := path.Join(stdinDir, "null")
-	// make a dev null in stdinDir
-	if err := syscall.Mknod(stdinFile, uint32(os.FileMode(0660)|syscall.S_IFCHR), int(unix.Mkdev(1, 3))); err != nil {
-		return 0, err
-	}
-
 	io := func(id string) (cio.IO, error) {
-		stdoutFile := logger.Path(domainName + ".out")
-		stderrFile := logger.Path(domainName)
+		stdoutFile := logger.Path("guest_vm-" + domainName)
+		stderrFile := logger.Path("guest_vm_err-" + domainName)
 		return &logio{
 			cio.Config{
-				Stdin:    stdinFile,
+				Stdin:    "/dev/null",
 				Stdout:   stdoutFile,
 				Stderr:   stderrFile,
 				Terminal: false,
@@ -502,20 +460,131 @@ func CtrStart(domainName string) (int, error) {
 		return 0, err
 	}
 
-	if err := prepareProcess(int(task.Pid()), nil); err != nil {
-		return 0, err
-	}
-
-	if err := task.Start(ctrdCtx); err != nil {
-		return 0, err
-	}
-
 	return int(task.Pid()), nil
 }
 
-// CtrStop stops (kills) the main task in the container
-func CtrStop(containerID string, force bool) error {
-	ctr, err := CtrdClient.LoadContainer(ctrdCtx, containerID)
+// CtrListTaskIds returns a list of all known tasks
+func CtrListTaskIds() ([]string, error) {
+	if err := verifyCtr(); err != nil {
+		return nil, fmt.Errorf("CtrListContainerIds: exception while verifying ctrd client: %s", err.Error())
+	}
+
+	tasks, err := CtrdClient.TaskService().List(ctrdCtx, &tasks.ListTasksRequest{})
+	if err != nil {
+		return nil, err
+	}
+
+	var res []string
+	for _, v := range tasks.Tasks {
+		res = append(res, v.ID)
+	}
+	return res, nil
+}
+
+// CtrStartTask starts the default task in a pre-existing container that was prepared by CtrCreateTask
+func CtrStartTask(domainName string) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrStartContainer: exception while verifying ctrd client: %s", err.Error())
+	}
+	ctr, err := CtrLoadContainer(domainName)
+	if err != nil {
+		return err
+	}
+
+	task, err := ctr.Task(ctrdCtx, nil)
+	if err != nil {
+		return err
+	}
+
+	if err := prepareProcess(int(task.Pid()), nil); err != nil {
+		return err
+	}
+
+	return task.Start(ctrdCtx)
+}
+
+// ctrExec starts the executable in a running container and attaches its logging to memlogd
+func ctrExec(ctx context.Context, domainName string, args []string) (string, string, error) {
+	if err := verifyCtr(); err != nil {
+		return "", "", fmt.Errorf("ctrExec: exception while verifying ctrd client: %s", err.Error())
+	}
+	ctr, err := CtrdClient.LoadContainer(ctx, domainName)
+	if err != nil {
+		return "", "", fmt.Errorf("ctrExec: Exception while loading container: %v", err)
+	}
+
+	spec, err := ctr.Spec(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	task, err := ctr.Task(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+
+	pspec := spec.Process
+	pspec.Terminal = true
+	pspec.Args = args
+
+	// plumb the process for I/O
+	var (
+		stdOut bytes.Buffer
+		stdErr bytes.Buffer
+	)
+	cioOpts := []cio.Opt{cio.WithStreams(new(bytes.Buffer), &stdOut, &stdErr), cio.WithFIFODir(fifoDir)}
+	// exec-id for task.Exec can NOT be longer than 71 runes, on top of that it has to match:
+	//   ^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*$:
+	process, err := task.Exec(ctx, fmt.Sprintf("%.50s%.20d", domainName, rand.Int()), pspec, cio.NewCreator(cioOpts...))
+	if err != nil {
+		return "", "", err
+	}
+	defer process.Delete(ctx)
+
+	// prepare an exit code channel
+	statusC, err := process.Wait(ctx)
+	if err != nil {
+		return "", "", err
+	}
+
+	// finally - run it (asynchronously)
+	if err := process.Start(ctx); err != nil {
+		return "", "", err
+	}
+
+	// block until the process exits or the timer fires
+	timer := time.NewTimer(30 * time.Second)
+	select {
+	case status := <-statusC:
+		if code, _, e := status.Result(); e == nil && code != 0 {
+			err = fmt.Errorf("execution failed with exit status %d", code)
+		} else {
+			err = e
+		}
+	case <-timer.C:
+		err = fmt.Errorf("execution timed out")
+	}
+
+	st, ee := process.Status(ctx)
+	log.Debugf("ctrExec process exited with: %v %v %d %d %d %d", st, ee, stdOut.Cap(), stdOut.Len(), stdErr.Cap(), stdErr.Len())
+	return stdOut.String(), stdErr.String(), err
+}
+
+// CtrExec starts the executable in a running user container
+func CtrExec(domainName string, args []string) (string, string, error) {
+	return ctrExec(ctrdCtx, domainName, args)
+}
+
+// CtrSystemExec starts the executable in a running system (EVE's) container
+func CtrSystemExec(domainName string, args []string) (string, string, error) {
+	return ctrExec(ctrdSystemCtx, domainName, args)
+}
+
+// CtrStopContainer stops (kills) the main task in the container
+func CtrStopContainer(containerID string, force bool) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrStopContainer: exception while verifying ctrd client: %s", err.Error())
+	}
+	ctr, err := CtrLoadContainer(containerID)
 	if err != nil {
 		return fmt.Errorf("can't find cotainer %s (%v)", containerID, err)
 	}
@@ -547,75 +616,99 @@ func CtrStop(containerID string, force bool) error {
 	return err
 }
 
-// CtrDelete is a simple wrapper around container.Delete()
-func CtrDelete(containerID string) error {
-	ctr, err := loadContainer(containerID)
+// CtrDeleteContainer is a simple wrapper around container.Delete()
+func CtrDeleteContainer(containerID string) error {
+	if err := verifyCtr(); err != nil {
+		return fmt.Errorf("CtrDeleteContainer: exception while verifying ctrd client: %s", err.Error())
+	}
+	ctr, err := CtrLoadContainer(containerID)
 	if err != nil {
 		return err
 	}
 
 	// do this just in case
-	_ = CtrStop(containerID, true)
+	_ = CtrStopContainer(containerID, true)
 
 	return ctr.Delete(ctrdCtx)
 }
 
-// CtrPrepareMount creates special files for running container inside a VM
-func CtrPrepareMount(containerID uuid.UUID, containerPath string, envVars map[string]string, noOfDisks int) error {
-	log.Infof("ctrPrepareMount(%s, %s, %v, %d)", containerID, containerPath,
-		envVars, noOfDisks)
-	imageInfo, err := getSavedImageInfo(containerPath)
-	if err != nil {
-		log.Errorf("ctrPrepareMount(%s, %s) getImageInfo failed: %s",
-			containerID, containerPath, err)
-		return err
-	}
-	// inject a few files of our own into the bundle
-	mountpoints, execpath, workdir, env, err := getContainerConfigs(imageInfo, envVars)
-	if err != nil {
-		log.Errorf("ctrPrepareMount(%s, %s) getContainerConfigs failed: %s",
-			containerID, containerPath, err)
-		return fmt.Errorf("ctrPrepare: unable to get container config: %v", err)
-	}
-
-	err = createMountPointExecEnvFiles(containerPath, mountpoints, execpath, workdir, env, noOfDisks)
-	if err != nil {
-		log.Errorf("ctrPrepareMount(%s, %s) createMountPointExecEnvFiles failed: %s",
-			containerID, containerPath, err)
-	}
-	return err
+// Resolver return a resolver.ResolverCloser that can read from containerd
+func Resolver() (resolver.ResolverCloser, error) {
+	_, res, err := resolver.NewContainerdWithClient(ctrdCtx, CtrdClient)
+	return res, err
 }
 
-// getContainerConfigs get the container configs needed, specifically
-// - mount target paths
-// - exec path
-// - working directory
-// - env var key/value pairs
-// this can change based on the config format
-func getContainerConfigs(imageInfo v1.Image, userEnvVars map[string]string) (map[string]struct{}, []string, string, []string, error) {
+// LKTaskPrepare creates a new containter based on linuxkit /container/services runtime
+// OCI spec file and optional bundle of DomainConfig settings and command line options.
+// Because we're expecting a linuxkit produced filesystem layout we expect R/O portion of the
+// filesystem to be available under `dirname specFile`/lower and we will be mounting
+// it R/O into the container. On top of that we expect the usual suspects of /run,
+// /persist and /config to be taken care of by the OCI config that lk produced.
+func LKTaskPrepare(name, linuxkit string, domSettings *types.DomainConfig, domStatus *types.DomainStatus, memOverhead int64, args []string) error {
+	config := "/containers/services/" + linuxkit + "/config.json"
+	rootfs := "/containers/services/" + linuxkit + "/rootfs"
 
-	mountpoints := imageInfo.Config.Volumes
-	execpath := imageInfo.Config.Entrypoint
-	execpath = append(execpath, imageInfo.Config.Cmd...)
-	workdir := imageInfo.Config.WorkingDir
-	unProcessedEnv := imageInfo.Config.Env
-	var env []string
-	for _, e := range unProcessedEnv {
-		keyAndValueSlice := strings.Split(e, "=")
-		if len(keyAndValueSlice) == 2 {
-			//handles Key=Value case
-			env = append(env, fmt.Sprintf("%s=\"%s\"", keyAndValueSlice[0], keyAndValueSlice[1]))
-		} else {
-			//handles Key= case
-			env = append(env, e)
+	log.Infof("Starting LKTaskLaunch for %s", linuxkit)
+	f, err := os.Open("/hostfs" + config)
+	if err != nil {
+		return fmt.Errorf("LKTaskLaunch: can't open spec file %s %v", config, err)
+	}
+	defer f.Close()
+
+	spec, err := NewOciSpec(name)
+	if err != nil {
+		return fmt.Errorf("LKTaskLaunch: NewOciSpec failed with error %v", err)
+	}
+	if err = spec.Load(f); err != nil {
+		return fmt.Errorf("LKTaskLaunch: can't load spec file from %s %v", config, err)
+	}
+
+	spec.Get().Root.Path = rootfs
+	spec.Get().Root.Readonly = true
+	if spec.Get().Linux != nil {
+		spec.Get().Linux.CgroupsPath = fmt.Sprintf("/%s/%s", ctrdServicesNamespace, name)
+	}
+	if domSettings != nil {
+		spec.UpdateFromDomain(*domSettings)
+		if memOverhead > 0 {
+			spec.AdjustMemLimit(*domSettings, memOverhead)
 		}
+		spec.UpdateMountsNested(domStatus.DiskStatusList)
 	}
 
-	for k, v := range userEnvVars {
-		env = append(env, fmt.Sprintf("%s=\"%s\"", k, v))
+	if args != nil {
+		spec.Get().Process.Args = args
 	}
-	return mountpoints, execpath, workdir, env, nil
+
+	return spec.CreateContainer(true)
 }
+
+//CtrCreateCtxWithLease returns a new containerd context with a 24 hrs lease and a func to delete the lease after use.
+func CtrCreateCtxWithLease() (context.Context, func() error, error) {
+	if CtrdClient == nil {
+		return nil, nil, fmt.Errorf("CtrCreateCtxWithLease: exception while verifying ctrd client: " +
+			"Container client is nil")
+	}
+	var (
+		err  error
+		done func(context.Context) error
+	)
+	newCtrdCtx := namespaces.WithNamespace(context.Background(), ctrdServicesNamespace)
+	newCtrdCtx, done, err = CtrdClient.WithLease(newCtrdCtx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("CtrCreateCtxWithLease: exception while creating lease: %s", err.Error())
+	}
+	return newCtrdCtx, func() error {
+		if err := done(newCtrdCtx); err != nil {
+			err = fmt.Errorf("CtrCreateCtxWithLease: exception while deleting newCtrdCtx: %s", err.Error())
+			log.Errorf(err.Error())
+			return err
+		}
+		return nil
+	}, nil
+}
+
+// Util methods
 
 // FIXME: once we move to runX this function is going to go away
 func createMountPointExecEnvFiles(containerPath string, mountpoints map[string]struct{}, execpath []string, workdir string, env []string, noOfDisks int) error {
@@ -699,42 +792,125 @@ func createMountPointExecEnvFiles(containerPath string, mountpoints map[string]s
 	return nil
 }
 
-// LKTaskLaunch runs a task in a new containter created as per linuxkit runtime OCI spec
-// file and optional bundle of DomainConfig settings and command line options. Because
-// we're expecting a linuxkit produced filesystem layout we expect R/O portion of the
-// filesystem to be available under `dirname specFile`/lower and we will be mounting
-// it R/O into the container. On top of that we expect the usual suspects of /run,
-// /persist and /config to be taken care of by the OCI config that lk produced.
-func LKTaskLaunch(name, linuxkit string, domSettings *types.DomainConfig, args []string) (int, error) {
-	config := "/containers/services" + linuxkit + "/config.json"
-	rootfs := "/containers/services" + linuxkit + "/lower"
+// getContainerConfigs get the container configs needed, specifically
+// - mount target paths
+// - exec path
+// - working directory
+// - env var key/value pairs
+// this can change based on the config format
+func getContainerConfigs(imageInfo ocispec.Image, userEnvVars map[string]string) (map[string]struct{}, []string, string, []string, error) {
 
-	f, err := os.Open(config)
+	mountpoints := imageInfo.Config.Volumes
+	execpath := imageInfo.Config.Entrypoint
+	execpath = append(execpath, imageInfo.Config.Cmd...)
+	workdir := imageInfo.Config.WorkingDir
+	unProcessedEnv := imageInfo.Config.Env
+	var env []string
+	for _, e := range unProcessedEnv {
+		keyAndValueSlice := strings.SplitN(e, "=", 2)
+		if len(keyAndValueSlice) == 2 {
+			//handles Key=Value case
+			env = append(env, fmt.Sprintf("%s=\"%s\"", keyAndValueSlice[0], keyAndValueSlice[1]))
+		} else {
+			//handles Key= case
+			env = append(env, e)
+		}
+	}
+
+	for k, v := range userEnvVars {
+		env = append(env, fmt.Sprintf("%s=\"%s\"", k, v))
+	}
+	return mountpoints, execpath, workdir, env, nil
+}
+
+// prepareProcess sets up anything that needs to be done after the container process is created,
+// but before it runs (for example networking)
+func prepareProcess(pid int, VifList []types.VifInfo) error {
+	log.Infof("prepareProcess(%d, %v)", pid, VifList)
+	for _, iface := range VifList {
+		if iface.Vif == "" {
+			return fmt.Errorf("Interface requires a name")
+		}
+
+		var link netlink.Link
+		var err error
+
+		link, err = netlink.LinkByName(iface.Vif)
+		if err != nil {
+			return fmt.Errorf("prepareProcess: Cannot find interface %s: %v", iface.Vif, err)
+		}
+
+		if err := netlink.LinkSetNsPid(link, int(pid)); err != nil {
+			return fmt.Errorf("prepareProcess: Cannot move interface %s into namespace: %v", iface.Vif, err)
+		}
+	}
+
+	binds := []struct {
+		ns   string
+		path string
+	}{
+		{"cgroup", ""},
+		{"ipc", ""},
+		{"mnt", ""},
+		{"net", ""},
+		{"pid", ""},
+		{"user", ""},
+		{"uts", ""},
+	}
+
+	for _, b := range binds {
+		if err := bindNS(b.ns, b.path, pid); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func getSavedImageInfo(containerPath string) (ocispec.Image, error) {
+	var image ocispec.Image
+
+	data, err := ioutil.ReadFile(filepath.Join(containerPath, imageConfigFilename))
 	if err != nil {
-		return 0, fmt.Errorf("can't open spec file %s %v", config, err)
+		return image, err
+	}
+	if err := json.Unmarshal(data, &image); err != nil {
+		return image, err
+	}
+	return image, nil
+}
+
+//verifyCtr verifies is containerd client and context.
+func verifyCtr() error {
+	if CtrdClient == nil {
+		return fmt.Errorf("verifyCtr: Container client is nil")
 	}
 
-	spec, err := NewOciSpec(name)
+	if ctrdCtx == nil {
+		return fmt.Errorf("verifyCtr: Container context is nil")
+	}
+	return nil
+}
+
+// bind mount a namespace file
+func bindNS(ns string, path string, pid int) error {
+	if path == "" {
+		return nil
+	}
+	// the path and file need to exist for the bind to succeed, so try to create
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("bindNS: Cannot create leading directories %s for bind mount destination: %v", dir, err)
+	}
+	fi, err := os.Create(path)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("bindNS: Cannot create a mount point for namespace bind at %s: %v", path, err)
 	}
-	if err = spec.Load(f); err != nil {
-		return 0, fmt.Errorf("can't load spec file from %s %v", config, err)
+	if err := fi.Close(); err != nil {
+		return err
 	}
-
-	spec.Root.Path = rootfs
-	spec.Root.Readonly = true
-	if domSettings != nil {
-		spec.UpdateFromDomain(*domSettings)
+	if err := unix.Mount(fmt.Sprintf("/proc/%d/ns/%s", pid, ns), path, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bindNS: Failed to bind %s namespace at %s: %v", ns, path, err)
 	}
-
-	if args != nil {
-		spec.Process.Args = args
-	}
-
-	if err = spec.CreateContainer(true); err == nil {
-		return CtrStart(name)
-	}
-
-	return 0, err
+	return nil
 }

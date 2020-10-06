@@ -51,13 +51,13 @@ PARTS=${*:-"efi imga imgb conf persist"}
 PARTITION_TYPE_USR_X86_64=5dfbf5f4-2848-4bac-aa5e-0d9a20b745a6
 
 # EFI partition size in bytes 
-EFI_PART_SIZE=$((1536 * 1024))
+EFI_PART_SIZE=$((36 * 1024 * 1024))
 # rootfs partition size in bytes
 ROOTFS_PART_SIZE=$(( 300 * 1024 * 1024 ))
 # conf partition size in bytes
 CONF_PART_SIZE=$((1024 * 1024))
 # installer inventory parition size in bytes
-WIN_INVENTORY_PART_SIZE=$((10240 * 1024))
+WIN_INVENTORY_PART_SIZE=$((40240 * 1024))
 # installer system parition size in bytes
 INSTALLER_SYS_PART_SIZE=$(( 300 * 1024 * 1024 ))
 # boot partition size
@@ -102,9 +102,12 @@ dir2vfat() {
   # <img name> dir2vfat <dir> <image size> [label]
   local IMG=`mktemp -u -p /tmp/data`
   local LABEL=${3:-EVE}
+  local FORCE_FAT32="-F32"
+  # FAT32 can only reside on disks larger than 33Mb
+  [ "$2" -lt 33792 ] && FORCE_FAT32="-v"
   (rm -rf /tmp/data
    mkdir /tmp/data
-   mkfs.vfat -v -n "$LABEL" -C "$IMG" "$2"
+   mkfs.vfat "$FORCE_FAT32" -v -n "$LABEL" -C "$IMG" "$2"
    mcopy -i $IMG -s $1/* ::/ ) >&2
   echo $IMG
 }
@@ -345,7 +348,7 @@ case "$(sgdisk -p $IMGFILE 2>/dev/null | sed -ne '/^Number/,$s/^.* //p' | tr '\0
 esac
 
 for p in $PARTS ; do
-  eval do_$p CUR_SEC 2>/dev/null
+  eval do_$p CUR_SEC
 done
 
 # Create a hybrid MBR to allow booting on legacy BIOS PC systems and ARM boards that

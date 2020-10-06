@@ -6,27 +6,56 @@ package upgradeconverter
 import (
 	"flag"
 
-	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
-var conversionHandlers = []ConversionHandler{
+//UCPhase tells us which phase we are in
+type UCPhase uint32
+
+//Different UCPhase phases we support
+const (
+	UCPhasePreVault UCPhase = iota + 0
+	UCPhasePostVault
+)
+
+//preVaultconversionHandlers run before vault is ready
+//Any handler that interacts with types.SealedDirName
+//should be in postVaultconversionHandlers
+var preVaultconversionHandlers = []ConversionHandler{
 	{
 		description: "Convert Global Settings to new format",
 		handlerFunc: convertGlobalConfig,
 	},
 }
 
+//postVaultconversionHandlers run after vault is setup
+//Any handler that is not related to types.SealedDirName
+//should be in preVaultconversionHandlers
+var postVaultconversionHandlers = []ConversionHandler{
+	{
+		description: "Move volumes to /persist/vault",
+		handlerFunc: convertPersistVolumes,
+	},
+	{
+		description: "Move verified files to /persist/vault/verifier/verified",
+		handlerFunc: renameVerifiedFiles,
+	},
+}
+
 type ucContext struct {
 	agentName     string
 	debugOverride bool
+	noFlag        bool
 
 	// FilePaths. These are defined here instead of consts for easier unit tests
+	persistDir       string
 	persistConfigDir string
 	varTmpDir        string
+	ps               *pubsub.PubSub
 }
 
 func (ctx ucContext) configItemValueMapDir() string {
@@ -42,9 +71,29 @@ func (ctx ucContext) globalConfigFile() string {
 	return ctx.globalConfigDir() + "/global.json"
 }
 
-func runHandlers(ctxPtr *ucContext) {
-	for _, handler := range conversionHandlers {
-		log.Printf("upgradeconverter.Run: Running Conversion handler: %s",
+// Old location for volumes
+func (ctx ucContext) imgDir() string {
+	return ctx.persistDir + "/img/"
+}
+
+// Old location for volumes
+func (ctx ucContext) preparedDir() string {
+	return ctx.persistDir + "/runx/pods/prepared/"
+}
+
+// New location for volumes
+func (ctx ucContext) volumesDir() string {
+	return ctx.persistDir + "/vault/volumes/"
+}
+
+// checkpoint file for EdgeDevConfig
+func (ctx ucContext) configCheckpointFile() string {
+	return ctx.persistDir + "/checkpoint/lastconfig"
+}
+
+func runHandlers(ctxPtr *ucContext, handlers []ConversionHandler) {
+	for _, handler := range handlers {
+		log.Infof("upgradeconverter.Run: Running Conversion handler: %s",
 			handler.description)
 		err := handler.handlerFunc(ctxPtr)
 		if err != nil {
@@ -54,27 +103,49 @@ func runHandlers(ctxPtr *ucContext) {
 	}
 }
 
+var logger *logrus.Logger
+var log *base.LogObject
+
 // Run - runs the main upgradeconverter process
-func Run(ps *pubsub.PubSub) {
-	log.Infof("upgradeconverter.Run")
+func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
+	logger = loggerArg
+	log = logArg
 	ctx := &ucContext{agentName: "upgradeconverter",
+		persistDir:       types.PersistDir,
 		persistConfigDir: types.PersistConfigDir,
-		varTmpDir:        "/var/tmp"}
+		varTmpDir:        "/var/tmp",
+		ps:               ps,
+	}
 	debugPtr := flag.Bool("d", false, "Debug flag")
+	persistPtr := flag.String("p", "/persist", "persist directory")
+	noFlagPtr := flag.Bool("n", false, "Don't do anything just log flag")
 	flag.Parse()
 	ctx.debugOverride = *debugPtr
+	ctx.persistDir = *persistPtr // XXX remove? Or use for tests?
+	ctx.noFlag = *noFlagPtr
 	if ctx.debugOverride {
-		log.SetLevel(log.DebugLevel)
+		logger.SetLevel(logrus.TraceLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		logger.SetLevel(logrus.InfoLevel)
 	}
-
-	agentlog.Init("upgradeconverter")
-	if err := pidfile.CheckAndCreatePidfile(ctx.agentName); err != nil {
+	if err := pidfile.CheckAndCreatePidfile(log, ctx.agentName); err != nil {
 		log.Fatal(err)
 	}
 	log.Infof("Starting %s\n", ctx.agentName)
-	runHandlers(ctx)
+
+	phase := UCPhasePreVault
+	if len(flag.Args()) != 0 {
+		switch flag.Args()[0] {
+		case "pre-vault":
+			phase = UCPhasePreVault
+		case "post-vault":
+			phase = UCPhasePostVault
+		default:
+			log.Errorf("Unknown argument %s, running pre-vault phase", flag.Args()[0])
+		}
+	}
+	runPhase(ctx, phase)
+	return 0
 }
 
 // HandlerFunc - defines functions to handle each conversion
@@ -84,4 +155,62 @@ type HandlerFunc func(ctx *ucContext) error
 type ConversionHandler struct {
 	description string
 	handlerFunc HandlerFunc
+}
+
+//RunPostVaultHandlers invokes postVaultconversionHandlers
+//and notifies the caller through the provided ucChan channel
+//the channel is useful for calling from other agent modules
+//without missing watchdog, by spawning this as a task, and
+//select()ing for its completion
+func RunPostVaultHandlers(moduleName string,
+	ps *pubsub.PubSub,
+	loggerArg *logrus.Logger,
+	logArg *base.LogObject,
+	debugOverride bool, ucChan chan struct{}) {
+	logger = loggerArg
+	log = logArg
+	ctx := &ucContext{agentName: moduleName,
+		persistDir:       types.PersistDir,
+		persistConfigDir: types.PersistConfigDir,
+		varTmpDir:        "/var/tmp",
+		ps:               ps,
+	}
+	runPhase(ctx, UCPhasePostVault)
+	log.Notice("RunPostVaultHandlers completed, notifying caller")
+	ucChan <- struct{}{}
+}
+
+//RunPreVaultHandlers invokes preVaultconversionHandlers
+//and notifies the caller through the provided ucChan channel
+//the channel is useful for calling from other agent modules
+//without missing watchdog, by spawning this as a task, and
+//select()ing for its completion
+func RunPreVaultHandlers(moduleName string,
+	ps *pubsub.PubSub,
+	loggerArg *logrus.Logger,
+	logArg *base.LogObject,
+	debugOverride bool, ucChan chan struct{}) {
+	logger = loggerArg
+	log = logArg
+	ctx := &ucContext{agentName: moduleName,
+		persistDir:       types.PersistDir,
+		persistConfigDir: types.PersistConfigDir,
+		varTmpDir:        "/var/tmp",
+		ps:               ps,
+	}
+	runPhase(ctx, UCPhasePreVault)
+	log.Notice("RunPreVaultHandlers completed, notifying caller")
+	ucChan <- struct{}{}
+}
+
+//helper to invoke handlers according to the phase supplied
+func runPhase(ctx *ucContext, phase UCPhase) {
+	switch phase {
+	case UCPhasePreVault:
+		runHandlers(ctx, preVaultconversionHandlers)
+	case UCPhasePostVault:
+		runHandlers(ctx, postVaultconversionHandlers)
+	default:
+		log.Errorf("Unknown phase %d, ignoring", phase)
+	}
 }

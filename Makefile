@@ -55,9 +55,14 @@ endif
 REPO_BRANCH=$(shell git rev-parse --abbrev-ref HEAD | tr / _)
 REPO_SHA=$(shell git describe --match v --abbrev=8 --always --dirty)
 REPO_TAG=$(shell git describe --always | grep -E '[0-9]*\.[0-9]*\.[0-9]*' || echo snapshot)
+REPO_DIRTY_TAG=$(if $(findstring -dirty,$(REPO_SHA)),-$(shell date -u +"%Y-%m-%d.%H.%M"))
 EVE_TREE_TAG = $(shell git describe --abbrev=8 --always --dirty)
 
-ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)-$(shell date -u +"%Y-%m-%d.%H.%M"),$(REPO_TAG))
+ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)$(REPO_DIRTY_TAG),$(REPO_TAG))
+
+# just reports the version, without appending qualifies like HVM or such
+version:
+	@echo $(ROOTFS_VERSION)
 
 APIDIRS = $(shell find ./api/* -maxdepth 1 -type d -exec basename {} \;)
 
@@ -79,7 +84,7 @@ DOCKER_ARCH_TAG=$(ZARCH)
 DIST=$(CURDIR)/dist/$(ZARCH)
 DOCKER_DIST=/eve/dist/$(ZARCH)
 
-BIOS_IMG=$(DIST)/OVMF.fd
+BIOS_IMG=$(DIST)/OVMF.fd $(DIST)/OVMF_CODE.fd $(DIST)/OVMF_VARS.fd
 LIVE=$(DIST)/live
 LIVE_IMG=$(DIST)/live.$(IMG_FORMAT)
 TARGET_IMG=$(DIST)/target.img
@@ -98,18 +103,14 @@ DEVICETREE_DTB_amd64=
 DEVICETREE_DTB_arm64=$(DIST)/dtb/eve.dtb
 DEVICETREE_DTB=$(DEVICETREE_DTB_$(ZARCH))
 
-# FIXME: this is the only rpi specific stuff left - we'll get rid of it soon
-CONF_FILES_FILTER_kvm_rpi=| grep -v conf/eve.dts
-CONF_FILES_FILTER_rpi_kvm=$(CONF_FILES_FILTER_kvm_rpi)
-CONF_FILES=$(shell ls -d $(CONF_DIR)/* $(CONF_FILES_FILTER_$(subst -,_,$(HV))))
-
-PART_SPEC_$(subst -,_,$(HV))=efi conf imga
-PART_SPEC_kvm_rpi=boot conf imga
-PART_SPEC_rpi_kvm=$(PART_SPEC_kvm_rpi)
-PART_SPEC=$(PART_SPEC_$(subst -,_,$(HV)))
+CONF_FILES=$(shell ls -d $(CONF_DIR)/*)
+PART_SPEC_=efi conf imga
+PART_SPEC_rpi=boot conf imga
+PART_SPEC=$(PART_SPEC_$(findstring rpi,$(HV)))
 
 # public cloud settings (only CGP is supported for now)
-CLOUD_IMG_NAME=live-$(ROOTFS_VERSION)-$(HV)-$(ZARCH)
+# note how GCP doesn't like dots so we replace them with -
+CLOUD_IMG_NAME=$(subst .,-,live-$(ROOTFS_VERSION)-$(HV)-$(ZARCH))
 CLOUD_PROJECT=-project lf-edge-eve
 CLOUD_BUCKET=-bucket eve-live
 CLOUD_INSTANCE=-zone us-west1-a -machine n1-standard-1
@@ -119,8 +120,8 @@ QEMU_SYSTEM_arm64=qemu-system-aarch64
 QEMU_SYSTEM_amd64=qemu-system-x86_64
 QEMU_SYSTEM=$(QEMU_SYSTEM_$(ZARCH))
 
-QEMU_ACCEL_Y_Darwin=-M accel=hvf --cpu host
-QEMU_ACCEL_Y_Linux=-enable-kvm
+QEMU_ACCEL_Y_Darwin=-machine q35,accel=hvf,usb=off -cpu kvm64,kvmclock=off
+QEMU_ACCEL_Y_Linux=-machine q35,accel=kvm,usb=off,dump-guest-core=off -cpu host,invtsc=on,kvmclock=off -machine kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on,aw-bits=48
 QEMU_ACCEL:=$(QEMU_ACCEL_$(ACCEL:%=Y)_$(shell uname -s))
 
 QEMU_OPTS_NET1=192.168.1.0/24
@@ -130,12 +131,10 @@ QEMU_OPTS_NET2_FIRST_IP=192.168.2.10
 
 QEMU_MEMORY:=4096
 
-ifeq ($(PFLASH),)
-QEMU_OPTS_BIOS=-bios $(BIOS_IMG)
-else
-BIOS_IMG=$(DIST)/OVMF*
-QEMU_OPTS_BIOS=-drive if=pflash,format=raw,unit=0,readonly,file=$(DIST)/OVMF_CODE.fd -drive if=pflash,format=raw,unit=1,file=$(DIST)/OVMF_VARS.fd
-endif
+PFLASH=y
+QEMU_OPTS_BIOS_y=-drive if=pflash,format=raw,unit=0,readonly,file=$(DIST)/OVMF_CODE.fd -drive if=pflash,format=raw,unit=1,file=$(DIST)/OVMF_VARS.fd
+QEMU_OPTS_BIOS_=-bios $(DIST)/OVMF.fd
+QEMU_OPTS_BIOS=$(QEMU_OPTS_BIOS_$(PFLASH))
 
 QEMU_OPTS_arm64= -machine virt,gic_version=3 -machine virtualization=true -cpu cortex-a57 -machine type=virt -drive file=fat:rw:$(dir $(DEVICETREE_DTB)),label=QEMU_DTB,format=vvfat
 QEMU_OPTS_amd64= -cpu SandyBridge $(QEMU_ACCEL)
@@ -196,7 +195,7 @@ all: help
 
 test: $(GOBUILDER) | $(DIST)
 	@echo Running tests on $(GOMODULE)
-	@$(DOCKER_GO) "gotestsum --junitfile $(DOCKER_DIST)/results.xml" $(GOTREE) $(GOMODULE)
+	@$(DOCKER_GO) "gotestsum --jsonfile $(DOCKER_DIST)/results.json --junitfile $(DOCKER_DIST)/results.xml" $(GOTREE) $(GOMODULE)
 
 itest: $(GOBUILDER) run-proxy | $(DIST)
 	@echo Running integration tests
@@ -269,10 +268,18 @@ run-proxy:
 #           --source-uri=https://storage.googleapis.com/eve-live/live.img.tar.gz
 #           --licenses="https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx"
 run-live-gcp: $(LINUXKIT) | $(LIVE).img.tar.gz
-	if gcloud compute images list $(CLOUD_PROJECT) --filter="name=$(CLOUD_IMG_NAME)" 2>&1 | grep -q 'Listed 0 items'; then \
+	if gcloud compute images list -$(CLOUD_PROJECT) --filter="name=$(CLOUD_IMG_NAME)" 2>&1 | grep -q 'Listed 0 items'; then \
 	    $^ push gcp -nested-virt -img-name $(CLOUD_IMG_NAME) $(CLOUD_PROJECT) $(CLOUD_BUCKET) $|                          ;\
 	fi
 	$^ run gcp $(CLOUD_PROJECT) $(CLOUD_INSTANCE) $(CLOUD_IMG_NAME)
+
+live-gcp-upload: $(LINUXKIT) | $(LIVE).img.tar.gz
+	if gcloud compute images list -$(CLOUD_PROJECT) --filter="name=$(CLOUD_IMG_NAME)" 2>&1 | grep -q 'Listed 0 items'; then \
+	    $^ push gcp -nested-virt -img-name $(CLOUD_IMG_NAME) $(CLOUD_PROJECT) $(CLOUD_BUCKET) $|                          ;\
+		echo "Uploaded $(CLOUD_IMG_NAME)"; \
+	else \
+		echo "Image $(CLOUD_IMG_NAME) already exists in GCP" ;\
+	fi
 
 # ensure the dist directory exists
 $(DIST) $(INSTALLER):
@@ -329,14 +336,18 @@ pkg/qrexec-lib: pkg/xen-tools eve-qrexec-lib
 pkg/%: eve-% FORCE
 	@true
 
-eve: Makefile $(BIOS_IMG) $(CONFIG_IMG) $(INSTALLER).iso $(INSTALLER).raw $(ROOTFS_IMG) $(LIVE_IMG) rootfs-kvm
-	cp pkg/eve/* Makefile images/*.yml $(DIST)
-	$(LINUXKIT) pkg $(LINUXKIT_PKG_TARGET) --hash-path $(CURDIR) $(LINUXKIT_OPTS) $(DIST)
+eve: $(BIOS_IMG) $(EFI_PART) $(CONFIG_IMG) $(INITRD_IMG) $(ROOTFS_IMG) $(if $(findstring rpi,$(HV)),$(BOOT_PART)) | $(DIST)
+	cp pkg/eve/build.yml pkg/eve/runme.sh images/*.yml $|
+	$(PARSE_PKGS) pkg/eve/Dockerfile.in > $|/Dockerfile
+	$(LINUXKIT) pkg $(LINUXKIT_PKG_TARGET) --disable-content-trust --hash-path $(CURDIR) --hash $(ROOTFS_VERSION)-$(HV) $(if $(strip $(EVE_REL)),--release) $(EVE_REL) $(FORCE_BUILD) $|
 
 proto-vendor:
 	@$(DOCKER_GO) "cd pkg/pillar ; go mod vendor" $(CURDIR) proto
 
-proto: $(GOBUILDER) api/go api/python
+proto-diagram: $(GOBUILDER)
+	@$(DOCKER_GO) "/usr/local/bin/protodot -src ./api/proto/config/devconfig.proto -output devconfig && cp ~/protodot/generated/devconfig.* ./api/images && dot ./api/images/devconfig.dot -Tpng -o ./api/images/devconfig.png && echo generated ./api/images/devconfig.*" $(CURDIR) api
+
+proto: $(GOBUILDER) api/go api/python proto-diagram
 	@echo Done building protobuf, you may want to vendor it into pillar by running proto-vendor
 
 api/%: $(GOBUILDER)

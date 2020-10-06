@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/containerd/containerd/cio"
 	"io"
 	"io/ioutil"
 	"net"
@@ -16,11 +15,15 @@ import (
 	"strings"
 	"syscall"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/cio"
+	logutils "github.com/lf-edge/eve/pkg/pillar/utils/logging"
+
+	log "github.com/sirupsen/logrus" // XXX add log argument
 )
 
 const (
-	logDumpCommand byte = iota
+	fifoDir        string = "/var/run/tasks/fifos"
+	logDumpCommand byte   = iota
 )
 
 type logio struct {
@@ -51,8 +54,9 @@ type Log interface {
 // GetLog returns the log destination we should use.
 func GetLog() Log {
 	if _, err := os.Stat(logWriteSocket); !os.IsNotExist(err) {
+		_ = os.MkdirAll(fifoDir, 0777)
 		return &remoteLog{
-			fifoDir: "/var/run",
+			fifoDir: fifoDir,
 		}
 	}
 	return &nullLog{}
@@ -93,6 +97,7 @@ func (r *remoteLog) Path(n string) string {
 	if err := syscall.Mkfifo(path, 0600); err != nil {
 		return "/dev/null"
 	}
+	log.Infof("Creating %s at %s", "func", logutils.GetMyStack())
 	go func() {
 		// In a goroutine because Open of the FIFO will block until
 		// containerd opens it when the task is started.

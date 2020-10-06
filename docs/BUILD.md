@@ -74,7 +74,7 @@ Since an installer is many-use, potentially across many sites, the small amount 
 
 EVE uses several build tools, some of which are prerequisites, while others are installed as needed.
 
-### Prerequisities
+### Prerequisites
 
 You must have the following installed in order to build EVE:
 
@@ -90,7 +90,7 @@ You must have the following installed in order to build EVE:
 
 Each "Installed as Needed" build tool will place its final executable in `build-tools/bin/`, e.g. `build-tools/bin/linuxkit` or `build-tools/bin/manifest-tool`. Each tool, in turn, has a directory in `build-tools/src/`, e.g. `build-tools/src/linuxkit/`. The `src/` directory does _not_ contain all of the code for the tool. Instead, it has the following:
 
-* `Gopkg.toml` - with all of the dependencies including the specific version of the package itself as a `constraint`
+* `Gopkg.toml` - with all of the dependencies including the specific version of the package itself as a `constraint`. Details of different types of the rules present in this file is described [here](https://golang.github.io/dep/docs/Gopkg.toml.html).
 * `Gopkg.lock` - generated from a run
 * `dummy.go` - an empty file to give go something to build
 
@@ -280,7 +280,7 @@ To build `installer.raw`:
     4. Populates the embedded boot partition with the grub `*.EFI` binary and `grub.cfg` file
     5. Validates the image.
 
-Note that once you flash `installer.raw` on the installer media, such as USB drive or SD card, since the `conf_win` partition is a Windows Data partition, most operating systems will recognize it and allow you to mount it. This allows you to update configuration on the the installer media between installs.
+Note that once you flash `installer.raw` on the installer media, such as USB drive or SD card, since the `conf_win` partition is a Windows Data partition, most operating systems will recognize it and allow you to mount it. This allows you to update configuration on the installer media between installs.
 
 ## Generating yml
 
@@ -415,7 +415,9 @@ make proto
 
 ### Building packages
 
-Each package can be built independently via:
+Packages are built within a docker container as defined by the `Dockerfile` within the package directory. The `Dockerfile` also specifies how the package will be built within the container. Some packages have a separate script to built them which is then invoked using the `RUN` clause within the `Dockerfile`. For some others like the `kernel` package, the entire build script is specified within the `Dockerfile`. Finally, the built docker images are published [here](https://hub.docker.com/u/lfedge).
+
+One can build each package independently via:
 
 ```shell
 make pkg/<name>

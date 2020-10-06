@@ -15,7 +15,6 @@ import (
 	"github.com/eriknordmark/netlink"
 	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
 )
 
 // Return the all routes for one interface
@@ -61,19 +60,17 @@ func PbrLinkChange(deviceNetworkStatus *types.DeviceNetworkStatus,
 		linkType)
 	switch change.Header.Type {
 	case syscall.RTM_NEWLINK:
-		relevantFlag, upFlag := devicenetwork.RelevantLastResort(change.Link)
-		added := devicenetwork.IfindexToNameAdd(ifindex, ifname, linkType,
-			relevantFlag, upFlag)
+		added := IfindexToNameAdd(log, ifindex, ifname, linkType)
 		if added {
 			changed = true
 		}
 	case syscall.RTM_DELLINK:
-		gone := devicenetwork.IfindexToNameDel(ifindex, ifname)
+		gone := IfindexToNameDel(log, ifindex, ifname)
 		if gone {
 			changed = true
 			MyTable := baseTableIndex + ifindex
-			devicenetwork.FlushRoutesTable(MyTable, 0)
-			devicenetwork.FlushRules(ifindex)
+			devicenetwork.FlushRoutesTable(log, MyTable, 0)
+			devicenetwork.FlushRules(log, ifindex)
 		}
 	}
 	if changed {

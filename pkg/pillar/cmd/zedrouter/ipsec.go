@@ -7,14 +7,14 @@ package zedrouter
 
 import (
 	"errors"
-	"os/exec"
+	"github.com/lf-edge/eve/pkg/pillar/base"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/lf-edge/eve/pkg/pillar/iptables"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
-	log "github.com/sirupsen/logrus"
 )
 
 type vpnAclRule struct {
@@ -108,8 +108,7 @@ const (
 
 func ipSecActivate(vpnConfig types.VpnConfig) error {
 	tunnelConfig := vpnConfig.ClientConfigList[0].TunnelConfig
-	cmd := exec.Command("ipsec", "start")
-	if _, err := cmd.Output(); err != nil {
+	if _, err := base.Exec(log, "ipsec", "start").Output(); err != nil {
 		log.Errorf("%s for %s start\n", err.Error(), "ipsec")
 		return err
 	}
@@ -118,8 +117,7 @@ func ipSecActivate(vpnConfig types.VpnConfig) error {
 }
 
 func ipSecInactivate(vpnConfig types.VpnConfig) error {
-	cmd := exec.Command("ipsec", "stop")
-	if _, err := cmd.Output(); err != nil {
+	if _, err := base.Exec(log, "ipsec", "stop").Output(); err != nil {
 		log.Errorf("%s for %s stop\n", err.Error(), "ipsec")
 		return err
 	}
@@ -128,8 +126,7 @@ func ipSecInactivate(vpnConfig types.VpnConfig) error {
 }
 
 func ipSecStatus() (string, error) {
-	cmd := exec.Command("ipsec", "status")
-	out, err := cmd.Output()
+	out, err := base.Exec(log, "ipsec", "status").Output()
 	if err != nil {
 		log.Errorf("%s for %s status\n", err.Error(), "ipsec")
 		return "", err
@@ -196,7 +193,7 @@ func ipTablesAwsClientRulesSet(tunnelName string,
 	ipTableName := "mangle"
 	// set the iptable rules
 	// forward rule
-	if err := iptables.IptableCmd("-t", ipTableName,
+	if err := iptables.IptableCmd(log, "-t", ipTableName,
 		"-I", "FORWARD", "1", "-o", tunnelName,
 		"-p", "tcp", "--tcp-flags", "SYN,RST",
 		"SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"); err != nil {
@@ -206,7 +203,7 @@ func ipTablesAwsClientRulesSet(tunnelName string,
 	}
 
 	// input rule
-	if err := iptables.IptableCmd("-t", ipTableName,
+	if err := iptables.IptableCmd(log, "-t", ipTableName,
 		"-I", "INPUT", "1", "-p", "esp", "-s", gatewayIpAddr,
 		"-j", "MARK", "--set-xmark", tunnelKey); err != nil {
 		log.Errorf("%s for %s, %s input rule create\n",
@@ -223,7 +220,7 @@ func ipTablesAwsClientRulesReset(tunnelName string,
 	ipTableName := "mangle"
 	// delete the iptable rules
 	// forward rule
-	if err := iptables.IptableCmd("-t", ipTableName, "-D", "FORWARD", "-o", tunnelName,
+	if err := iptables.IptableCmd(log, "-t", ipTableName, "-D", "FORWARD", "-o", tunnelName,
 		"-p", "tcp", "--tcp-flags", "SYN,RST",
 		"SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"); err != nil {
 		log.Errorf("%s for %s, %s forward rule delete\n",
@@ -232,7 +229,7 @@ func ipTablesAwsClientRulesReset(tunnelName string,
 	}
 
 	// input rule
-	if err := iptables.IptableCmd("-t", ipTableName, "-D", "INPUT",
+	if err := iptables.IptableCmd(log, "-t", ipTableName, "-D", "INPUT",
 		"-p", "esp", "-s", gatewayIpAddr,
 		"-j", "MARK", "--set-xmark", tunnelKey); err != nil {
 		log.Errorf("%s for %s, %s input rule delete\n",
@@ -320,7 +317,7 @@ func iptableCounterRuleOp(acl vpnAclRule, set bool) error {
 	cmd = append(cmd, "-j")
 	cmd = append(cmd, acl.target)
 
-	if err := iptables.IptableCmd(cmd...); err != nil {
+	if err := iptables.IptableCmd(log, cmd...); err != nil {
 		log.Errorf("%s for %s, %s rule create\n",
 			err.Error(), "iptables", acl.chain)
 		return err
@@ -345,7 +342,7 @@ func iptableCounterRuleStat(acl vpnAclRule) (types.PktStats, error) {
 	cmd = append(cmd, acl.chain)
 	cmd = append(cmd, "-v")
 
-	out, err := iptables.IptableCmdOut(false, cmd...)
+	out, err := iptables.IptableCmdOut(nil, cmd...)
 	if err != nil {
 		log.Errorf("%s for %s, %s rule counter\n",
 			err.Error(), "iptables", acl.chain)
@@ -408,12 +405,14 @@ func ipTablesChainMatch(tableName string, chainName string,
 
 	// XXX as long as zedagent also calls iptables we need to
 	// wait for the lock with -w 5
-	cmd := exec.Command("iptables", "-w", "5", "-S", chainName)
+	var cmd string
+	var args []string
+	cmd = "iptables"
+	args = []string{"-w", "5", "-S", chainName}
 	if tableName == "mangle" {
-		cmd = exec.Command("iptables",
-			"-t", tableName, "-S", chainName)
+		args = []string{"-t", tableName, "-S", chainName}
 	}
-	out, err := cmd.Output()
+	out, err := base.Exec(log, cmd, args...).Output()
 	if err != nil {
 		log.Errorf("%s for %s %s %s\n",
 			err.Error(), "iptables", tableName, chainName)
@@ -446,9 +445,8 @@ func ipRouteCreate(vpnConfig types.VpnConfig) error {
 	if vpnConfig.IsClient {
 		clientConfig := vpnConfig.ClientConfigList[0]
 		tunnelConfig := clientConfig.TunnelConfig
-		cmd := exec.Command("ip", "route", "add", gatewayConfig.SubnetBlock,
-			"dev", tunnelConfig.Name, "metric", tunnelConfig.Metric)
-		if _, err := cmd.Output(); err != nil {
+		if _, err := base.Exec(log, "ip", "route", "add", gatewayConfig.SubnetBlock, "dev",
+			tunnelConfig.Name, "metric", tunnelConfig.Metric).Output(); err != nil {
 			log.Errorf("%s for %s %s add\n",
 				err.Error(), "iproute", gatewayConfig.SubnetBlock)
 			return err
@@ -458,9 +456,8 @@ func ipRouteCreate(vpnConfig types.VpnConfig) error {
 		// for server config, create all client subnet block routes
 		for _, clientConfig := range vpnConfig.ClientConfigList {
 			tunnelConfig := vpnConfig.ClientConfigList[0].TunnelConfig
-			cmd := exec.Command("ip", "route", "add", clientConfig.SubnetBlock,
-				"dev", tunnelConfig.Name, "metric", tunnelConfig.Metric)
-			if _, err := cmd.Output(); err != nil {
+			if _, err := base.Exec(log, "ip", "route", "add", clientConfig.SubnetBlock, "dev",
+				tunnelConfig.Name, "metric", tunnelConfig.Metric).Output(); err != nil {
 				log.Errorf("%s for %s %s add\n",
 					err.Error(), "iproute", clientConfig.SubnetBlock)
 				return err
@@ -483,8 +480,8 @@ func ipRouteDelete(vpnConfig types.VpnConfig) error {
 	if vpnConfig.IsClient {
 		if len(vpnConfig.ClientConfigList) > 0 {
 			tunnelConfig := vpnConfig.ClientConfigList[0].TunnelConfig
-			cmd := exec.Command("ip", "route", "delete", gatewayConfig.SubnetBlock)
-			if _, err := cmd.Output(); err != nil {
+			if _, err := base.Exec(log, "ip", "route", "delete",
+				gatewayConfig.SubnetBlock).Output(); err != nil {
 				log.Errorf("%s for %s %s add\n",
 					err.Error(), "iproute", gatewayConfig.SubnetBlock)
 				return err
@@ -496,8 +493,8 @@ func ipRouteDelete(vpnConfig types.VpnConfig) error {
 		// for server config, remove all client routes
 		for _, clientConfig := range vpnConfig.ClientConfigList {
 			tunnelConfig := clientConfig.TunnelConfig
-			cmd := exec.Command("ip", "route", "delete", clientConfig.SubnetBlock)
-			if _, err := cmd.Output(); err != nil {
+			if _, err := base.Exec(log, "ip", "route", "delete",
+				clientConfig.SubnetBlock).Output(); err != nil {
 				log.Errorf("%s for %s %s add\n",
 					err.Error(), "iproute", clientConfig.SubnetBlock)
 				return err
@@ -520,8 +517,7 @@ func ipRouteCheck(vpnConfig types.VpnConfig) error {
 
 	// for client configs, check server subnet block route
 	if vpnConfig.IsClient {
-		cmd := exec.Command("ip", "route", "get", gatewayConfig.SubnetBlock)
-		out, err := cmd.Output()
+		out, err := base.Exec(log, "ip", "route", "get", gatewayConfig.SubnetBlock).Output()
 		if err != nil {
 			log.Errorf("%s for %s %s check, no route\n",
 				err.Error(), "iproute", gatewayConfig.SubnetBlock)
@@ -537,8 +533,7 @@ func ipRouteCheck(vpnConfig types.VpnConfig) error {
 		// for server config, check all client subnet block routes
 		for _, clientConfig := range vpnConfig.ClientConfigList {
 			tunnelConfig := clientConfig.TunnelConfig
-			cmd := exec.Command("ip", "route", "get", clientConfig.SubnetBlock)
-			out, err := cmd.Output()
+			out, err := base.Exec(log, "ip", "route", "get", clientConfig.SubnetBlock).Output()
 			if err != nil {
 				log.Errorf("%s for %s %s check, no route\n",
 					err.Error(), "iproute", clientConfig.SubnetBlock)
@@ -583,20 +578,18 @@ func ipLinkTunnelCreate(vpnConfig types.VpnConfig) error {
 	log.Infof("%s: %s %s %s\n", tunnelConfig.Name, "ip link add",
 		portConfig.IpAddr, gatewayConfig.IpAddr)
 	if vpnConfig.IsClient {
-		cmd := exec.Command("ip", "link", "add",
+		if _, err := base.Exec(log, "ip", "link", "add",
 			tunnelConfig.Name, "type", "vti", "local", portConfig.IpAddr,
-			"remote", gatewayConfig.IpAddr, "key", tunnelConfig.Key)
-		if _, err := cmd.Output(); err != nil {
+			"remote", gatewayConfig.IpAddr, "key", tunnelConfig.Key).Output(); err != nil {
 			log.Errorf("%s for %s %s add on %s %s\n", err.Error(), "ip link",
 				tunnelConfig.Name, portConfig.IpAddr, gatewayConfig.IpAddr)
 			return err
 		}
 	} else {
 		// for server, create remote any
-		cmd := exec.Command("ip", "link", "add",
+		if _, err := base.Exec(log, "ip", "link", "add",
 			tunnelConfig.Name, "type", "vti", "local", portConfig.IpAddr,
-			"remote", "0.0.0.0")
-		if _, err := cmd.Output(); err != nil {
+			"remote", "0.0.0.0").Output(); err != nil {
 			log.Errorf("%s for %s %s add on %s %s\n", err.Error(), "ip link",
 				tunnelConfig.Name, portConfig.IpAddr, gatewayConfig.IpAddr)
 			return err
@@ -606,10 +599,9 @@ func ipLinkTunnelCreate(vpnConfig types.VpnConfig) error {
 	if vpnConfig.VpnRole == AwsVpnClient {
 		log.Infof("%s: %s %s %s\n", tunnelConfig.Name, "ip link addr",
 			tunnelConfig.LocalIpAddr, tunnelConfig.RemoteIpAddr)
-		cmd := exec.Command("ip", "addr", "add",
+		if _, err := base.Exec(log, "ip", "addr", "add",
 			tunnelConfig.LocalIpAddr, "remote", tunnelConfig.RemoteIpAddr,
-			"dev", tunnelConfig.Name)
-		if _, err := cmd.Output(); err != nil {
+			"dev", tunnelConfig.Name).Output(); err != nil {
 			log.Errorf("%s for ip addr add %s remote %s dev %s\n",
 				err.Error(), tunnelConfig.LocalIpAddr,
 				tunnelConfig.RemoteIpAddr, tunnelConfig.Name)
@@ -619,9 +611,8 @@ func ipLinkTunnelCreate(vpnConfig types.VpnConfig) error {
 
 	log.Infof("%s: %s %s\n", tunnelConfig.Name, "ip link mtu",
 		tunnelConfig.Mtu)
-	cmd := exec.Command("ip", "link", "set",
-		tunnelConfig.Name, "up", "mtu", tunnelConfig.Mtu)
-	if _, err := cmd.Output(); err != nil {
+	if _, err := base.Exec(log, "ip", "link", "set",
+		tunnelConfig.Name, "up", "mtu", tunnelConfig.Mtu).Output(); err != nil {
 		log.Errorf("%s for %s %s set mtu up\n",
 			err.Error(), "ip link mtu", tunnelConfig.Name)
 		return err
@@ -642,8 +633,7 @@ func ipLinkTunnelDelete(vpnConfig types.VpnConfig) error {
 	clientConfig := vpnConfig.ClientConfigList[0]
 	tunnelConfig := clientConfig.TunnelConfig
 
-	cmd := exec.Command("ip", "link", "delete", tunnelConfig.Name)
-	_, err := cmd.Output()
+	_, err := base.Exec(log, "ip", "link", "delete", tunnelConfig.Name).Output()
 	if err != nil {
 		log.Errorf("%s for %s %s delete\n",
 			err.Error(), "ip link", tunnelConfig.Name)
@@ -747,8 +737,7 @@ func ipSecConfigCreate(vpnConfig types.VpnConfig) error {
 	if err := ipSecConfigFileWrite(filename, writeStr); err != nil {
 		return err
 	}
-	cmd := exec.Command("chmod", "600", filename)
-	_, err := cmd.Output()
+	err := os.Chmod(filename, 0600)
 	if err != nil {
 		log.Errorf("%s for %s %s\n", err.Error(), "chmod", filename)
 		return err
@@ -795,8 +784,7 @@ func ipSecSecretConfigCreate(vpnConfig types.VpnConfig) error {
 	if err := ipSecConfigFileWrite(filename, writeStr); err != nil {
 		return err
 	}
-	cmd := exec.Command("chmod", "600", filename)
-	_, err := cmd.Output()
+	err := os.Chmod(filename, 0600)
 	if err != nil {
 		log.Errorf("%s for %s %s\n", err.Error(), "chmod", filename)
 		return err
@@ -857,8 +845,7 @@ func sysctlConfigReset(vpnConfig types.VpnConfig) error {
 }
 
 func sysctlConfigSet() error {
-	cmd := exec.Command("sysctl", "-p")
-	_, err := cmd.Output()
+	_, err := base.Exec(log, "sysctl", "-p").Output()
 	if err != nil {
 		log.Errorf("%s for %s set \n", err.Error(), "sysctl")
 		return err
@@ -876,8 +863,7 @@ func ipSecConfigFileWrite(filename string, writeStr string) error {
 }
 
 func checkIntfExistsCmd(intfName string) error {
-	cmd := exec.Command("ifconfig", intfName)
-	_, err := cmd.Output()
+	_, err := base.Exec(log, "ifconfig", intfName).Output()
 	if err != nil {
 		log.Errorf("%s for %s %s status\n",
 			err.Error(), "ifconfig", intfName)
@@ -887,8 +873,7 @@ func checkIntfExistsCmd(intfName string) error {
 }
 
 func checkIntfStateCmd(intfName string) error {
-	cmd := exec.Command("ifconfig", intfName)
-	out, err := cmd.Output()
+	out, err := base.Exec(log, "ifconfig", intfName).Output()
 	if err != nil {
 		log.Errorf("%s for %s %s status\n",
 			err.Error(), "ifconfig", intfName)
@@ -909,8 +894,7 @@ func checkIntfStateCmd(intfName string) error {
 }
 
 func checkIpSecStatusCmd(tunnelName string) error {
-	cmd := exec.Command("ipsec", "status")
-	out, err := cmd.Output()
+	out, err := base.Exec(log, "ipsec", "status").Output()
 	if err != nil {
 		log.Errorf("%s for %s %s status\n",
 			err.Error(), "ipsec", tunnelName)
@@ -945,8 +929,7 @@ func getIpSecLineState(outArr []string) error {
 }
 
 func issueIfUpCmd(tunnelName string) error {
-	cmd := exec.Command("ifup", tunnelName)
-	_, err := cmd.Output()
+	_, err := base.Exec(log, "ifup", tunnelName).Output()
 	if err != nil {
 		log.Errorf("%s for %s %s\n",
 			err.Error(), "ifup", tunnelName)

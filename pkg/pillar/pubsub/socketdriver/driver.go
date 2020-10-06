@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Zededa, Inc.
+// Copyright (c) 2019-2020 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 package socketdriver
@@ -9,9 +9,13 @@ import (
 	"net"
 	"os"
 	"path"
+	"strings"
+	"sync"
+	"sync/atomic"
 
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // Protocol over AF_UNIX or other IPC mechanism
@@ -54,6 +58,9 @@ const (
 
 // SocketDriver driver for pubsub using local unix-domain socket and files
 type SocketDriver struct {
+	Logger  *logrus.Logger
+	Log     *base.LogObject
+	RootDir string // Default is "/"; tests can override
 }
 
 // Publisher return an implementation of `pubsub.DriverPublisher` for
@@ -81,7 +88,7 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 	switch {
 	case persistent && publishToDir:
 		// Special case for /persist/config/
-		dirName = fmt.Sprintf("%s/%s", persistConfigDir, name)
+		dirName = fmt.Sprintf("%s/%s/%s", s.RootDir, persistConfigDir, name)
 	case persistent && !publishToDir:
 		dirName = s.persistentDirName(name)
 	case !persistent && publishToDir:
@@ -92,7 +99,7 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 	}
 
 	if _, err := os.Stat(dirName); err != nil {
-		log.Infof("Publish Create %s\n", dirName)
+		s.Log.Infof("Publish Create %s\n", dirName)
 		if err := os.MkdirAll(dirName, 0700); err != nil {
 			errStr := fmt.Sprintf("Publish(%s): %s",
 				name, err)
@@ -107,7 +114,7 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 		sockName = s.sockName(name)
 		dir := path.Dir(sockName)
 		if _, err := os.Stat(dir); err != nil {
-			log.Infof("Publish Create %s\n", dir)
+			s.Log.Infof("Publish Create %s\n", dir)
 			if err := os.MkdirAll(dir, 0700); err != nil {
 				errStr := fmt.Sprintf("Publish(%s): %s",
 					name, err)
@@ -115,6 +122,15 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 			}
 		}
 		if _, err := os.Stat(sockName); err == nil {
+			// This could either be a left-over in the filesystem
+			// or some other process (or ourselves) using the same
+			// name to publish. Try connect to see if it is the latter.
+			sock, err := net.Dial("unixpacket", sockName)
+			if err == nil {
+				sock.Close()
+				s.Log.Fatalf("Can not publish %s since it it already used",
+					sockName)
+			}
 			if err := os.Remove(sockName); err != nil {
 				errStr := fmt.Sprintf("Publish(%s): %s",
 					name, err)
@@ -128,6 +144,7 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 			return nil, errors.New(errStr)
 		}
 	}
+	doneChan := make(chan struct{})
 	return &Publisher{
 		sockName:       sockName,
 		listener:       listener,
@@ -138,6 +155,9 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 		updaters:       updaterList,
 		differ:         differ,
 		restarted:      restarted,
+		logger:         s.Logger,
+		log:            s.Log,
+		doneChan:       doneChan,
 	}, nil
 }
 
@@ -153,14 +173,28 @@ func (s *SocketDriver) Subscriber(global bool, name, topic string, persistent bo
 	// Special case for files in /var/tmp/zededa/ and also
 	// for zedclient going away yet metrics being read after it
 	// is gone.
-	agentName := name
+	var agentName string
+	names := strings.Split(name, "/")
+	if len(names) > 0 {
+		agentName = names[0]
+	}
 
 	if global {
 		subFromDir = true
-		dirName = s.fixedDirName(name)
+		if persistent {
+			// Special case for /persist/config/
+			dirName = fmt.Sprintf("%s/%s/%s", s.RootDir,
+				persistConfigDir, name)
+		} else {
+			dirName = s.fixedDirName(name)
+		}
 	} else if agentName == "zedclient" {
 		subFromDir = true
-		dirName = s.pubDirName(name)
+		if persistent {
+			dirName = s.persistentDirName(name)
+		} else {
+			dirName = s.pubDirName(name)
+		}
 	} else if persistent {
 		// We do the initial Load from the directory if it
 		// exists, but subsequent updates come over IPC
@@ -170,6 +204,7 @@ func (s *SocketDriver) Subscriber(global bool, name, topic string, persistent bo
 		subFromDir = subscribeFromDir
 		dirName = s.pubDirName(name)
 	}
+	doneChan := make(chan struct{})
 	return &Subscriber{
 		subscribeFromDir: subFromDir,
 		dirName:          dirName,
@@ -177,6 +212,9 @@ func (s *SocketDriver) Subscriber(global bool, name, topic string, persistent bo
 		topic:            topic,
 		sockName:         sockName,
 		C:                C,
+		logger:           s.Logger,
+		log:              s.Log,
+		doneChan:         doneChan,
 	}, nil
 }
 
@@ -186,17 +224,64 @@ func (s *SocketDriver) DefaultName() string {
 }
 
 func (s *SocketDriver) sockName(name string) string {
-	return fmt.Sprintf("/var/run/%s.sock", name)
+	return fmt.Sprintf("%s/var/run/%s.sock", s.RootDir, name)
 }
 
 func (s *SocketDriver) pubDirName(name string) string {
-	return fmt.Sprintf("/var/run/%s", name)
+	return fmt.Sprintf("%s/var/run/%s", s.RootDir, name)
 }
 
 func (s *SocketDriver) fixedDirName(name string) string {
-	return fmt.Sprintf("%s/%s", fixedDir, name)
+	return fmt.Sprintf("%s/%s/%s", s.RootDir, fixedDir, name)
 }
 
 func (s *SocketDriver) persistentDirName(name string) string {
-	return fmt.Sprintf("%s/status/%s", "/persist", name)
+	return fmt.Sprintf("%s/%s/status/%s", s.RootDir, "/persist", name)
+}
+
+// Use a buffer pool to minimize memory usage
+var bufPool = &sync.Pool{
+	New: func() interface{} {
+		buffer := make([]byte, maxsize+1)
+		return buffer
+	},
+}
+
+// Track allocations for debug
+var allocated uint32
+
+// GetBuffer returns a buffer and a done func to call at defer.
+func GetBuffer() ([]byte, func()) {
+	buf := bufPool.Get().([]byte)
+	atomic.AddUint32(&allocated, 1)
+	return buf, func() {
+		bufPool.Put(buf)
+		atomic.AddUint32(&allocated, ^uint32(0))
+	}
+}
+
+// logs a message if the allocation changed
+var lastLoggedAllocated uint32
+
+func maybeLogAllocated(log *base.LogObject) {
+	if lastLoggedAllocated == allocated {
+		return
+	}
+	log.Noticef("pubsub buffer allocation changed from %d to  %d",
+		lastLoggedAllocated, allocated)
+	lastLoggedAllocated = allocated
+}
+
+// Poll to check if we should go away
+func areWeDone(log *base.LogObject, doneChan <-chan struct{}) bool {
+	select {
+	case _, ok := <-doneChan:
+		if !ok {
+			return true
+		} else {
+			log.Fatal("Received message on doneChan")
+		}
+	default:
+	}
+	return false
 }

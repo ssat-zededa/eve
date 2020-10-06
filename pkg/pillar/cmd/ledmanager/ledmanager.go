@@ -20,18 +20,21 @@ package ledmanager
 import (
 	"flag"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io/ioutil"
 	"os"
-	"os/exec"
+	"strings"
+	"syscall"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/base"
+	"github.com/lf-edge/eve/pkg/pillar/diskmetrics"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -52,67 +55,123 @@ type ledManagerContext struct {
 	GCInitialized          bool
 }
 
-type Blink200msFunc func()
-type BlinkInitFunc func()
+type Blink200msFunc func(ledName string)
+type BlinkInitFunc func(ledName string)
 
+// The ledName is a string like wifi_active in /sys/class/leds
 type modelToFuncs struct {
 	model     string
 	initFunc  BlinkInitFunc
 	blinkFunc Blink200msFunc
+	ledName   string
 }
 
 // XXX introduce wildcard matching on model names? Just a default at the end
 var mToF = []modelToFuncs{
 	{
 		model:     "Supermicro.SYS-E100-9APP",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
 	{
 		model:     "Supermicro.SYS-E100-9S",
+		initFunc:  InitDDCmd,
 		blinkFunc: ExecuteDDCmd},
 	{
 		model:     "Supermicro.SYS-E50-9AP",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
 	{ // XXX temporary fix for old BIOS
 		model:     "Supermicro.Super Server",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
 	{
 		model:     "Supermicro.SYS-E300-8D",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
 	{
 		model:     "Supermicro.SYS-E300-9A-4CN10P",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
 	{
 		model:     "Supermicro.SYS-5018D-FN8T",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
+	{
+		model:     "Dell Inc..Edge Gateway 3001",
+		initFunc:  InitDellCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "/sys/class/gpio/gpio346/value",
+	},
+	{
+		model:     "Dell Inc..Edge Gateway 3002",
+		initFunc:  InitDellCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "/sys/class/gpio/gpio346/value",
+	},
+	{
+		model:     "Dell Inc..Edge Gateway 3003",
+		initFunc:  InitDellCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "/sys/class/gpio/gpio346/value",
+	},
 	{
 		model:     "hisilicon,hi6220-hikey.hisilicon,hi6220.",
-		initFunc:  InitWifiLedCmd,
-		blinkFunc: ExecuteWifiLedCmd},
+		initFunc:  InitLedCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "wifi_active",
+	},
 	{
 		model:     "hisilicon,hikey.hisilicon,hi6220.",
-		initFunc:  InitWifiLedCmd,
-		blinkFunc: ExecuteWifiLedCmd},
+		initFunc:  InitLedCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "wifi_active"},
 	{
 		model:     "LeMaker.HiKey-6220",
-		initFunc:  InitWifiLedCmd,
-		blinkFunc: ExecuteWifiLedCmd},
+		initFunc:  InitLedCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "wifi_active",
+	},
 	{
 		model: "QEMU.Standard PC (i440FX + PIIX, 1996)",
 		// No dd disk light blinking on QEMU
 	},
-	// Last in table as a default
 	{
+		model:     "raspberrypi.rpi.raspberrypi,4-model-b.brcm,bcm2711",
+		initFunc:  InitLedCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "led0",
+	},
+	{
+		model:     "RaspberryPi.RPi4",
+		initFunc:  InitLedCmd,
+		blinkFunc: ExecuteLedCmd,
+		ledName:   "led0",
+	},
+	{
+		// Last in table as a default
 		model:     "",
-		blinkFunc: ExecuteDDCmd},
+		initFunc:  InitDDCmd,
+		blinkFunc: ExecuteDDCmd,
+	},
 }
 
 var debug bool
 var debugOverride bool // From command line arg
+var logger *logrus.Logger
+var log *base.LogObject
 
 // Set from Makefile
 var Version = "No version specified"
 
-func Run(ps *pubsub.PubSub) {
+func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
+	logger = loggerArg
+	log = logArg
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug")
 	fatalPtr := flag.Bool("F", false, "Cause log.Fatal fault injection")
@@ -123,55 +182,60 @@ func Run(ps *pubsub.PubSub) {
 	fatalFlag := *fatalPtr
 	hangFlag := *hangPtr
 	if debugOverride {
-		log.SetLevel(log.DebugLevel)
+		logger.SetLevel(logrus.TraceLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		logger.SetLevel(logrus.InfoLevel)
 	}
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
-		return
+		return 0
 	}
-	agentlog.Init(agentName)
-
-	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
+	if err := pidfile.CheckAndCreatePidfile(log, agentName); err != nil {
 		log.Fatal(err)
 	}
 	log.Infof("Starting %s", agentName)
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
-	agentlog.StillRunning(agentName, warningTime, errorTime)
+	ps.StillRunning(agentName, warningTime, errorTime)
 
-	model := hardware.GetHardwareModel()
+	model := hardware.GetHardwareModel(log)
 	log.Infof("Got HardwareModel %s", model)
 
 	var blinkFunc Blink200msFunc
 	var initFunc BlinkInitFunc
+	var ledName string
 	for _, m := range mToF {
 		if m.model == model {
 			blinkFunc = m.blinkFunc
 			initFunc = m.initFunc
+			ledName = m.ledName
+			log.Infof("Found %v led %s for model %s",
+				blinkFunc, ledName, model)
 			break
 		}
 		if m.model == "" {
 			log.Infof("No blink function for %s", model)
 			blinkFunc = m.blinkFunc
 			initFunc = m.initFunc
+			ledName = m.ledName
 			break
 		}
 	}
 
 	if initFunc != nil {
-		initFunc()
+		initFunc(ledName)
 	}
 
 	// Any state needed by handler functions
 	ctx := ledManagerContext{}
 	ctx.countChange = make(chan int)
-	go TriggerBlinkOnDevice(ctx.countChange, blinkFunc)
+	log.Infof("Creating %s at %s", "triggerBinkOnDevice", agentlog.GetMyStack())
+	go TriggerBlinkOnDevice(ctx.countChange, blinkFunc, ledName)
 
 	subLedBlinkCounter, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "",
+		MyAgentName:   agentName,
 		TopicImpl:     types.LedBlinkCounter{},
 		Activate:      false,
 		Ctx:           &ctx,
@@ -189,6 +253,7 @@ func Run(ps *pubsub.PubSub) {
 
 	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "nim",
+		MyAgentName:   agentName,
 		TopicImpl:     types.DeviceNetworkStatus{},
 		Activate:      false,
 		Ctx:           &ctx,
@@ -207,6 +272,7 @@ func Run(ps *pubsub.PubSub) {
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "",
+		MyAgentName:   agentName,
 		TopicImpl:     types.ConfigItemValueMap{},
 		Activate:      false,
 		Ctx:           &ctx,
@@ -230,7 +296,7 @@ func Run(ps *pubsub.PubSub) {
 			subGlobalConfig.ProcessChange(change)
 		case <-stillRunning.C:
 		}
-		agentlog.StillRunning(agentName, warningTime, errorTime)
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 	log.Infof("processed GlobalConfig")
 
@@ -254,7 +320,7 @@ func Run(ps *pubsub.PubSub) {
 		if hangFlag {
 			log.Infof("Requested to not touch to cause watchdog")
 		} else {
-			agentlog.StillRunning(agentName, warningTime, errorTime)
+			ps.StillRunning(agentName, warningTime, errorTime)
 		}
 	}
 }
@@ -303,7 +369,9 @@ func handleLedBlinkDelete(ctxArg interface{}, key string,
 	log.Infof("handleLedBlinkDelete done for %s", key)
 }
 
-func TriggerBlinkOnDevice(countChange chan int, blinkFunc Blink200msFunc) {
+func TriggerBlinkOnDevice(countChange chan int, blinkFunc Blink200msFunc,
+	ledName string) {
+
 	var counter int
 	for {
 		select {
@@ -316,7 +384,7 @@ func TriggerBlinkOnDevice(countChange chan int, blinkFunc Blink200msFunc) {
 		log.Debugln("Number of times LED will blink: ", counter)
 		for i := 0; i < counter; i++ {
 			if blinkFunc != nil {
-				blinkFunc()
+				blinkFunc(ledName)
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
@@ -328,50 +396,134 @@ func DummyCmd() {
 	time.Sleep(200 * time.Millisecond)
 }
 
-// Should be tuned so that the LED lights up for 200ms
-// Disable cache since there might be a filesystem on the device
-func ExecuteDDCmd() {
-	cmd := exec.Command("dd", "if=/dev/sda", "of=/dev/null", "bs=4M", "count=22", "iflag=nocache")
-	stdout, err := cmd.Output()
-	if err != nil {
-		log.Errorln("dd error: ", err)
+var printOnce = true
+var diskDevice string // Based on largest disk
+var ddCount int       // Based on time for 200ms
+
+// InitDellCmd prepares "Cloud LED" on Dell IoT gateways by enabling GPIO endpoint
+func InitDellCmd(ledName string) {
+	err := ioutil.WriteFile("/sys/class/gpio/export", []byte("346"), 0644)
+	if err == nil {
+		if err = ioutil.WriteFile("/sys/class/gpio/gpio346/direction", []byte("out"), 0644); err == nil {
+			log.Infof("Enabled Dell Cloud LED")
+			return
+		}
+	}
+	log.Warnf("Failed to enable Dell Cloud LED: %v", err)
+}
+
+// InitDDCmd determines the disk (using the largest disk) and measures
+// the repetition count to get to 200ms dd time.
+func InitDDCmd(ledName string) {
+	disk := diskmetrics.FindLargestDisk(log)
+	if disk == "" {
 		return
 	}
-	log.Debugf("ddinfo: %s", stdout)
+	log.Infof("InitDDCmd using disk %s", disk)
+	diskDevice = "/dev/" + disk
+	count := 100
+	// Prime before measuring
+	uncachedDiskRead(count)
+	uncachedDiskRead(count)
+	start := time.Now()
+	uncachedDiskRead(count)
+	elapsed := time.Since(start)
+	if elapsed == 0 {
+		log.Errorf("Measured 0 nanoseconds!")
+		return
+	}
+	// Adjust count but at least one
+	fl := time.Duration(count) * (200 * time.Millisecond) / elapsed
+	count = int(fl)
+	if count == 0 {
+		count = 1
+	}
+	log.Infof("Measured %v; count %d", elapsed, count)
+	ddCount = count
+}
+
+// Should be tuned so that the LED lights up for 200ms
+// Disable cache since there might be a filesystem on the device
+func ExecuteDDCmd(ledName string) {
+	if diskDevice == "" || ddCount == 0 {
+		DummyCmd()
+		return
+	}
+	uncachedDiskRead(ddCount)
+}
+
+func uncachedDiskRead(count int) {
+	bufferLength := int64(4194304) //4M buffer length
+	offset := int64(0)
+	data := make([]byte, bufferLength) //4M buffer
+	handler, err := os.Open(diskDevice)
+	if err != nil {
+		err = fmt.Errorf("uncachedDiskRead: Failed on open: %s", err)
+		log.Error(err.Error())
+		return
+	}
+	defer handler.Close()
+	for i := 0; i < count; i++ {
+		unix.Fadvise(int(handler.Fd()), offset, bufferLength, 4) // 4 == POSIX_FADV_DONTNEED
+		readBytes, err := handler.Read(data)
+		if err != nil {
+			err = fmt.Errorf("uncachedDiskRead: Failed on read: %s", err)
+			log.Error(err.Error())
+		}
+		syscall.Madvise(data, 4) // 4 == MADV_DONTNEED
+		log.Debugf("uncachedDiskRead: size: %d", readBytes)
+		if int64(readBytes) < bufferLength {
+			log.Debugf("uncachedDiskRead: done")
+			break
+		}
+		offset += bufferLength
+	}
 }
 
 const (
-	ledFilename        = "/sys/class/leds/wifi_active"
-	triggerFilename    = ledFilename + "/trigger"
-	brightnessFilename = ledFilename + "/brightness"
 	// Time limits for event loop handlers
 	errorTime   = 3 * time.Minute
 	warningTime = 40 * time.Second
 )
 
-// Disable existimg trigger
-// Write "none" to /sys/class/leds/wifi_active/trigger
-func InitWifiLedCmd() {
-	log.Infof("InitWifiLedCmd")
+// InitLedCmd can use different LEDs in /sys/class/leds
+// Disable existing trigger
+// Write "none" to /sys/class/leds/<ledName>/trigger
+func InitLedCmd(ledName string) {
+	log.Infof("InitLedCmd(%s)", ledName)
+	triggerFilename := fmt.Sprintf("/sys/class/leds/%s/trigger", ledName)
 	b := []byte("none")
 	err := ioutil.WriteFile(triggerFilename, b, 0644)
 	if err != nil {
-		log.Fatal(err, triggerFilename)
+		log.Error(err, triggerFilename)
 	}
 }
 
-// Enable the Wifi led for 200ms
-func ExecuteWifiLedCmd() {
+// ExecuteLedCmd can use different LEDs in /sys/class/leds
+// Enable the led for 200ms
+func ExecuteLedCmd(ledName string) {
+	var brightnessFilename string
 	b := []byte("1")
+	if strings.HasPrefix(ledName, "/") {
+		brightnessFilename = ledName
+	} else {
+		brightnessFilename = fmt.Sprintf("/sys/class/leds/%s/brightness", ledName)
+	}
 	err := ioutil.WriteFile(brightnessFilename, b, 0644)
 	if err != nil {
-		log.Fatal(err, brightnessFilename)
+		if printOnce {
+			log.Error(err, brightnessFilename)
+			printOnce = false
+		} else {
+			log.Debug(err, brightnessFilename)
+		}
+		return
 	}
 	time.Sleep(200 * time.Millisecond)
 	b = []byte("0")
 	err = ioutil.WriteFile(brightnessFilename, b, 0644)
 	if err != nil {
-		log.Fatal(err, brightnessFilename)
+		log.Debug(err, brightnessFilename)
 	}
 }
 
@@ -385,7 +537,8 @@ func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
 		return
 	}
 	log.Infof("handleDNSModify for %s", key)
-	if cmp.Equal(ctx.deviceNetworkStatus, status) {
+	// Ignore test status and timestamps
+	if ctx.deviceNetworkStatus.MostlyEqual(status) {
 		log.Infof("handleDNSModify no change")
 		return
 	}
@@ -438,8 +591,8 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 	}
 	log.Infof("handleGlobalConfigModify for %s", key)
 	var gcp *types.ConfigItemValueMap
-	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, gcp = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	if gcp != nil {
 		ctx.GCInitialized = true
 	}
@@ -455,7 +608,7 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigDelete for %s", key)
-	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
-		debugOverride)
+	debug, _ = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
+		debugOverride, logger)
 	log.Infof("handleGlobalConfigDelete done for %s", key)
 }

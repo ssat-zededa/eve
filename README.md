@@ -15,13 +15,26 @@ To get its job done, EVE leverages a lot of great open source projects: [Xen Pro
 You will need [QEMU 3.x+](https://www.qemu.org/), [Docker](https://www.docker.com), [Make](https://www.gnu.org/software/make/)
 and [go 1.12+](https://golang.org) installed in your system.
 
-Note, that since Linuxkit and manifest-tool are evolving pretty rapidly, we're
-vendoring those under build-tools/src. This means you don't have to have them
-locally installed, but it also means your first build time will be much longer.
+### Use pre-built release binaries
 
-If you're on MacOS the following steps should get you all the dependencies:
+EVE is an agile software project with bi-weekly release schedule. Each release gets tagged
+with x.y.z version in Git and a corresponding build is published on [DockerHUB](https://hub.docker.com/r/lfedge/eve).
+As is common with Docker releases, EVE also uses version `latest` to designate the latest
+official release and `snapshot` to designate the latest build off of master branch.
+
+Since EVE is not just an application, but a compute engine that expects to be deployed
+on real (or virtualized) hardware, you can't simply do `docker run` to give it a try.
+Instead, you need to use eve Docker container to produce one of the artifacts that
+you can then either run on bare metal hardware or deploy on virtualized infrastructure
+such as Google Compute Platform (GCP).
+
+EVE Docker container `lfedge/eve:<version>` is used to produce these deployment artifacts.
+
+Try running `docker run lfedge/eve` to get the most up-to-date help message.
 
 ### Install Dependencies
+
+The following steps are required to build and run EVE from source:
 
 #### Get Go
 
@@ -190,17 +203,15 @@ While running everything on your laptop with QEMU could be fun, nothing beats re
 
 ## How to use on a Raspberry Pi 4 ARM board
 
-Raspberry Pi 4 is a tiny, but capable enough ARM board that allows EVE to run with KVM hypervisor (and soon Xen) hypervisors. While EVE would run in the lowest memory configuration (1GB) if you plan to use it for actual EVE development we strongly recommend buying a 4GB RAM option.
+Raspberry Pi 4 is a tiny, but capable enough ARM board that allows EVE to run with either Xen or KVM hypervisors. While EVE would run in the lowest memory configuration (1GB) if you plan to use it for actual EVE development we strongly recommend buying a 4GB RAM option.
 
 Since a full Raspberry Pi 4 support is only available in upstream Linux kernels starting from 5.6.0, you'll have to use that bleeding edge kernel for your build. Another peculiar aspect of this board is that it doesn't use a standard [bootloader (e.g. u-boot or UEFI)](https://www.raspberrypi.org/documentation/configuration/boot_folder.md) so we need to trick it into using our own u-boot as UEFI environment. Thankfully, our Makefile logic tries to automate as much of it as possible. Thus, putting it all together, here are the steps to run EVE on Raspberry Pi 4:
 
 1. Make sure you have a clean build directory (since this is a non-standard build) `rm -rf dist/arm64`
-2. Build a live image `make ZARCH=arm64 HV=rpi-kvm live-raw`
+2. Build a live image `make ZARCH=arm64 HV=rpi live-raw` (or `make ZARCH=arm64 HV=rpi-kvm live-raw` if you want KVM by default)
 3. Flash the `dist/arm64/live.raw` live EVE image onto your SD card by [following these instructions](#how-to-write-eve-image-and-installer-onto-an-sd-card-or-an-installer-medium)
 
-Once your Raspberry Pi 4 is happily running an EVE image you can start using EVE controller for further updates (so that you don't ever have to take an SD card out of your board). Build your rootfs by running `make ZARCH=arm64 rootfs-kvm-rpi` and give resulting `dist/arm64/installer/rootfs.img` to the controller.
-
-You may notice that the Makefile logic doesn't produce regular devicetree blob for Raspberry Pi 4 and only enables it to run in KVM hypervisor mode. Both of these may change in the future as we evolve support for this board, but for now you just need to keep this in mind and alway build with a special option `HV=rpi-kvm`.
+Once your Raspberry Pi 4 is happily running an EVE image you can start using EVE controller for further updates (so that you don't ever have to take an SD card out of your board). Build your rootfs by running `make ZARCH=arm64 rootfs-rpi` (or `make ZARCH=arm64 rootfs-kvm-rpi` if you want KVM by default) and give resulting `dist/arm64/installer/rootfs.img` to the controller.
 
 One final note about Raspberry Pi 4 GPU support is that since we are running EVE in 64bit (aarch64) mode we are still waiting for the proper [VC4 DRM BCM2711 drivers](https://lore.kernel.org/dri-devel/cover.6c896ace9a5a7840e9cec008b553cbb004ca1f91.1582533919.git-series.maxime@cerno.tech/T/#m0275b55e1518be1fb2154d3c95e13c1b7de1f347) to be upstreamed. Currently it is expected that Kernel 5.7 may actually ship the fully functional driver.
 

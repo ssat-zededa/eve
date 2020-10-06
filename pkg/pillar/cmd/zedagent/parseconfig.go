@@ -22,8 +22,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/ssh"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
-	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	uuid "github.com/satori/go.uuid"
 )
 
 const (
@@ -54,6 +53,7 @@ func parseConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigContext,
 	if getconfigCtx.rebootFlag || ctx.deviceReboot {
 		log.Debugf("parseConfig: Ignoring config as rebootFlag set")
 	} else {
+		handleControllerCertsSha(ctx, config)
 		parseCipherContext(getconfigCtx, config)
 		parseDatastoreConfig(config, getconfigCtx)
 		// DeviceIoList has some defaults for Usage and UsagePolicy
@@ -69,6 +69,8 @@ func parseConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigContext,
 		parseSystemAdapterConfig(config, getconfigCtx, forceSystemAdaptersParse)
 		parseBaseOsConfig(getconfigCtx, config)
 		parseNetworkInstanceConfig(config, getconfigCtx)
+		parseContentInfoConfig(getconfigCtx, config)
+		parseVolumeConfig(getconfigCtx, config)
 		parseAppInstanceConfig(config, getconfigCtx)
 	}
 	return false
@@ -131,8 +133,6 @@ func parseBaseOsConfig(getconfigCtx *getconfigContext,
 		if !found {
 			log.Infof("parseBaseOsConfig: deleting %s", uuidStr)
 			getconfigCtx.pubBaseOsConfig.Unpublish(uuidStr)
-
-			unpublishCertObjConfig(getconfigCtx, uuidStr)
 		}
 	}
 
@@ -147,34 +147,15 @@ func parseBaseOsConfig(getconfigCtx *getconfigContext,
 
 		baseOs.UUIDandVersion.UUID, _ = uuid.FromString(cfgOs.Uuidandversion.Uuid)
 		baseOs.UUIDandVersion.Version = cfgOs.Uuidandversion.Version
-
 		baseOs.Activate = cfgOs.GetActivate()
 		baseOs.BaseOsVersion = cfgOs.GetBaseOSVersion()
-
-		cfgOsDetails := cfgOs.GetBaseOSDetails()
-		cfgOsParamList := cfgOsDetails.GetBaseOSParams()
-
-		for jdx, cfgOsDetail := range cfgOsParamList {
-			param := new(types.OsVerParams)
-			param.OSVerKey = cfgOsDetail.GetOSVerKey()
-			param.OSVerValue = cfgOsDetail.GetOSVerValue()
-			baseOs.OsParams[jdx] = *param
-		}
-
-		baseOs.StorageConfigList = make([]types.StorageConfig,
+		baseOs.ContentTreeConfigList = make([]types.ContentTreeConfig,
 			len(cfgOs.Drives))
-		parseStorageConfigList(types.BaseOsObj, baseOs.StorageConfigList,
-			cfgOs.Drives)
+		parseContentTreeConfigList(baseOs.ContentTreeConfigList, cfgOs.Drives)
 
-		certInstance := getCertObjects(baseOs.UUIDandVersion,
-			baseOs.ConfigSha256, baseOs.StorageConfigList)
 		log.Debugf("parseBaseOsConfig publishing %v",
 			baseOs)
 		publishBaseOsConfig(getconfigCtx, baseOs)
-		if certInstance != nil {
-			publishCertObjConfig(getconfigCtx, certInstance,
-				baseOs.Key())
-		}
 	}
 }
 
@@ -334,18 +315,6 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			ctx.pubNetworkInstanceConfig.Publish(networkInstanceConfig.UUID.String(),
 				networkInstanceConfig)
 
-		case types.NetworkInstanceTypeMesh:
-			// mark HasEncap as true, for special MTU handling
-			networkInstanceConfig.HasEncap = true
-			// if not cryptoIPv4/IPv6 type, flag it
-			if networkInstanceConfig.IpType != types.AddressTypeCryptoIPV4 && networkInstanceConfig.IpType != types.AddressTypeCryptoIPV6 {
-				log.Errorf("Network instance %s %s, %v not crypto type",
-					networkInstanceConfig.UUID.String(),
-					networkInstanceConfig.DisplayName,
-					networkInstanceConfig.IpType)
-			}
-			populateLispConfig(apiConfigEntry, &networkInstanceConfig)
-
 		// FIXME:XXX set encap flag, when the dummy interface
 		// is tested for the VPN
 		case types.NetworkInstanceTypeCloud:
@@ -386,34 +355,6 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 
 		ctx.pubNetworkInstanceConfig.Publish(networkInstanceConfig.UUID.String(),
 			networkInstanceConfig)
-	}
-}
-
-func populateLispConfig(apiConfigEntry *zconfig.NetworkInstanceConfig,
-	networkInstanceConfig *types.NetworkInstanceConfig) {
-	lispConfig := apiConfigEntry.Cfg.LispConfig
-	if lispConfig != nil {
-		mapServers := []types.MapServer{}
-		for _, ms := range lispConfig.LispMSs {
-			mapServer := types.MapServer{
-				ServiceType: types.MapServerType(ms.ZsType),
-				NameOrIp:    ms.NameOrIp,
-				Credential:  ms.Credential,
-			}
-			mapServers = append(mapServers, mapServer)
-		}
-		eidPrefix := net.IP(lispConfig.Allocationprefix)
-
-		// Populate service Lisp config that should be sent to zedrouter
-		networkInstanceConfig.LispConfig = types.NetworkInstanceLispConfig{
-			MapServers:    mapServers,
-			IID:           lispConfig.LispInstanceId,
-			Allocate:      lispConfig.Allocate,
-			ExportPrivate: lispConfig.Exportprivate,
-			EidPrefix:     eidPrefix,
-			EidPrefixLen:  lispConfig.Allocationprefixlen,
-			Experimental:  lispConfig.Experimental,
-		}
 	}
 }
 
@@ -478,8 +419,6 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 		if !found {
 			log.Infof("Remove app config %s", uuidStr)
 			getconfigCtx.pubAppInstanceConfig.Unpublish(uuidStr)
-
-			unpublishCertObjConfig(getconfigCtx, uuidStr)
 		}
 	}
 
@@ -506,10 +445,12 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 		appInstance.FixedResources.VncDisplay = cfgApp.Fixedresources.VncDisplay
 		appInstance.FixedResources.VncPasswd = cfgApp.Fixedresources.VncPasswd
 
-		appInstance.StorageConfigList = make([]types.StorageConfig,
-			len(cfgApp.Drives))
-		parseStorageConfigList(types.AppImgObj, appInstance.StorageConfigList,
-			cfgApp.Drives)
+		appInstance.VolumeRefConfigList = make([]types.VolumeRefConfig,
+			len(cfgApp.VolumeRefList))
+		parseVolumeRefList(appInstance.VolumeRefConfigList, cfgApp.GetVolumeRefList())
+
+		// fill in the collect stats IP address of the App
+		appInstance.CollectStatsIPAddr = net.ParseIP(cfgApp.GetCollectStatsIPAddr())
 
 		// fill the overlay/underlay config
 		parseAppNetworkConfig(&appInstance, cfgApp, config.Networks,
@@ -543,27 +484,9 @@ func parseAppInstanceConfig(config *zconfig.EdgeDevConfig,
 		appInstance.RemoteConsole = cfgApp.GetRemoteConsole()
 		appInstance.CipherBlockStatus = parseCipherBlock(getconfigCtx, appInstance.Key(),
 			cfgApp.GetCipherData())
-		// get the certs for image sha verification
-		certInstance := getCertObjects(appInstance.UUIDandVersion,
-			appInstance.ConfigSha256, appInstance.StorageConfigList)
-
-		// Pretend that the controller specified purgeCounter for the first
-		// disk. Then StorageStatus will start with that value below.
-		if len(appInstance.StorageConfigList) > 0 &&
-			appInstance.StorageConfigList[0].PurgeCounter != appInstance.PurgeCmd.Counter {
-			sc := &appInstance.StorageConfigList[0]
-			log.Infof("Setting purgeCounter to %d for %s",
-				appInstance.PurgeCmd.Counter, appInstance.Key())
-			sc.PurgeCounter = appInstance.PurgeCmd.Counter
-		}
 
 		// write to zedmanager config directory
-		uuidStr := cfgApp.Uuidandversion.Uuid
 		publishAppInstanceConfig(getconfigCtx, appInstance)
-		if certInstance != nil {
-			publishCertObjConfig(getconfigCtx, certInstance,
-				uuidStr)
-		}
 	}
 }
 
@@ -670,11 +593,9 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 		errStr := fmt.Sprintf("Missing phyio for %s lower %s; ignored",
 			sysAdapter.Name, sysAdapter.LowerLayerName)
 		log.Error(errStr)
-		// Report error but set Dhcp, isMgmt, and isFree to sane values
-		port.RecordFailure(errStr)
-		port.IfName = sysAdapter.Name
-		isFree = true
-	} else if !types.IoType(phyio.Ptype).IsNet() {
+		return nil
+	}
+	if !types.IoType(phyio.Ptype).IsNet() {
 		errStr := fmt.Sprintf("phyio for %s lower %s not IsNet; ignored",
 			sysAdapter.Name, sysAdapter.LowerLayerName)
 		log.Error(errStr)
@@ -878,6 +799,8 @@ func parseDeviceIoListConfig(config *zconfig.EdgeDevConfig,
 				port.Phyaddr.Irq = value
 			case "ioports":
 				port.Phyaddr.Ioports = value
+			case "usbaddr":
+				port.Phyaddr.UsbAddr = value
 			default:
 				port.Phyaddr.UnknownType = value
 				log.Warnf("Unrecognized Physical address Ignored: "+
@@ -986,45 +909,42 @@ func publishDatastoreConfig(ctx *getconfigContext,
 	}
 }
 
-func parseStorageConfigList(objType string,
-	storageList []types.StorageConfig, drives []*zconfig.Drive) {
+func parseContentTreeConfigList(contentTreeList []types.ContentTreeConfig, drives []*zconfig.Drive) {
 
 	var idx int = 0
 
 	for _, drive := range drives {
-		image := new(types.StorageConfig)
+		contentTree := new(types.ContentTreeConfig)
 		if drive.Image == nil {
 			log.Errorf("No drive.Image for drive %v",
 				drive)
 			// Pass on for error reporting
-			image.DatastoreID = nilUUID
+			contentTree.ContentID = nilUUID
 		} else {
-			id, _ := uuid.FromString(drive.Image.DsId)
-			image.DatastoreID = id
-			image.Name = drive.Image.Name
-			image.ImageID, _ = uuid.FromString(drive.Image.Uuidandversion.Uuid)
-			image.Format = drive.Image.Iformat
-			image.Size = uint64(drive.Image.SizeBytes)
-			image.ImageSignature = drive.Image.Siginfo.Signature
-			image.SignatureKey = drive.Image.Siginfo.Signercerturl
-
-			// XXX:FIXME certificates can be many
-			// this list, currently contains the certUrls
-			// should be the sha/uuid of cert filenames
-			// as proper DataStore Entries
-
-			if drive.Image.Siginfo.Intercertsurl != "" {
-				image.CertificateChain = make([]string, 1)
-				image.CertificateChain[0] = drive.Image.Siginfo.Intercertsurl
-			}
+			contentTree.ContentID, _ = uuid.FromString(drive.Image.Uuidandversion.Uuid)
+			contentTree.DatastoreID, _ = uuid.FromString(drive.Image.DsId)
+			contentTree.RelativeURL = drive.Image.Name
+			contentTree.Format = drive.Image.Iformat
+			contentTree.ContentSha256 = strings.ToLower(drive.Image.Sha256)
+			contentTree.MaxDownloadSize = uint64(drive.Image.SizeBytes)
+			contentTree.DisplayName = drive.Image.Name
 		}
-		image.ReadOnly = drive.Readonly
-		image.Preserve = drive.Preserve
-		image.Maxsizebytes = uint64(drive.Maxsizebytes)
-		image.Target = strings.ToLower(drive.Target.String())
-		image.Devtype = strings.ToLower(drive.Drvtype.String())
-		image.ImageSha256 = drive.Image.Sha256
-		storageList[idx] = *image
+		contentTreeList[idx] = *contentTree
+		idx++
+	}
+}
+
+func parseVolumeRefList(volumeRefConfigList []types.VolumeRefConfig,
+	volumeRefs []*zconfig.VolumeRef) {
+
+	var idx int
+	for _, volumeRef := range volumeRefs {
+		volume := new(types.VolumeRefConfig)
+		volume.VolumeID, _ = uuid.FromString(volumeRef.Uuid)
+		volume.GenerationCounter = volumeRef.GenerationCount
+		volume.RefCount = 1
+		volume.MountDir = volumeRef.GetMountDir()
+		volumeRefConfigList[idx] = *volume
 		idx++
 	}
 }
@@ -1384,8 +1304,6 @@ func parseAppNetworkConfig(appInstance *types.AppInstanceConfig,
 
 	parseUnderlayNetworkConfig(appInstance, cfgApp, cfgNetworks,
 		cfgNetworkInstances)
-	parseOverlayNetworkConfig(appInstance, cfgApp, cfgNetworks,
-		cfgNetworkInstances)
 }
 
 func parseUnderlayNetworkConfig(appInstance *types.AppInstanceConfig,
@@ -1547,167 +1465,6 @@ func parseUnderlayNetworkConfigEntry(
 	return ulCfg
 }
 
-func parseOverlayNetworkConfigEntry(
-	cfgApp *zconfig.AppInstanceConfig,
-	cfgNetworks []*zconfig.NetworkConfig,
-	cfgNetworkInstances []*zconfig.NetworkInstanceConfig,
-	intfEnt *zconfig.NetworkAdapter) *types.EIDOverlayConfig {
-
-	olCfg := new(types.EIDOverlayConfig)
-	olCfg.Name = intfEnt.Name
-	// XXX set olCfg.IntfOrder from API once available
-	var intfOrder int32
-
-	// Lookup NetworkInstance ID
-	networkInstanceEntry := lookupNetworkInstanceId(intfEnt.NetworkId,
-		cfgNetworkInstances)
-	if networkInstanceEntry == nil {
-		olCfg.Error = fmt.Sprintf("App %s-%s: Can't find %s in network instances.\n",
-			cfgApp.Displayname, cfgApp.Uuidandversion.Uuid,
-			intfEnt.NetworkId)
-		log.Errorf("%s", olCfg.Error)
-		// XXX These errors should be propagated to zedrouter.
-		// zedrouter can then relay these errors to zedcloud.
-		return olCfg
-	}
-	if !isOverlayNetworkInstance(networkInstanceEntry) {
-		return nil
-	}
-	uuid, err := uuid.FromString(intfEnt.NetworkId)
-	if err != nil {
-		olCfg.Error = fmt.Sprintf("parseOverlayNetworkConfigEntry: "+
-			"Malformed UUID ignored: %s", err)
-		log.Errorf("%s", olCfg.Error)
-		return olCfg
-	}
-	log.Infof("NetworkInstance(%s-%s): InstType %v",
-		cfgApp.Displayname, uuid.String(),
-		networkInstanceEntry.InstType)
-
-	olCfg.Network = uuid
-	if intfEnt.MacAddress != "" {
-		log.Infof("parseOverlayNetworkConfigEntry: (App %s, Overlay interface %s) - "+
-			"Got static mac %s", cfgApp.Displayname, olCfg.Name, intfEnt.MacAddress)
-		olCfg.AppMacAddr, err = net.ParseMAC(intfEnt.MacAddress)
-		if err != nil {
-			olCfg.Error = fmt.Sprintf("parseOverlayNetworkConfigEntry: bad MAC %s: %s\n",
-				intfEnt.MacAddress, err)
-			log.Errorf("%s", olCfg.Error)
-			return olCfg
-		}
-	}
-	// Handle old and new location of EIDv6
-	if intfEnt.CryptoEid != "" {
-		olCfg.EIDConfigDetails.EID = net.ParseIP(intfEnt.CryptoEid)
-		if olCfg.EIDConfigDetails.EID == nil {
-			olCfg.Error = fmt.Sprintf("parseOverlayNetworkConfigEntry: bad CryptoEid %s\n",
-				intfEnt.CryptoEid)
-			log.Errorf("%s", olCfg.Error)
-			return olCfg
-		}
-		// Any IPv4 EID?
-		if intfEnt.Addr != "" {
-			olCfg.AppIPAddr = net.ParseIP(intfEnt.Addr)
-			if olCfg.AppIPAddr == nil {
-				olCfg.Error = fmt.Sprintf("parseOverlayNetworkConfigEntry: bad Addr %s\n",
-					intfEnt.Addr)
-				log.Errorf("%s", olCfg.Error)
-				return olCfg
-			}
-		}
-	} else if intfEnt.Addr != "" {
-		olCfg.EIDConfigDetails.EID = net.ParseIP(intfEnt.Addr)
-		if olCfg.EIDConfigDetails.EID == nil {
-			olCfg.Error = fmt.Sprintf("parseOverlayNetworkConfigEntry: bad Addr %s\n",
-				intfEnt.Addr)
-			log.Errorf("%s", olCfg.Error)
-			return olCfg
-		}
-	}
-	if olCfg.AppIPAddr == nil {
-		olCfg.AppIPAddr = olCfg.EIDConfigDetails.EID
-	}
-
-	olCfg.ACLs = make([]types.ACE, len(intfEnt.Acls))
-	for aclIdx, acl := range intfEnt.Acls {
-		aclCfg := new(types.ACE)
-		aclCfg.Matches = make([]types.ACEMatch,
-			len(acl.Matches))
-		aclCfg.Actions = make([]types.ACEAction,
-			len(acl.Actions))
-		aclCfg.RuleID = acl.Id
-		// XXX temporary until we get an intfOrder in the API
-		if intfOrder == 0 {
-			intfOrder = acl.Id
-		}
-		aclCfg.Name = acl.Name
-		aclCfg.Dir = types.ACEDirection(acl.Dir)
-		for matchIdx, match := range acl.Matches {
-			matchCfg := new(types.ACEMatch)
-			matchCfg.Type = match.Type
-			matchCfg.Value = match.Value
-			aclCfg.Matches[matchIdx] = *matchCfg
-		}
-
-		for actionIdx, action := range acl.Actions {
-			actionCfg := new(types.ACEAction)
-			actionCfg.Limit = action.Limit
-			actionCfg.LimitRate = int(action.Limitrate)
-			actionCfg.LimitUnit = action.Limitunit
-			actionCfg.LimitBurst = int(action.Limitburst)
-			actionCfg.PortMap = action.Portmap
-			actionCfg.TargetPort = int(action.AppPort)
-			aclCfg.Actions[actionIdx] = *actionCfg
-		}
-		olCfg.ACLs[aclIdx] = *aclCfg
-	}
-
-	olCfg.EIDConfigDetails.LispSignature = intfEnt.Lispsignature
-	olCfg.EIDConfigDetails.PemCert = intfEnt.Pemcert
-	olCfg.EIDConfigDetails.PemPrivateKey = intfEnt.Pemprivatekey
-	// XXX set olCfg.IntfOrder from API once available
-	olCfg.IntfOrder = intfOrder
-
-	return olCfg
-}
-
-// parseOverlayNetworkConfig
-func parseOverlayNetworkConfig(appInstance *types.AppInstanceConfig,
-	cfgApp *zconfig.AppInstanceConfig,
-	cfgNetworks []*zconfig.NetworkConfig,
-	cfgNetworkInstances []*zconfig.NetworkInstanceConfig) {
-
-	for _, intfEnt := range cfgApp.Interfaces {
-		olCfg := parseOverlayNetworkConfigEntry(
-			cfgApp, cfgNetworks, cfgNetworkInstances, intfEnt)
-		if olCfg == nil {
-			log.Infof("Nil olcfg for App interface %s", intfEnt.Name)
-			continue
-		}
-		appInstance.OverlayNetworkList = append(appInstance.OverlayNetworkList,
-			*olCfg)
-		if olCfg.Error != "" {
-			appInstance.Errors = append(appInstance.Errors, olCfg.Error)
-			log.Errorf("Error in Interface(%s) config. Error: %s",
-				intfEnt.Name, olCfg.Error)
-		}
-	}
-	// sort based on intfOrder
-	// XXX remove? Debug?
-	if len(appInstance.OverlayNetworkList) > 1 {
-		log.Infof("XXX pre sort %+v", appInstance.OverlayNetworkList)
-	}
-	sort.Slice(appInstance.OverlayNetworkList[:],
-		func(i, j int) bool {
-			return appInstance.OverlayNetworkList[i].IntfOrder <
-				appInstance.OverlayNetworkList[j].IntfOrder
-		})
-	// XXX remove? Debug?
-	if len(appInstance.OverlayNetworkList) > 1 {
-		log.Infof("XXX post sort %+v", appInstance.OverlayNetworkList)
-	}
-}
-
 var itemsPrevConfigHash []byte
 
 func parseConfigItems(config *zconfig.EdgeDevConfig, ctx *getconfigContext) {
@@ -1793,7 +1550,7 @@ func parseConfigItems(config *zconfig.EdgeDevConfig, ctx *getconfigContext) {
 		if newSSHAuthorizedKeys != oldSSHAuthorizedKeys {
 			log.Infof("parseConfigItems: %s changed from %v to %v",
 				"SshAuthorizedKeys", oldSSHAuthorizedKeys, newSSHAuthorizedKeys)
-			ssh.UpdateSshAuthorizedKeys(newSSHAuthorizedKeys)
+			ssh.UpdateSshAuthorizedKeys(log, newSSHAuthorizedKeys)
 		}
 		pub := ctx.zedagentCtx.pubGlobalConfig
 		err := pub.Publish("global", *gcPtr)
@@ -1823,98 +1580,6 @@ func publishBaseOsConfig(getconfigCtx *getconfigContext,
 		key, config.BaseOsVersion, config.Activate)
 	pub := getconfigCtx.pubBaseOsConfig
 	pub.Publish(key, *config)
-}
-
-func getCertObjects(uuidAndVersion types.UUIDandVersion,
-	sha256 string, drives []types.StorageConfig) *types.CertObjConfig {
-
-	var cidx int = 0
-
-	// count the number of cerificates in this object
-	for _, image := range drives {
-		if image.SignatureKey != "" {
-			cidx++
-		}
-		for _, certUrl := range image.CertificateChain {
-			if certUrl != "" {
-				cidx++
-			}
-		}
-	}
-
-	// if no cerificates, return
-	if cidx == 0 {
-		return nil
-	}
-
-	// using the holder object UUID for
-	// cert config json, and also the config sha
-	var config = &types.CertObjConfig{}
-
-	// certs object holder
-	// each storageConfigList entry is a
-	// certificate object
-	config.UUIDandVersion = uuidAndVersion
-	config.ConfigSha256 = sha256
-	config.StorageConfigList = make([]types.StorageConfig, cidx)
-
-	cidx = 0
-	for _, image := range drives {
-		if image.SignatureKey != "" {
-			getCertObjConfig(config, image, image.SignatureKey, cidx)
-			cidx++
-		}
-
-		for _, certUrl := range image.CertificateChain {
-			if certUrl != "" {
-				getCertObjConfig(config, image, certUrl, cidx)
-				cidx++
-			}
-		}
-	}
-
-	return config
-}
-
-func getCertObjConfig(config *types.CertObjConfig,
-	image types.StorageConfig, certUrl string, idx int) {
-
-	if certUrl == "" {
-		return
-	}
-
-	// XXX the sha for the cert should be set
-	// XXX:FIXME hardcoding Size as 100KB
-	var drive = &types.StorageConfig{
-		DatastoreID: image.DatastoreID,
-		Name:        certUrl, // XXX FIXME use??
-		NameIsURL:   true,
-		Size:        100 * 1024,
-		ImageSha256: "",
-	}
-	config.StorageConfigList[idx] = *drive
-}
-
-func publishCertObjConfig(getconfigCtx *getconfigContext,
-	config *types.CertObjConfig, uuidStr string) {
-
-	key := uuidStr // XXX vs. config.Key()?
-	log.Debugf("publishCertObjConfig(%s) key %s", uuidStr, config.Key())
-	pub := getconfigCtx.pubCertObjConfig
-	pub.Publish(key, *config)
-}
-
-func unpublishCertObjConfig(getconfigCtx *getconfigContext, uuidStr string) {
-
-	key := uuidStr
-	log.Debugf("unpublishCertObjConfig(%s)", key)
-	pub := getconfigCtx.pubCertObjConfig
-	c, _ := pub.Get(key)
-	if c == nil {
-		log.Errorf("unpublishCertObjConfig(%s) not found", key)
-		return
-	}
-	pub.Unpublish(key)
 }
 
 // Get sha256 for a subset of the protobuf message.
@@ -1947,26 +1612,22 @@ func parseOpCmds(config *zconfig.EdgeDevConfig,
 	return scheduleReboot(config.GetReboot(), getconfigCtx)
 }
 
-func readRebootConfig() types.DeviceOpsCmd {
-	rebootConfig := types.DeviceOpsCmd{}
-
+// Returns the cmd if the file exists
+func readRebootConfig() *types.DeviceOpsCmd {
 	log.Debugf("readRebootConfigCounter - reading %s", rebootConfigFilename)
 
 	bytes, err := ioutil.ReadFile(rebootConfigFilename)
 	if err == nil {
+		rebootConfig := types.DeviceOpsCmd{}
 		err = json.Unmarshal(bytes, &rebootConfig)
 		if err != nil {
 			log.Fatal(err)
 		}
-	} else {
-		// Check if the file exists - if not, create one with
-		// default rebootConfig
-		log.Infof("readRebootConfigCounter - %s doesn't exist. Creating it. "+
-			"rebootConfig.Counter: %d",
-			rebootConfigFilename, rebootConfig.Counter)
-		saveRebootConfig(rebootConfig)
+		return &rebootConfig
 	}
-	return rebootConfig
+	log.Infof("readRebootConfigCounter - %s doesn't exist",
+		rebootConfigFilename)
+	return nil
 }
 
 func saveRebootConfig(reboot types.DeviceOpsCmd) {
@@ -2004,13 +1665,11 @@ func scheduleReboot(reboot *zconfig.DeviceOpsCmd,
 
 	log.Infof("scheduleReboot: Applying updated config %v", reboot)
 	rebootConfig := readRebootConfig()
-	log.Infof("scheduleReboot - CurrentRebootConfig %v", rebootConfig)
-
-	// If counter value has changed it means new reboot event
-	if rebootConfig.Counter != reboot.Counter {
-
-		log.Infof("scheduleReboot: old %d new %d",
-			rebootConfig.Counter, reboot.Counter)
+	if rebootConfig != nil && rebootConfig.Counter == reboot.Counter {
+		rebootPrevReturn = false
+		return false
+	}
+	if rebootConfig == nil || rebootConfig.Counter != reboot.Counter {
 		// store current config, persistently
 		rebootCmd := types.DeviceOpsCmd{
 			Counter:      reboot.Counter,
@@ -2019,29 +1678,33 @@ func scheduleReboot(reboot *zconfig.DeviceOpsCmd,
 		}
 		saveRebootConfig(rebootCmd)
 		getconfigCtx.zedagentCtx.rebootConfigCounter = reboot.Counter
-
-		// if device reboot is set, ignore op-command
-		if getconfigCtx.zedagentCtx.deviceReboot {
-			log.Warnf("device reboot is set")
-			return false
-		}
-
-		// Defer if inprogress by returning
-		ctx := getconfigCtx.zedagentCtx
-		if getconfigCtx.updateInprogress {
-			// Wait until TestComplete
-			log.Warnf("Rebooting even though testing inprogress; defer")
-			ctx.rebootCmdDeferred = true
-			return false
-		}
-
-		infoStr := "NORMAL: handleReboot rebooting"
-		handleRebootCmd(ctx, infoStr)
-		rebootPrevReturn = true
-		return true
 	}
-	rebootPrevReturn = false
-	return false
+	if rebootConfig == nil {
+		// First boot - skip the reboot but report to cloud
+		triggerPublishDevInfo(getconfigCtx.zedagentCtx)
+		rebootPrevReturn = false
+		return false
+	}
+
+	// if device reboot is set, ignore op-command
+	if getconfigCtx.zedagentCtx.deviceReboot {
+		log.Warnf("device reboot is set")
+		return false
+	}
+
+	// Defer if inprogress by returning
+	ctx := getconfigCtx.zedagentCtx
+	if getconfigCtx.updateInprogress {
+		// Wait until TestComplete
+		log.Warnf("Rebooting even though testing inprogress; defer")
+		ctx.rebootCmdDeferred = true
+		return false
+	}
+
+	infoStr := "NORMAL: handleReboot rebooting"
+	handleRebootCmd(ctx, infoStr)
+	rebootPrevReturn = true
+	return true
 }
 
 var backupPrevConfigHash []byte

@@ -12,28 +12,30 @@ import (
 	"os"
 	"time"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 type ctrdContext struct {
-	// XXX add log?
 	domCounter int
 	PCI        map[string]bool
+	ctrdClient *containerd.Client
 }
 
 func initContainerd() (*ctrdContext, error) {
-	if err := containerd.InitContainerdClient(); err != nil {
+	ctrdClient, err := containerd.NewContainerdClient()
+	if err != nil {
 		return nil, err
 	}
 	return &ctrdContext{
 		domCounter: 0,
 		PCI:        map[string]bool{},
+		ctrdClient: ctrdClient,
 	}, nil
 }
 
 func newContainerd() Hypervisor {
 	if ret, err := initContainerd(); err != nil {
-		log.Fatalf("couldn't initialize containerd (this should not happen): %v. Exiting.", err)
+		logrus.Fatalf("couldn't initialize containerd (this should not happen): %v. Exiting.", err)
 		return nil // it really never returns on account of above
 	} else {
 		return ret
@@ -51,7 +53,7 @@ func (ctx ctrdContext) Task(status *types.DomainStatus) types.Task {
 func (ctx ctrdContext) Setup(status types.DomainStatus, config types.DomainConfig, aa *types.AssignableAdapters, file *os.File) error {
 	diskStatusList := status.DiskStatusList
 	domainName := status.DomainName
-	spec, err := containerd.NewOciSpec(domainName)
+	spec, err := ctx.ctrdClient.NewOciSpec(domainName)
 	if err != nil {
 		return logError("requesting default OCI spec for domain %s failed %v", domainName, err)
 	}
@@ -83,20 +85,24 @@ func (ctx ctrdContext) Create(domainName string, cfgFilename string, config *typ
 	// we are ignoring error here since it is cheaper to always call this as opposed
 	// to figure out if there's a wedged task (IOW, error could simply mean there was
 	// nothing to kill)
-	_ = containerd.CtrStopContainer(domainName, true)
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+	_ = ctx.ctrdClient.CtrStopContainer(ctrdCtx, domainName, true)
 
-	return containerd.CtrCreateTask(domainName)
+	return ctx.ctrdClient.CtrCreateTask(ctrdCtx, domainName)
 }
 
 func (ctx ctrdContext) Start(domainName string, domainID int) error {
-	err := containerd.CtrStartTask(domainName)
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+	err := ctx.ctrdClient.CtrStartTask(ctrdCtx, domainName)
 	if err != nil {
 		return err
 	}
 
 	// now lets wait for task to reach a steady state or for >10sec to elapse
 	for i := 0; i < 10; i++ {
-		_, _, status, err := containerd.CtrContainerInfo(domainName)
+		_, _, status, err := ctx.ctrdClient.CtrContainerInfo(ctrdCtx, domainName)
 		if err == nil && (status == "running" || status == "stopped" || status == "paused") {
 			return nil
 		}
@@ -107,15 +113,27 @@ func (ctx ctrdContext) Start(domainName string, domainID int) error {
 }
 
 func (ctx ctrdContext) Stop(domainName string, domainID int, force bool) error {
-	return containerd.CtrStopContainer(domainName, force)
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+	return ctx.ctrdClient.CtrStopContainer(ctrdCtx, domainName, force)
 }
 
 func (ctx ctrdContext) Delete(domainName string, domainID int) error {
-	return containerd.CtrDeleteContainer(domainName)
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+	return ctx.ctrdClient.CtrDeleteContainer(ctrdCtx, domainName)
+}
+
+func (ctx ctrdContext) Annotations(domainName string, domainID int) (map[string]string, error) {
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+	return ctx.ctrdClient.CtrGetAnnotations(ctrdCtx, domainName)
 }
 
 func (ctx ctrdContext) Info(domainName string, domainID int) (int, types.SwState, error) {
-	effectiveDomainID, exit, status, err := containerd.CtrContainerInfo(domainName)
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+	effectiveDomainID, exit, status, err := ctx.ctrdClient.CtrContainerInfo(ctrdCtx, domainName)
 	if err != nil {
 		return domainID, types.UNKNOWN, logError("containerd looking up domain %s with PID %d resulted in %v", domainName, domainID, err)
 	}
@@ -125,7 +143,7 @@ func (ctx ctrdContext) Info(domainName string, domainID int) (int, types.SwState
 	}
 
 	if effectiveDomainID != domainID {
-		log.Warnf("containerd domain %s with PID %d (different from expected %d) is %s",
+		logrus.Warnf("containerd domain %s with PID %d (different from expected %d) is %s",
 			domainName, effectiveDomainID, domainID, status)
 	}
 
@@ -166,9 +184,15 @@ func (ctx ctrdContext) GetHostCPUMem() (types.HostMemory, error) {
 	return selfDomCPUMem()
 }
 
+const clockTicks uint64 = 100 // github.com/containerd/cgroups/ticks.go hardcoded as 100 also
+const nanoSecToSec uint64 = 1000000000
+
 func (ctx ctrdContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 	res := map[string]types.DomainMetric{}
-	ids, err := containerd.CtrListTaskIds()
+	ctrdCtx, done := ctx.ctrdClient.CtrNewUserServicesCtx()
+	defer done()
+
+	ids, err := ctx.ctrdClient.CtrListTaskIds(ctrdCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +202,7 @@ func (ctx ctrdContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 		var usedMemPerc float64
 		var cpuTotal uint64
 
-		if metric, err := containerd.CtrGetContainerMetrics(id); err == nil {
+		if metric, err := ctx.ctrdClient.CtrGetContainerMetrics(ctrdCtx, id); err == nil {
 			usedMem = uint32(roundFromBytesToMbytes(metric.Memory.Usage.Usage))
 			totalMem = uint32(roundFromBytesToMbytes(metric.Memory.HierarchicalMemoryLimit))
 			availMem = 0
@@ -190,9 +214,9 @@ func (ctx ctrdContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 			} else {
 				usedMemPerc = 0
 			}
-			cpuTotal = metric.CPU.Usage.Total / 1000000000
+			cpuTotal = metric.CPU.Usage.Total / nanoSecToSec / clockTicks
 		} else {
-			log.Errorf("GetDomsCPUMem failed with error %v", err)
+			logrus.Errorf("GetDomsCPUMem failed with error %v", err)
 		}
 
 		res[id] = types.DomainMetric{

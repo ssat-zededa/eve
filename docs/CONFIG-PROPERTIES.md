@@ -13,6 +13,7 @@
 | timer.use.config.checkpoint | integer in seconds | 600 | use checkpointed config if no cloud connectivity |
 | timer.gc.vdisk | integer in seconds | 1 hour | garbage collect unused instance virtual disk |
 | timer.download.retry | integer in seconds | 600 | retry a failed download |
+| timer.download.stalled | integer in seconds | 600 | cancel a stalled download |
 | timer.boot.retry | integer in seconds | 600 | retry a failed domain boot |
 | timer.port.georedo | integer in seconds | 1 hour | redo IP geolocation |
 | timer.port.georetry | integer in seconds | 600 | retry geolocation after failure |
@@ -30,6 +31,7 @@
 | storage.dom0.disk.minusage.percent | integer percent | 20 | min. percent of persist partition reserved for dom0 |
 | storage.apps.ignore.disk.check | boolean | false | Ignore disk usage check for Apps. Allows apps to create images bigger than available disk|
 | timer.appcontainer.stats.interval | integer in seconds | 300 | collect application container stats |
+| timer.vault.ready.cutoff | integer in seconds | 300 | reboot after inaccessible vault |
 
 
 In addition, there can be per-agent settings.

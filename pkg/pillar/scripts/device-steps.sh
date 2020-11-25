@@ -11,16 +11,17 @@ PERSIST_CERTS=$PERSISTDIR/certs
 PERSIST_AGENT_DEBUG=$PERSISTDIR/agentdebug
 BINDIR=/opt/zededa/bin
 TMPDIR=/persist/tmp
-ZTMPDIR=/var/tmp/zededa
+ZTMPDIR=/run/global
 DPCDIR=$ZTMPDIR/DevicePortConfig
 FIRSTBOOTFILE=$ZTMPDIR/first-boot
 GCDIR=$PERSISTDIR/config/ConfigItemValueMap
-AGENTS0="logmanager ledmanager nim nodeagent domainmgr"
-AGENTS1="zedmanager zedrouter downloader verifier zedagent baseosmgr wstunnelclient volumemgr"
+AGENTS0="zedagent logmanager ledmanager nim nodeagent domainmgr"
+AGENTS1="zedmanager zedrouter downloader verifier baseosmgr wstunnelclient volumemgr"
 AGENTS="$AGENTS0 $AGENTS1"
 TPM_DEVICE_PATH="/dev/tpmrm0"
 SECURITYFSPATH=/sys/kernel/security
 PATH=$BINDIR:$PATH
+TPMINFOTEMPFILE=/var/tmp/tpminfo.txt
 
 echo "$(date -Ins -u) Starting device-steps.sh"
 echo "$(date -Ins -u) EVE version: $(cat /run/eve-release)"
@@ -42,9 +43,9 @@ while [ $# != 0 ]; do
     shift
 done
 
-# Sleep for a bit until /var/run/$1.touch exists
+# Sleep for a bit until /run/$1.touch exists
 wait_for_touch() {
-    f=/var/run/"$1".touch
+    f=/run/"$1".touch
     waited=0
     while [ ! -f "$f" ] && [ "$waited" -lt 60 ]; do
             echo "$(date -Ins -u) waiting for $f"
@@ -75,7 +76,12 @@ if ! mount -t securityfs securityfs "$SECURITYFSPATH"; then
     echo "$(date -Ins -u) mounting securityfs failed"
 fi
 
-DIRS="$CONFIGDIR $ZTMPDIR $CONFIGDIR/DevicePortConfig $PERSIST_CERTS $PERSIST_AGENT_DEBUG /persist/status/zedclient/OnboardingStatus"
+DIRS="$CONFIGDIR $CONFIGDIR/DevicePortConfig $PERSIST_CERTS $PERSIST_AGENT_DEBUG /persist/status/zedclient/OnboardingStatus"
+
+# If /persist didn't exist or was removed treat this as a first boot
+if [ ! -d $PERSIST_CERTS ]; then
+    touch $FIRSTBOOTFILE # For nodeagent
+fi
 
 for d in $DIRS; do
     d1=$(dirname "$d")
@@ -138,15 +144,8 @@ if [ -c $TPM_DEVICE_PATH ] && ! [ -f $CONFIGDIR/disable-tpm ]; then
     fi
 fi
 
-if [ -f $PERSISTDIR/IMGA/reboot-reason ]; then
-    echo "IMGA reboot-reason: $(cat $PERSISTDIR/IMGA/reboot-reason)"
-fi
-if [ -f $PERSISTDIR/IMGB/reboot-reason ]; then
-    echo "IMGB reboot-reason: $(cat $PERSISTDIR/IMGB/reboot-reason)"
-fi
-
 if [ -f $PERSISTDIR/reboot-reason ]; then
-    echo "Common reboot-reason: $(cat $PERSISTDIR/reboot-reason)"
+    echo "Reboot-reason: $(cat $PERSISTDIR/reboot-reason)"
 fi
 
 # Copy any GlobalConfig from /config
@@ -172,11 +171,18 @@ echo "$(date -Ins -u) device-steps: Starting upgradeconverter (pre-vault)"
 $BINDIR/upgradeconverter pre-vault
 echo "$(date -Ins -u) device-steps: upgradeconverter (pre-vault) Completed"
 
+# Start zedagent to make sure we have a ConfigItemValueMap publisher
+echo "$(date -Ins -u) Starting zedagent"
+$BINDIR/zedagent &
+wait_for_touch zedagent
+
+touch "$WATCHDOG_FILE/zedagent.touch"
+
 # BlinkCounter 1 means we have started; might not yet have IP addresses
 # client/selfRegister and zedagent update this when the found at least
 # one free uplink with IP address(s)
-mkdir -p /var/tmp/zededa/LedBlinkCounter/
-echo '{"BlinkCounter": 1}' > '/var/tmp/zededa/LedBlinkCounter/ledconfig.json'
+mkdir -p "$ZTMPDIR/LedBlinkCounter"
+echo '{"BlinkCounter": 1}' > "$ZTMPDIR/LedBlinkCounter/ledconfig.json"
 
 # If ledmanager is already running we don't have to start it.
 # TBD: Should we start it earlier before wwan and wlan services?
@@ -251,7 +257,10 @@ access_usb() {
         if [ -d /mnt/dump ]; then
             echo "$(date -Ins -u) Dumping diagnostics to USB stick"
             # Check if it fits without clobbering an existing tar file
-            if tar cf /mnt/dump/diag1.tar /persist/status/ /persist/config /var/run/ /persist/log "/persist/rsyslog"; then
+            if ! $BINDIR/tpmmgr saveTpmInfo $TPMINFOTEMPFILE; then
+                echo "$(date -Ins -u) saveTpmInfo failed" > $TPMINFOTEMPFILE
+            fi
+            if tar cf /mnt/dump/diag1.tar /persist/status/ /var/run/ /persist/log "/persist/rsyslog" $TPMINFOTEMPFILE; then
                 mv /mnt/dump/diag1.tar /mnt/dump/diag.tar
             else
                 rm -f /mnt/dump/diag1.tar
@@ -293,7 +302,12 @@ wait_for_touch nim
 touch "$WATCHDOG_FILE/nim.touch"
 
 # Print diag output forever on changes
-$BINDIR/diag -f -o /dev/console &
+# NOTE: it is safe to do either kill -STOP or an outright
+# kill -9 on the following cat process if you want to stop
+# receiving those messages on the console.
+mkfifo /run/diag.pipe
+(while true; do cat; done) < /run/diag.pipe >/dev/console 2>&1 &
+$BINDIR/diag -f -o /run/diag.pipe runAsService &
 
 # Wait for having IP addresses for a few minutes
 # so that we are likely to have an address when we run ntp
@@ -473,9 +487,6 @@ touch "$WATCHDOG_FILE/tpmmgr.touch"
 # Now run watchdog for all agents
 for AGENT in $AGENTS; do
     touch "$WATCHDOG_FILE/$AGENT.touch"
-    if [ "$AGENT" = "zedagent" ]; then
-       touch "$WATCHDOG_FILE/${AGENT}config.touch" "$WATCHDOG_FILE/${AGENT}metrics.touch" "$WATCHDOG_FILE/${AGENT}devinfo.touch" "$WATCHDOG_FILE/${AGENT}attest.touch" "$WATCHDOG_FILE/${AGENT}ccerts.touch"
-    fi
 done
 
 blockdev --flushbufs "$CONFIGDEV"

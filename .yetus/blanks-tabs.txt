@@ -1,0 +1,5 @@
+.*Makefile.*
+.*\.go
+.*\.dts
+.*\.md
+^.codespellignorelines

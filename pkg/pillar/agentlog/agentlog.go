@@ -4,8 +4,8 @@
 package agentlog
 
 import (
+	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/signal"
 	"runtime"
@@ -18,14 +18,14 @@ import (
 
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/zboot"
 	"github.com/sirupsen/logrus"
 )
 
 const (
-	reasonFile  = "reboot-reason"
-	stackFile   = "reboot-stack"
-	rebootImage = "reboot-image"
+	reasonFile     = "reboot-reason"
+	stackFile      = "reboot-stack"
+	rebootImage    = "reboot-image"
+	bootReasonFile = "boot-reason"
 )
 
 var savedRebootReason = "unknown"
@@ -56,7 +56,8 @@ func (hook *FatalHook) Fire(entry *logrus.Entry) error {
 	reason := fmt.Sprintf("fatal: agent %s[%d]: %s", hook.agentName,
 		hook.agentPid, entry.Message)
 	savedRebootReason = reason
-	RebootReason(reason, hook.agentName, hook.agentPid, false)
+	RebootReason(reason, types.BootReasonFatal, hook.agentName,
+		hook.agentPid, false)
 	return nil
 }
 
@@ -152,7 +153,7 @@ func handleSignals(log *base.LogObject, agentName string, agentPid int, sigs cha
 	for {
 		select {
 		case sig := <-sigs:
-			log.Infof("handleSignals: received %v\n", sig)
+			log.Functionf("handleSignals: received %v\n", sig)
 			switch sig {
 			case syscall.SIGUSR1:
 				stacks := getStacks(true)
@@ -163,7 +164,7 @@ func handleSignals(log *base.LogObject, agentName string, agentPid int, sigs cha
 				if err == nil {
 					for _, stack := range stackArray {
 						// This goes to /persist/agentdebug/<agentname>/sigusr1 file
-						sigUsr1File.WriteString(stack)
+						sigUsr1File.WriteString(stack + "\n\n")
 					}
 					sigUsr1File.Close()
 				} else {
@@ -175,9 +176,6 @@ func handleSignals(log *base.LogObject, agentName string, agentPid int, sigs cha
 					log.Warnf("%v", stack)
 				}
 				log.Warnf("SIGUSR1: end of stacks")
-				// Could result in a watchdog reboot hence
-				// we save it as a reboot-stack
-				RebootStack(log, stacks, agentName, agentPid)
 			case syscall.SIGUSR2:
 				log.Warnf("SIGUSR2 triggered memory info:\n")
 				sigUsr2File, err := os.OpenFile(sigUsr2FileName,
@@ -203,20 +201,24 @@ func handleSignals(log *base.LogObject, agentName string, agentPid int, sigs cha
 func printStack(log *base.LogObject, agentName string, agentPid int) {
 	stacks := getStacks(false)
 	stackArray := strings.Split(stacks, "\n\n")
-	log.Errorf("Fatal stack trace due to %s with %d stack traces", savedRebootReason, len(stackArray))
+	log.Errorf("Fatal stack trace due to %s with %d stack traces",
+		savedRebootReason, len(stackArray))
 	for _, stack := range stackArray {
 		log.Errorf("%v", stack)
 	}
 	log.Errorf("Fatal: end of stacks")
-	RebootReason(fmt.Sprintf("fatal: agent %s[%d] exit", agentName, agentPid),
-		agentName, agentPid, false)
 	RebootStack(log, stacks, agentName, agentPid)
 }
 
 // RebootReason writes a reason string in /persist/reboot-reason, including agentName and date
 // It also appends to /persist/log/reboot-reason.log
+// If the bootReasonFile is not present it will write the bootReason enum
+// there as a string. That ensures that if we have a e.g., a log.Fatal followed
+// by watchdog we retain the fatal.
 // NOTE: can not use log here since we are called from a log hook!
-func RebootReason(reason string, agentName string, agentPid int, normal bool) {
+func RebootReason(reason string, bootReason types.BootReason, agentName string,
+	agentPid int, normal bool) {
+
 	filename := fmt.Sprintf("%s/%s", types.PersistDir, reasonFile)
 	dateStr := time.Now().Format(time.RFC3339Nano)
 	if !normal {
@@ -226,11 +228,25 @@ func RebootReason(reason string, agentName string, agentPid int, normal bool) {
 		reason = fmt.Sprintf("%s EVE version %s at %s\n",
 			reason, EveVersion(), dateStr)
 	}
-	err := printToFile(filename, reason)
+	// If we already wrote a bootReason file we append to
+	// the rebootReason file otherwise we truncate and write.
+	_, err := os.Stat("/persist/" + bootReasonFile)
 	if err != nil {
-		// Note: can not use log here since we are called from a log hook!
-		fmt.Printf("printToFile failed %s\n", err)
+		// Already failed; append subsequent info to rebootReason
+		err = printToFile(filename, reason)
+		if err != nil {
+			// Note: can not use log here since we are called from a log hook!
+			fmt.Printf("printToFile failed %s\n", err)
+		}
+	} else {
+		// First call hence a new failure
+		err = overWriteFile(filename, reason)
+		if err != nil {
+			// Note: can not use log here since we are called from a log hook!
+			fmt.Printf("overWriteFile failed %s\n", err)
+		}
 	}
+	// Append to the log file
 	filename = "/persist/log/" + reasonFile + ".log"
 	err = printToFile(filename, reason)
 	if err != nil {
@@ -246,28 +262,46 @@ func RebootReason(reason string, agentName string, agentPid int, normal bool) {
 		err = overWriteFile(agentFatalReasonFilename, reason)
 		if err != nil {
 			// Note: can not use log here since we are called from a log hook!
-			fmt.Printf("printToFile failed %s\n", err)
+			fmt.Printf("overWriteFile failed %s\n", err)
 		}
 	}
 
 	filename = "/persist/" + rebootImage
 	curPart := EveCurrentPartition()
-	err = printToFile(filename, curPart)
+	err = overWriteFile(filename, curPart)
 	if err != nil {
 		// Note: can not use log here since we are called from a log hook!
-		fmt.Printf("printToFile failed %s\n", err)
+		fmt.Printf("overWriteFile failed %s\n", err)
 	}
 	syscall.Sync()
+
+	if bootReason != types.BootReasonNone {
+		filename = "/persist/" + bootReasonFile
+		brString := bootReason.String()
+		cur, _ := statAndRead(nil, filename)
+		if cur != "" {
+			// Note: can not use log here since we are called from a log hook!
+			fmt.Printf("not replacing BootReason %s with %s\n",
+				cur, brString)
+		} else {
+			err = overWriteFile(filename, brString)
+			if err != nil {
+				// Note: can not use log here since we are called from a log hook!
+				fmt.Printf("overwriteFile failed %s\n", err)
+			}
+		}
+	}
 }
 
 // RebootStack writes stack in /persist/reboot-stack
 // and appends to /persist/log/reboot-stack.log
+// XXX remove latter? Can grow unbounded.
 func RebootStack(log *base.LogObject, stacks string, agentName string, agentPid int) {
 	filename := fmt.Sprintf("%s/%s", types.PersistDir, stackFile)
 	log.Warnf("RebootStack to %s", filename)
-	err := printToFile(filename, fmt.Sprintf("%v\n", stacks))
+	err := overWriteFile(filename, fmt.Sprintf("%v\n", stacks))
 	if err != nil {
-		log.Errorf("printToFile failed %s\n", err)
+		log.Errorf("overWriteFile failed %s\n", err)
 	}
 	filename = "/persist/log/" + stackFile + ".log"
 	err = printToFile(filename, fmt.Sprintf("%v\n", stacks))
@@ -278,30 +312,27 @@ func RebootStack(log *base.LogObject, stacks string, agentName string, agentPid 
 	agentStackTraceFile := agentDebugDir + "/fatal-stack"
 	err = overWriteFile(agentStackTraceFile, fmt.Sprintf("%v\n", stacks))
 	if err != nil {
-		log.Errorf("printToFile failed %s\n", err)
+		log.Errorf("overWriteFile failed %s\n", err)
 	}
 	syscall.Sync()
 }
 
-func GetOtherRebootReason(log *base.LogObject) (string, time.Time, string) {
-	dirname := getOtherIMGdir(false)
-	if dirname == "" {
-		return "", time.Time{}, ""
-	}
-	reasonFilename := fmt.Sprintf("%s/%s", dirname, reasonFile)
-	stackFilename := fmt.Sprintf("%s/%s", dirname, stackFile)
-	reason, ts := statAndRead(log, reasonFilename)
-	stack, _ := statAndRead(log, stackFilename)
-	return reason, ts, stack
-}
-
-// Used for failures/hangs when zboot curpart hangs
-func GetCommonRebootReason(log *base.LogObject) (string, time.Time, string) {
+// GetRebootReason returns the RebootReason string together with
+// its timestamp plus the reboot stack
+// We limit the size we read to 16k for both of those.
+func GetRebootReason(log *base.LogObject) (string, time.Time, string) {
 	reasonFilename := fmt.Sprintf("%s/%s", types.PersistDir, reasonFile)
 	stackFilename := fmt.Sprintf("%s/%s", types.PersistDir, stackFile)
 	reason, ts := statAndRead(log, reasonFilename)
 	stack, _ := statAndRead(log, stackFilename)
 	return reason, ts, stack
+}
+
+// GetBootReason returns the BootReason enum, which is stored as a string in /persist, together with its timestamp
+func GetBootReason(log *base.LogObject) (types.BootReason, time.Time) {
+	reasonFilename := fmt.Sprintf("%s/%s", types.PersistDir, bootReasonFile)
+	reason, ts := statAndRead(log, reasonFilename)
+	return types.BootReasonFromString(reason), ts
 }
 
 // GetRebootImage : Image from which the reboot happened
@@ -311,19 +342,34 @@ func GetRebootImage(log *base.LogObject) string {
 	return image
 }
 
+const maxReadSize = 16384
+
 // Returns content and Modtime
+// We limit the size we read to 16k
 func statAndRead(log *base.LogObject, filename string) (string, time.Time) {
 	fi, err := os.Stat(filename)
 	if err != nil {
 		// File doesn't exist
 		return "", time.Time{}
 	}
-	content, err := ioutil.ReadFile(filename)
+	f, err := os.Open(filename)
 	if err != nil {
-		log.Errorf("statAndRead failed %s", err)
+		if log != nil {
+			log.Errorf("statAndRead failed %s", err)
+		}
 		return "", fi.ModTime()
 	}
-	return string(content), fi.ModTime()
+	defer f.Close()
+	r := bufio.NewReader(f)
+	content := make([]byte, maxReadSize)
+	n, err := r.Read(content)
+	if err != nil {
+		if log != nil {
+			log.Errorf("statAndRead failed %s", err)
+		}
+		return "", fi.ModTime()
+	}
+	return string(content[0:n]), fi.ModTime()
 }
 
 // Append if file exists.
@@ -355,37 +401,27 @@ func overWriteFile(filename string, str string) error {
 	return nil
 }
 
-// DiscardOtherRebootReason removes any reason from the other dir
-func DiscardOtherRebootReason(log *base.LogObject) {
-	dirname := getOtherIMGdir(false)
-	if dirname == "" {
-		return
-	}
-	reasonFilename := fmt.Sprintf("%s/%s", dirname, reasonFile)
-	stackFilename := fmt.Sprintf("%s/%s", dirname, stackFile)
+// DiscardRebootReason removes any reason and stack from /persist/
+func DiscardRebootReason(log *base.LogObject) {
+	reasonFilename := fmt.Sprintf("%s/%s", types.PersistDir, reasonFile)
+	stackFilename := fmt.Sprintf("%s/%s", types.PersistDir, stackFile)
 	if err := os.Remove(reasonFilename); err != nil {
-		log.Errorf("DiscardOtherRebootReason failed %s\n", err)
+		log.Errorf("DiscardRebootReason failed %s\n", err)
 	}
 	_, err := os.Stat(stackFilename)
 	if err == nil {
 		if err := os.Remove(stackFilename); err != nil {
-			log.Errorf("DiscardOtherRebootReason failed %s\n", err)
+			log.Errorf("DiscardRebootReason failed %s\n", err)
 		}
 	}
 }
 
-// DiscardCommonRebootReason removes any reason and stack from /persist/
-func DiscardCommonRebootReason(log *base.LogObject) {
-	reasonFilename := fmt.Sprintf("%s/%s", types.PersistDir, reasonFile)
-	stackFilename := fmt.Sprintf("%s/%s", types.PersistDir, stackFile)
+// DiscardBootReason removes the BootReason file
+func DiscardBootReason(log *base.LogObject) {
+	reasonFilename := fmt.Sprintf("%s/%s", types.PersistDir, bootReasonFile)
 	if err := os.Remove(reasonFilename); err != nil {
-		log.Errorf("DiscardCommonRebootReason failed %s\n", err)
-	}
-	_, err := os.Stat(stackFilename)
-	if err == nil {
-		if err := os.Remove(stackFilename); err != nil {
-			log.Errorf("DiscardCommonRebootReason failed %s\n", err)
-		}
+		// Might not have existed
+		log.Warnf("DiscardBootReason failed %s\n", err)
 	}
 }
 
@@ -441,7 +477,7 @@ func logGCStats(log *base.LogObject) {
 	var m dbg.GCStats
 
 	dbg.ReadGCStats(&m)
-	log.Infof("GCStats %+v\n", m)
+	log.Functionf("GCStats %+v\n", m)
 }
 
 // Print in sorted order based on top bytes
@@ -475,7 +511,7 @@ func logMemUsage(log *base.LogObject, file *os.File) {
 	var m runtime.MemStats
 
 	runtime.ReadMemStats(&m)
-	log.Infof("Alloc %d Mb, TotalAlloc %d Mb, Sys %d Mb, NumGC %d",
+	log.Functionf("Alloc %d Mb, TotalAlloc %d Mb, Sys %d Mb, NumGC %d",
 		roundToMb(m.Alloc), roundToMb(m.TotalAlloc), roundToMb(m.Sys), m.NumGC)
 
 	if file != nil {
@@ -585,7 +621,7 @@ func initImpl(agentName string, redirect bool) (*logrus.Logger, *base.LogObject)
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGUSR1)
 		signal.Notify(sigs, syscall.SIGUSR2)
-		log.Infof("Creating %s at %s", "handleSignals", GetMyStack())
+		log.Functionf("Creating %s at %s", "handleSignals", GetMyStack())
 		go handleSignals(log, agentName, agentPid, sigs)
 		eh := func() { printStack(log, agentName, agentPid) }
 		logrus.RegisterExitHandler(eh)
@@ -593,16 +629,13 @@ func initImpl(agentName string, redirect bool) (*logrus.Logger, *base.LogObject)
 	return logger, log
 }
 
-var otherIMGdir = ""
-
-func getOtherIMGdir(inprogressCheck bool) string {
-	if otherIMGdir != "" {
-		return otherIMGdir
+// CustomLogInit - allow pillar services and containers to use customized logging
+func CustomLogInit(level logrus.Level) *logrus.Logger {
+	logger := logrus.New()
+	formatter := logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
 	}
-	if inprogressCheck && !zboot.IsOtherPartitionStateInProgress() {
-		return ""
-	}
-	partName := zboot.GetOtherPartition()
-	otherIMGdir = fmt.Sprintf("%s/%s", types.PersistDir, partName)
-	return otherIMGdir
+	logger.SetFormatter(&formatter)
+	logger.SetLevel(level)
+	return logger
 }

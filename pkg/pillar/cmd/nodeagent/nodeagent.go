@@ -23,8 +23,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	info "github.com/lf-edge/eve/api/go/info"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
@@ -41,7 +43,7 @@ const (
 	maxRebootStackSize          = 1600
 	maxJSONAttributeSize        = maxRebootStackSize + 100
 	configDir                   = "/config"
-	tmpDirname                  = "/var/tmp/zededa"
+	tmpDirname                  = "/run/global"
 	firstbootFile               = tmpDirname + "/first-boot"
 	restartCounterFile          = configDir + "/restartcounter"
 	// Time limits for event loop handlers
@@ -65,6 +67,7 @@ type nodeagentContext struct {
 	subZbootStatus              pubsub.Subscription
 	subZedAgentStatus           pubsub.Subscription
 	subDomainStatus             pubsub.Subscription
+	subVaultStatus              pubsub.Subscription
 	pubZbootConfig              pubsub.Publication
 	pubNodeAgentStatus          pubsub.Publication
 	curPart                     string
@@ -82,12 +85,16 @@ type nodeagentContext struct {
 	timeTickCount               uint32 // Don't get confused by NTP making time jump by tracking our own progression
 	rebootCmd                   bool   // Are we rebooting?
 	deviceReboot                bool
-	currentRebootReason         string    // Reason we are rebooting
-	rebootReason                string    // From last reboot
-	rebootImage                 string    // Image from which the last reboot happened
-	rebootStack                 string    // From last reboot
-	rebootTime                  time.Time // From last reboot
+	currentRebootReason         string // Reason we are rebooting
+	currentBootReason           types.BootReason
+	lastLock                    sync.Mutex       // Ensure publish gets consistent data
+	rebootReason                string           // From last reboot
+	bootReason                  types.BootReason // From last reboot
+	rebootImage                 string           // Image from which the last reboot happened
+	rebootStack                 string           // From last reboot
+	rebootTime                  time.Time        // From last reboot
 	restartCounter              uint32
+	vaultOperational            bool
 
 	// Some contants.. Declared here as variables to enable unit tests
 	minRebootDelay          uint32
@@ -98,7 +105,7 @@ type nodeagentContext struct {
 var debug = false
 var debugOverride bool // From command line arg
 
-func newNodeagentContext(ps *pubsub.PubSub, logger *logrus.Logger, log *base.LogObject) nodeagentContext {
+func newNodeagentContext(ps *pubsub.PubSub, logger *logrus.Logger, log *base.LogObject) *nodeagentContext {
 	nodeagentCtx := nodeagentContext{}
 	nodeagentCtx.minRebootDelay = minRebootDelay
 	nodeagentCtx.maxDomainHaltTime = maxDomainHaltTime
@@ -125,7 +132,7 @@ func newNodeagentContext(ps *pubsub.PubSub, logger *logrus.Logger, log *base.Log
 	curpart := agentlog.EveCurrentPartition()
 	nodeagentCtx.curPart = strings.TrimSpace(curpart)
 	nodeagentCtx.agentBaseContext.NeedWatchdog = true
-	return nodeagentCtx
+	return &nodeagentCtx
 }
 
 func (ctxPtr *nodeagentContext) AgentBaseContext() *agentbase.Context {
@@ -146,15 +153,63 @@ var log *base.LogObject
 // Run : nodeagent run entry function
 func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
 	log = logArg
-	nodeagentCtx := newNodeagentContext(ps, loggerArg, logArg)
+	ctxPtr := newNodeagentContext(ps, loggerArg, logArg)
 
-	agentbase.Run(&nodeagentCtx)
+	agentbase.Run(ctxPtr)
 
-	// Make sure we have a GlobalConfig file with defaults
-	utils.EnsureGCFile(log)
+	// Look for global config such as log levels
+	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		MyAgentName:   agentName,
+		TopicImpl:     types.ConfigItemValueMap{},
+		Persistent:    true,
+		Activate:      false,
+		Ctx:           ctxPtr,
+		CreateHandler: handleGlobalConfigCreate,
+		ModifyHandler: handleGlobalConfigModify,
+		DeleteHandler: handleGlobalConfigDelete,
+		SyncHandler:   handleGlobalConfigSynchronized,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctxPtr.subGlobalConfig = subGlobalConfig
+	subGlobalConfig.Activate()
+
+	// Pick up debug aka log level before we start real work
+	for !ctxPtr.GCInitialized {
+		log.Functionf("Waiting for GCInitialized")
+		select {
+		case change := <-subGlobalConfig.MsgChan():
+			subGlobalConfig.ProcessChange(change)
+
+		case <-ctxPtr.tickerTimer.C:
+			handleDeviceTimers(ctxPtr)
+
+		case <-ctxPtr.stillRunning.C:
+		}
+		ps.StillRunning(agentName, warningTime, errorTime)
+	}
+	log.Functionf("processed GlobalConfig")
 
 	// get the last reboot reason
-	handleLastRebootReason(&nodeagentCtx)
+	handleLastRebootReason(ctxPtr)
+
+	// Fault injection; if /persist/fault-injection/readfile exists we read it
+	// which will use memory
+	fileToRead := "/persist/fault-injection/readfile"
+	if _, err := os.Stat(fileToRead); err == nil {
+		log.Warnf("Reading %s", fileToRead)
+		content, err := ioutil.ReadFile(fileToRead)
+		if err != nil {
+			log.Error(err)
+		} else {
+			log.Noticef("Read %d bytes from %s",
+				len(content), fileToRead)
+		}
+	}
 
 	// publisher of NodeAgent Status
 	pubNodeAgentStatus, err := ps.NewPublication(
@@ -166,7 +221,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		log.Fatal(err)
 	}
 	pubNodeAgentStatus.ClearRestarted()
-	nodeagentCtx.pubNodeAgentStatus = pubNodeAgentStatus
+	ctxPtr.pubNodeAgentStatus = pubNodeAgentStatus
 
 	// publisher of Zboot Config
 	pubZbootConfig, err := ps.NewPublication(
@@ -178,35 +233,34 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		log.Fatal(err)
 	}
 	pubZbootConfig.ClearRestarted()
-	nodeagentCtx.pubZbootConfig = pubZbootConfig
+	ctxPtr.pubZbootConfig = pubZbootConfig
 
-	// Look for global config such as log levels
-	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:     "",
+	// Look for vault status
+	subVaultStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "vaultmgr",
 		MyAgentName:   agentName,
-		TopicImpl:     types.ConfigItemValueMap{},
+		TopicImpl:     types.VaultStatus{},
 		Activate:      false,
-		Ctx:           &nodeagentCtx,
-		ModifyHandler: handleGlobalConfigModify,
-		DeleteHandler: handleGlobalConfigDelete,
-		SyncHandler:   handleGlobalConfigSynchronized,
+		Ctx:           ctxPtr,
+		CreateHandler: handleVaultStatusCreate,
+		ModifyHandler: handleVaultStatusModify,
 		WarningTime:   warningTime,
 		ErrorTime:     errorTime,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	nodeagentCtx.subGlobalConfig = subGlobalConfig
-	subGlobalConfig.Activate()
+	ctxPtr.subVaultStatus = subVaultStatus
+	subVaultStatus.Activate()
 
 	// publish zboot config as of now
-	publishZbootConfigAll(&nodeagentCtx)
+	publishZbootConfigAll(ctxPtr)
 
 	// access the zboot APIs directly, baseosmgr is still not ready
-	nodeagentCtx.updateInprogress = zboot.IsCurrentPartitionStateInProgress()
-	log.Infof("Current partition: %s, inProgress: %v", nodeagentCtx.curPart,
-		nodeagentCtx.updateInprogress)
-	publishNodeAgentStatus(&nodeagentCtx)
+	ctxPtr.updateInprogress = zboot.IsCurrentPartitionStateInProgress()
+	log.Functionf("Current partition: %s, inProgress: %v", ctxPtr.curPart,
+		ctxPtr.updateInprogress)
+	publishNodeAgentStatus(ctxPtr)
 
 	// Get DomainStatus from domainmgr
 	subDomainStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -214,35 +268,19 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		MyAgentName: agentName,
 		TopicImpl:   types.DomainStatus{},
 		Activate:    false,
-		Ctx:         &nodeagentCtx,
+		Ctx:         ctxPtr,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	nodeagentCtx.subDomainStatus = subDomainStatus
+	ctxPtr.subDomainStatus = subDomainStatus
 	subDomainStatus.Activate()
-
-	// Pick up debug aka log level before we start real work
-	for !nodeagentCtx.GCInitialized {
-		log.Infof("Waiting for GCInitialized")
-		select {
-		case change := <-subGlobalConfig.MsgChan():
-			subGlobalConfig.ProcessChange(change)
-
-		case <-nodeagentCtx.tickerTimer.C:
-			handleDeviceTimers(&nodeagentCtx)
-
-		case <-nodeagentCtx.stillRunning.C:
-		}
-		ps.StillRunning(agentName, warningTime, errorTime)
-	}
-	log.Infof("processed GlobalConfig")
 
 	// Wait until we have been onboarded aka know our own UUID
 	if err := utils.WaitForOnboarded(ps, log, agentName, warningTime, errorTime); err != nil {
 		log.Fatal(err)
 	}
-	log.Infof("Device is onboarded")
+	log.Functionf("Device is onboarded")
 
 	// if current partition state is not in-progress,
 	// nothing much to do. Zedcloud connectivity is tracked,
@@ -259,8 +297,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	// cloud connectionnectivity status.
 
 	// Start waiting for controller connectivity
-	nodeagentCtx.lastControllerReachableTime = nodeagentCtx.timeTickCount
-	setTestStartTime(&nodeagentCtx)
+	ctxPtr.lastControllerReachableTime = ctxPtr.timeTickCount
+	setTestStartTime(ctxPtr)
 
 	// subscribe to zboot status events
 	subZbootStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -268,7 +306,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		MyAgentName:   agentName,
 		TopicImpl:     types.ZbootStatus{},
 		Activate:      false,
-		Ctx:           &nodeagentCtx,
+		Ctx:           ctxPtr,
+		CreateHandler: handleZbootStatusCreate,
 		ModifyHandler: handleZbootStatusModify,
 		DeleteHandler: handleZbootStatusDelete,
 		WarningTime:   warningTime,
@@ -277,7 +316,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	if err != nil {
 		log.Fatal(err)
 	}
-	nodeagentCtx.subZbootStatus = subZbootStatus
+	ctxPtr.subZbootStatus = subZbootStatus
 	subZbootStatus.Activate()
 
 	// subscribe to zedagent status events
@@ -286,7 +325,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		MyAgentName:   agentName,
 		TopicImpl:     types.ZedAgentStatus{},
 		Activate:      false,
-		Ctx:           &nodeagentCtx,
+		Ctx:           ctxPtr,
+		CreateHandler: handleZedAgentStatusCreate,
 		ModifyHandler: handleZedAgentStatusModify,
 		DeleteHandler: handleZedAgentStatusDelete,
 		WarningTime:   warningTime,
@@ -295,10 +335,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	if err != nil {
 		log.Fatal(err)
 	}
-	nodeagentCtx.subZedAgentStatus = subZedAgentStatus
+	ctxPtr.subZedAgentStatus = subZedAgentStatus
 	subZedAgentStatus.Activate()
 
-	log.Infof("zedbox event loop")
+	log.Functionf("zedbox event loop")
 	for {
 		select {
 		case change := <-subGlobalConfig.MsgChan():
@@ -313,10 +353,13 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		case change := <-subZedAgentStatus.MsgChan():
 			subZedAgentStatus.ProcessChange(change)
 
-		case <-nodeagentCtx.tickerTimer.C:
-			handleDeviceTimers(&nodeagentCtx)
+		case <-ctxPtr.tickerTimer.C:
+			handleDeviceTimers(ctxPtr)
 
-		case <-nodeagentCtx.stillRunning.C:
+		case change := <-subVaultStatus.MsgChan():
+			subVaultStatus.ProcessChange(change)
+
+		case <-ctxPtr.stillRunning.C:
 		}
 		ps.StillRunning(agentName, warningTime, errorTime)
 	}
@@ -326,21 +369,31 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 func handleGlobalConfigSynchronized(ctxArg interface{}, done bool) {
 	ctxPtr := ctxArg.(*nodeagentContext)
 
-	log.Infof("handleGlobalConfigSynchronized(%v)", done)
+	log.Functionf("handleGlobalConfigSynchronized(%v)", done)
 	if done {
 		ctxPtr.GCInitialized = true
 	}
 }
 
-func handleGlobalConfigModify(ctxArg interface{},
-	key string, statusArg interface{}) {
+func handleGlobalConfigCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleGlobalConfigImpl(ctxArg, key, statusArg)
+}
+
+func handleGlobalConfigModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleGlobalConfigImpl(ctxArg, key, statusArg)
+}
+
+func handleGlobalConfigImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
 
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigModify: ignoring %s", key)
+		log.Functionf("handleGlobalConfigImpl: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigModify for %s", key)
+	log.Functionf("handleGlobalConfigImpl for %s", key)
 	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(log, ctxPtr.subGlobalConfig, agentName,
 		debugOverride, ctxPtr.agentBaseContext.Logger)
@@ -348,7 +401,7 @@ func handleGlobalConfigModify(ctxArg interface{},
 		ctxPtr.globalConfig = gcp
 		ctxPtr.GCInitialized = true
 	}
-	log.Infof("handleGlobalConfigModify(%s): done", key)
+	log.Functionf("handleGlobalConfigImpl(%s): done", key)
 }
 
 func handleGlobalConfigDelete(ctxArg interface{},
@@ -356,40 +409,62 @@ func handleGlobalConfigDelete(ctxArg interface{},
 
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigDelete: ignoring %s", key)
+		log.Functionf("handleGlobalConfigDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigDelete for %s", key)
+	log.Functionf("handleGlobalConfigDelete for %s", key)
 	debug, _ = agentlog.HandleGlobalConfig(log, ctxPtr.subGlobalConfig, agentName,
 		debugOverride, ctxPtr.agentBaseContext.Logger)
 	ctxPtr.globalConfig = types.DefaultConfigItemValueMap()
-	log.Infof("handleGlobalConfigDelete done for %s", key)
+	log.Functionf("handleGlobalConfigDelete done for %s", key)
 }
 
 // handle zedagent status events, for cloud connectivity
-func handleZedAgentStatusModify(ctxArg interface{},
-	key string, statusArg interface{}) {
+func handleZedAgentStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleZedAgentStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleZedAgentStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleZedAgentStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleZedAgentStatusImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
 	ctxPtr := ctxArg.(*nodeagentContext)
 	status := statusArg.(types.ZedAgentStatus)
 	handleRebootCmd(ctxPtr, status)
 	updateZedagentCloudConnectStatus(ctxPtr, status)
-	log.Infof("handleZedAgentStatusModify(%s) done", key)
+	log.Functionf("handleZedAgentStatusImpl(%s) done", key)
 }
 
 func handleZedAgentStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	// do nothing
-	log.Infof("handleZedAgentStatusDelete(%s) done", key)
+	log.Functionf("handleZedAgentStatusDelete(%s) done", key)
 }
 
 // zboot status event handlers
-func handleZbootStatusModify(ctxArg interface{},
-	key string, statusArg interface{}) {
+func handleZbootStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleZbootStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleZbootStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleZbootStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleZbootStatusImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
 	ctxPtr := ctxArg.(*nodeagentContext)
 	status := statusArg.(types.ZbootStatus)
 	if status.CurrentPartition && ctxPtr.updateInprogress &&
 		status.PartitionState == "active" {
-		log.Infof("CurPart(%s) transitioned to \"active\" state",
+		log.Functionf("CurPart(%s) transitioned to \"active\" state",
 			status.PartitionLabel)
 		ctxPtr.updateInprogress = false
 		ctxPtr.testComplete = false
@@ -398,7 +473,7 @@ func handleZbootStatusModify(ctxArg interface{},
 	}
 	doZbootBaseOsInstallationComplete(ctxPtr, key, status)
 	doZbootBaseOsTestValidationComplete(ctxPtr, key, status)
-	log.Debugf("handleZbootStatusModify(%s) done", key)
+	log.Tracef("handleZbootStatusImpl(%s) done", key)
 }
 
 func handleZbootStatusDelete(ctxArg interface{},
@@ -406,10 +481,10 @@ func handleZbootStatusDelete(ctxArg interface{},
 
 	ctxPtr := ctxArg.(*nodeagentContext)
 	if status := lookupZbootStatus(ctxPtr, key); status == nil {
-		log.Infof("handleZbootStatusDelete: unknown %s", key)
+		log.Functionf("handleZbootStatusDelete: unknown %s", key)
 		return
 	}
-	log.Infof("handleZbootStatusDelete(%s) done", key)
+	log.Functionf("handleZbootStatusDelete(%s) done", key)
 }
 
 // If we have a reboot reason from this or the other partition
@@ -417,51 +492,43 @@ func handleZbootStatusDelete(ctxArg interface{},
 // we will push this as part of baseos status
 func handleLastRebootReason(ctx *nodeagentContext) {
 
-	// ctx.rebootStack is sent by timer hence don't set it
+	// Wait to update ctx until the end since the timer publishes these
+	// values and don't want partial or changing data.
 	// until after truncation.
-	var rebootStack = ""
-	ctx.rebootReason, ctx.rebootTime, rebootStack =
-		agentlog.GetCommonRebootReason(log)
-	if ctx.rebootReason != "" {
+	rebootReason, rebootTime, rebootStack := agentlog.GetRebootReason(log)
+	if rebootReason != "" {
 		log.Warnf("Current partition RebootReason: %s",
-			ctx.rebootReason)
-		agentlog.DiscardCommonRebootReason(log)
+			rebootReason)
+		agentlog.DiscardRebootReason(log)
 	}
-	// XXX We'll retain this block of code for some time to support having older
-	// versions of code in the other partition.
-	otherRebootReason, otherRebootTime, otherRebootStack := agentlog.GetOtherRebootReason(log)
-	if otherRebootReason != "" {
-		log.Warnf("Other partition RebootReason: %s",
-			otherRebootReason)
-		// if other partition state is "inprogress"
-		// do not erase the reboot reason, going to
-		// be used for baseos error status, across reboot
-		if !zboot.IsOtherPartitionStateInProgress() {
-			agentlog.DiscardOtherRebootReason(log)
-		}
-	}
-	// first, pick up from other partition
-	if ctx.rebootReason == "" {
-		ctx.rebootReason = otherRebootReason
-		ctx.rebootTime = otherRebootTime
-		rebootStack = otherRebootStack
+	// We override the above rebootTime since if bootReason is known this is when things
+	// started going down
+	bootReason, ts := agentlog.GetBootReason(log)
+	if bootReason != types.BootReasonNone {
+		rebootTime = ts
 	}
 
+	agentlog.DiscardBootReason(log)
 	// still nothing, fillup the default
-	if ctx.rebootReason == "" {
-		ctx.rebootTime = time.Now()
-		dateStr := ctx.rebootTime.Format(time.RFC3339Nano)
+	if rebootReason == "" {
+		rebootTime = time.Now()
+		dateStr := rebootTime.Format(time.RFC3339Nano)
 		var reason string
 		if fileExists(firstbootFile) {
 			reason = fmt.Sprintf("NORMAL: First boot of device - at %s",
 				dateStr)
+			if bootReason == types.BootReasonNone {
+				bootReason = types.BootReasonFirst
+			}
 		} else {
 			reason = fmt.Sprintf("Unknown reboot reason - power failure or crash - at %s",
 				dateStr)
+			if bootReason == types.BootReasonNone {
+				bootReason = types.BootReasonUnknown
+			}
 		}
 		log.Warnf("Default RebootReason: %s", reason)
-		ctx.rebootReason = reason
-		ctx.rebootTime = time.Now()
+		rebootReason = reason
 		rebootStack = ""
 	}
 	// remove the first boot file, if it is present
@@ -477,14 +544,20 @@ func handleLastRebootReason(ctx *nodeagentContext) {
 		}
 		rebootStack = fmt.Sprintf("Truncated stack: %v", string(runes))
 	}
-	ctx.rebootStack = rebootStack
 	rebootImage := agentlog.GetRebootImage(log)
 	if rebootImage != "" {
-		ctx.rebootImage = rebootImage
 		agentlog.DiscardRebootImage(log)
 	}
+	// Update context
+	ctx.lastLock.Lock()
+	ctx.bootReason = bootReason
+	ctx.rebootImage = rebootImage
+	ctx.rebootReason = rebootReason
+	ctx.rebootTime = rebootTime
+	ctx.rebootStack = rebootStack
 	// Read and increment restartCounter
 	ctx.restartCounter = incrementRestartCounter()
+	ctx.lastLock.Unlock()
 }
 
 // If the file doesn't exist we pick zero.
@@ -502,7 +575,7 @@ func incrementRestartCounter() uint32 {
 				log.Errorf("incrementRestartCounter: %s", err)
 			} else {
 				restartCounter = uint32(c)
-				log.Infof("incrementRestartCounter: read %d", restartCounter)
+				log.Functionf("incrementRestartCounter: read %d", restartCounter)
 			}
 		}
 	}
@@ -520,8 +593,11 @@ func fileExists(filename string) bool {
 }
 
 // publish nodeagent status
+// Can be called from a timer hence we use a mutex to avoid issues
+// with changing last* fields.
 func publishNodeAgentStatus(ctxPtr *nodeagentContext) {
 	pub := ctxPtr.pubNodeAgentStatus
+	ctxPtr.lastLock.Lock()
 	status := types.NodeAgentStatus{
 		Name:              agentName,
 		CurPart:           ctxPtr.curPart,
@@ -529,10 +605,33 @@ func publishNodeAgentStatus(ctxPtr *nodeagentContext) {
 		UpdateInprogress:  ctxPtr.updateInprogress,
 		DeviceReboot:      ctxPtr.deviceReboot,
 		RebootReason:      ctxPtr.rebootReason,
+		BootReason:        ctxPtr.bootReason,
 		RebootStack:       ctxPtr.rebootStack,
 		RebootTime:        ctxPtr.rebootTime,
 		RebootImage:       ctxPtr.rebootImage,
 		RestartCounter:    ctxPtr.restartCounter,
 	}
+	ctxPtr.lastLock.Unlock()
 	pub.Publish(agentName, status)
+}
+
+func handleVaultStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleVaultStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleVaultStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleVaultStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleVaultStatusImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	ctx := ctxArg.(*nodeagentContext)
+	vault := statusArg.(types.VaultStatus)
+	if vault.Name == types.DefaultVaultName && vault.ConversionComplete &&
+		vault.Status != info.DataSecAtRestStatus_DATASEC_AT_REST_ERROR {
+		ctx.vaultOperational = true
+	}
 }

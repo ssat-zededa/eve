@@ -103,6 +103,11 @@ func (status AppNetworkStatus) Pending() bool {
 	return status.PendingAdd || status.PendingModify || status.PendingDelete
 }
 
+// AwaitingNetwork - Is the app waiting for network?
+func (status AppNetworkStatus) AwaitingNetwork() bool {
+	return status.AwaitNetworkInstance
+}
+
 // Indexed by UUID
 type AppNetworkStatus struct {
 	UUIDandVersion UUIDandVersion
@@ -113,9 +118,9 @@ type AppNetworkStatus struct {
 	PendingDelete  bool
 	DisplayName    string
 	// Copy from the AppNetworkConfig; used to delete when config is gone.
-	GetStatsIPAddr      net.IP
-	UnderlayNetworkList []UnderlayNetworkStatus
-	MissingNetwork      bool // If any Missing flag is set in the networks
+	GetStatsIPAddr       net.IP
+	UnderlayNetworkList  []UnderlayNetworkStatus
+	AwaitNetworkInstance bool // If any Missing flag is set in the networks
 	// Any errros from provisioning the network
 	// ErrorAndTime provides SetErrorNow() and ClearError()
 	ErrorAndTime
@@ -307,6 +312,25 @@ type DevicePortConfigList struct {
 	Key            string // Assume "gobal" if empty
 	CurrentIndex   int
 	PortConfigList []DevicePortConfig
+}
+
+// MostlyEqual - Equal if everything else other than timestamps is equal.
+func (config DevicePortConfigList) MostlyEqual(config2 DevicePortConfigList) bool {
+
+	if len(config.PortConfigList) != len(config2.PortConfigList) {
+		return false
+	}
+	if config.CurrentIndex != config2.CurrentIndex {
+		return false
+	}
+	for i, c1 := range config.PortConfigList {
+		c2 := config2.PortConfigList[i]
+
+		if !c1.MostlyEqual(&c2) || c1.State != c2.State {
+			return false
+		}
+	}
+	return true
 }
 
 // PubKey is used for pubsub
@@ -584,6 +608,13 @@ func (trPtr *TestResults) Update(src TestResults) {
 	}
 }
 
+// Clear test results.
+func (trPtr *TestResults) Clear() {
+	trPtr.LastFailed = time.Time{}
+	trPtr.LastSucceeded = time.Time{}
+	trPtr.LastError = ""
+}
+
 type DevicePortConfigVersion uint32
 
 // GetPortByIfName - DevicePortConfig method to get config pointer
@@ -638,14 +669,14 @@ func (config *DevicePortConfig) DoSanitize(log *base.LogObject,
 			} else {
 				config.TimePriority = time.Unix(0, 0)
 			}
-			log.Infof("DoSanitize: Forcing TimePriority for %s to %v\n",
+			log.Functionf("DoSanitize: Forcing TimePriority for %s to %v\n",
 				key, config.TimePriority)
 		}
 	}
 	if sanitizeKey {
 		if config.Key == "" {
 			config.Key = key
-			log.Infof("DoSanitize: Forcing Key for %s TS %v\n",
+			log.Functionf("DoSanitize: Forcing Key for %s TS %v\n",
 				key, config.TimePriority)
 		}
 	}
@@ -656,12 +687,12 @@ func (config *DevicePortConfig) DoSanitize(log *base.LogObject,
 			port := &config.Ports[i]
 			if port.Phylabel == "" {
 				port.Phylabel = port.IfName
-				log.Infof("XXX DoSanitize: Forcing Phylabel for %s ifname %s\n",
+				log.Functionf("XXX DoSanitize: Forcing Phylabel for %s ifname %s\n",
 					key, port.IfName)
 			}
 			if port.Logicallabel == "" {
 				port.Logicallabel = port.IfName
-				log.Infof("XXX DoSanitize: Forcing Logicallabel for %s ifname %s\n",
+				log.Functionf("XXX DoSanitize: Forcing Logicallabel for %s ifname %s\n",
 					key, port.IfName)
 			}
 		}
@@ -905,6 +936,23 @@ type NetworkPortStatus struct {
 	TestResults
 }
 
+// HasIPAndDNS - Check if the given port has a valid unicast IP along with DNS & Gateway.
+func (port NetworkPortStatus) HasIPAndDNS() bool {
+	foundUnicast := false
+
+	for _, addr := range port.AddrInfoList {
+		if !addr.Addr.IsLinkLocalUnicast() {
+			foundUnicast = true
+		}
+	}
+
+	if foundUnicast && len(port.DefaultRouters) > 0 && len(port.DNSServers) > 0 {
+		return true
+	}
+
+	return false
+}
+
 type AddrInfo struct {
 	Addr             net.IP
 	Geo              ipinfo.IPInfo
@@ -1109,6 +1157,16 @@ func (status *DeviceNetworkStatus) GetPortByLogicallabel(
 		}
 	}
 	return nil
+}
+
+// HasErrors - DeviceNetworkStatus has errors on any of it's ports?
+func (status DeviceNetworkStatus) HasErrors() bool {
+	for _, port := range status.Ports {
+		if port.HasError() {
+			return true
+		}
+	}
+	return false
 }
 
 func rotate(arr []string, amount int) []string {
@@ -1576,10 +1634,10 @@ func LogicallabelToIfName(deviceNetworkStatus *DeviceNetworkStatus,
 func (config *DevicePortConfig) IsAnyPortInPciBack(
 	log *base.LogObject, aa *AssignableAdapters) (bool, string, uuid.UUID) {
 	if aa == nil {
-		log.Infof("IsAnyPortInPciBack: nil aa")
+		log.Functionf("IsAnyPortInPciBack: nil aa")
 		return false, "", uuid.UUID{}
 	}
-	log.Infof("IsAnyPortInPciBack: aa init %t, %d bundles, %d ports",
+	log.Functionf("IsAnyPortInPciBack: aa init %t, %d bundles, %d ports",
 		aa.Initialized, len(aa.IoBundleList), len(config.Ports))
 	for _, port := range config.Ports {
 		ioBundle := aa.LookupIoBundleIfName(port.IfName)
@@ -1587,7 +1645,7 @@ func (config *DevicePortConfig) IsAnyPortInPciBack(
 			// It is not guaranteed that all Ports are part of Assignable Adapters
 			// If not found, the adapter is not capable of being assigned at
 			// PCI level. So it cannot be in PCI back.
-			log.Infof("IsAnyPortInPciBack: ifname %s not found",
+			log.Functionf("IsAnyPortInPciBack: ifname %s not found",
 				port.IfName)
 			continue
 		}
@@ -1687,6 +1745,7 @@ type UnderlayNetworkConfig struct {
 
 type UnderlayNetworkStatus struct {
 	UnderlayNetworkConfig
+	ACLs int // drop ACLs field from UnderlayNetworkConfig
 	VifInfo
 	BridgeMac       net.HardwareAddr
 	BridgeIPAddr    string // The address for DNS/DHCP service in zedrouter
@@ -1694,7 +1753,12 @@ type UnderlayNetworkStatus struct {
 	Assigned        bool   // Set to true once DHCP has assigned it to domU
 	IPAddrMisMatch  bool
 	HostName        string
-	ACLRules        IPTablesRuleList
+}
+
+// ULNetworkACLs - Underlay Network ACLRules
+// moved out from UnderlayNetowrkStatus, and now ACLRules are kept in zedrouterContext 2D-map NLaclMap
+type ULNetworkACLs struct {
+	ACLRules IPTablesRuleList
 }
 
 type NetworkType uint8
@@ -1825,7 +1889,7 @@ func (instanceInfo *NetworkInstanceInfo) IsVifInBridge(
 
 func (instanceInfo *NetworkInstanceInfo) RemoveVif(log *base.LogObject,
 	vifName string) {
-	log.Infof("DelVif(%s, %s)\n", instanceInfo.BridgeName, vifName)
+	log.Functionf("DelVif(%s, %s)\n", instanceInfo.BridgeName, vifName)
 
 	var vifs []VifNameMac
 	for _, vif := range instanceInfo.Vifs {
@@ -1839,7 +1903,7 @@ func (instanceInfo *NetworkInstanceInfo) RemoveVif(log *base.LogObject,
 func (instanceInfo *NetworkInstanceInfo) AddVif(log *base.LogObject,
 	vifName string, appMac string, appID uuid.UUID) {
 
-	log.Infof("addVifToBridge(%s, %s, %s, %s)\n",
+	log.Functionf("addVifToBridge(%s, %s, %s, %s)\n",
 		instanceInfo.BridgeName, vifName, appMac, appID.String())
 	// XXX Should we just overwrite it? There is a lookup function
 	//	anyways if the caller wants "check and add" semantics
@@ -1946,7 +2010,8 @@ func (metrics NetworkInstanceMetrics) LogKey() string {
 // Network metrics for overlay and underlay
 // Matches networkMetrics protobuf message
 type NetworkMetrics struct {
-	MetricList []NetworkMetric
+	MetricList     []NetworkMetric
+	TotalRuleCount uint64
 }
 
 // Key is used for pubsub
@@ -2247,7 +2312,7 @@ func (status *NetworkInstanceStatus) UpdateNetworkMetrics(log *base.LogObject,
 	for _, vif := range status.Vifs {
 		metric, found := nms.LookupNetworkMetrics(vif.Name)
 		if !found {
-			log.Debugf("No metrics found for interface %s",
+			log.Tracef("No metrics found for interface %s",
 				vif.Name)
 			continue
 		}
@@ -2282,7 +2347,7 @@ func (status *NetworkInstanceStatus) UpdateBridgeMetrics(log *base.LogObject,
 	// Get bridge metrics
 	bridgeMetric, found := nms.LookupNetworkMetrics(status.BridgeName)
 	if !found {
-		log.Debugf("No metrics found for Bridge %s",
+		log.Tracef("No metrics found for Bridge %s",
 			status.BridgeName)
 	} else {
 		netMetric.TxErrors += bridgeMetric.TxErrors

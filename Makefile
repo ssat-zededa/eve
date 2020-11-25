@@ -3,7 +3,7 @@
 #
 # Run make (with no arguments) to see help on what targets are available
 
-GOVER ?= 1.12.4
+GOVER ?= 1.15.3
 PKGBASE=github.com/lf-edge/eve
 GOMODULE=$(PKGBASE)/pkg/pillar
 GOTREE=$(CURDIR)/pkg/pillar
@@ -36,6 +36,10 @@ SSH_KEY=$(CONF_DIR)/ssh.key
 ACCEL=
 # Location of the EVE configuration folder to be used in builds
 CONF_DIR=conf
+# Source of the cloud-init enabled qcow2 Linux VM for all architectures
+BUILD_VM_SRC_arm64=https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-arm64.img
+BUILD_VM_SRC_amd64=https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+BUILD_VM_SRC=$(BUILD_VM_SRC_$(ZARCH))
 
 UNAME_S := $(shell uname -s)
 
@@ -59,10 +63,6 @@ REPO_DIRTY_TAG=$(if $(findstring -dirty,$(REPO_SHA)),-$(shell date -u +"%Y-%m-%d
 EVE_TREE_TAG = $(shell git describe --abbrev=8 --always --dirty)
 
 ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)$(REPO_DIRTY_TAG),$(REPO_TAG))
-
-# just reports the version, without appending qualifies like HVM or such
-version:
-	@echo $(ROOTFS_VERSION)
 
 APIDIRS = $(shell find ./api/* -maxdepth 1 -type d -exec basename {} \;)
 
@@ -91,11 +91,15 @@ TARGET_IMG=$(DIST)/target.img
 INSTALLER=$(DIST)/installer
 INSTALLER_IMG=$(INSTALLER).$(INSTALLER_IMG_FORMAT)
 
+BUILD_VM=$(DIST)/build-vm.qcow2
+BUILD_VM_CLOUD_INIT=$(DIST)/build-vm-ci.qcow2
+
 ROOTFS=$(INSTALLER)/rootfs
 ROOTFS_FULL_NAME=$(INSTALLER)/rootfs-$(ROOTFS_VERSION)
 ROOTFS_IMG=$(ROOTFS).img
 CONFIG_IMG=$(INSTALLER)/config.img
 INITRD_IMG=$(INSTALLER)/initrd.img
+PERSIST_IMG=$(INSTALLER)/persist.img
 EFI_PART=$(INSTALLER)/EFI
 BOOT_PART=$(INSTALLER)/boot
 
@@ -104,9 +108,17 @@ DEVICETREE_DTB_arm64=$(DIST)/dtb/eve.dtb
 DEVICETREE_DTB=$(DEVICETREE_DTB_$(ZARCH))
 
 CONF_FILES=$(shell ls -d $(CONF_DIR)/*)
-PART_SPEC_=efi conf imga
-PART_SPEC_rpi=boot conf imga
-PART_SPEC=$(PART_SPEC_$(findstring rpi,$(HV)))
+PART_SPEC_amd64=efi conf imga
+PART_SPEC_arm64=boot conf imga
+PART_SPEC=$(PART_SPEC_$(ZARCH))
+
+# parallels settings
+# https://github.com/qemu/qemu/blob/595123df1d54ed8fbab9e1a73d5a58c5bb71058f/docs/interop/prl-xml.txt
+# predefined GUID according link ^
+PARALLELS_UUID={5fbaabe3-6958-40ff-92a7-860e329aab41}
+PARALLELS_VM_NAME=EVE_Live
+PARALLELS_CPUS=2 #num
+PARALLELS_MEMORY=2048 #in megabytes
 
 # public cloud settings (only CGP is supported for now)
 # note how GCP doesn't like dots so we replace them with -
@@ -120,9 +132,13 @@ QEMU_SYSTEM_arm64=qemu-system-aarch64
 QEMU_SYSTEM_amd64=qemu-system-x86_64
 QEMU_SYSTEM=$(QEMU_SYSTEM_$(ZARCH))
 
-QEMU_ACCEL_Y_Darwin=-machine q35,accel=hvf,usb=off -cpu kvm64,kvmclock=off
-QEMU_ACCEL_Y_Linux=-machine q35,accel=kvm,usb=off,dump-guest-core=off -cpu host,invtsc=on,kvmclock=off -machine kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on,aw-bits=48
-QEMU_ACCEL:=$(QEMU_ACCEL_$(ACCEL:%=Y)_$(shell uname -s))
+QEMU_ACCEL_Y_Darwin_amd64=-machine q35,accel=hvf,usb=off -cpu kvm64,kvmclock=off
+QEMU_ACCEL_Y_Linux_amd64=-machine q35,accel=kvm,usb=off,dump-guest-core=off -cpu host,invtsc=on,kvmclock=off -machine kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on,aw-bits=48
+# -machine virt,gic_version=3
+QEMU_ACCEL_Y_Linux_arm64=-machine virt,accel=kvm,usb=off,dump-guest-core=off -cpu host
+QEMU_ACCEL__$(shell uname -s)_arm64=-machine virt,virtualization=true -cpu cortex-a57
+QEMU_ACCEL__$(shell uname -s)_amd64=-machine q35 -cpu SandyBridge
+QEMU_ACCEL:=$(QEMU_ACCEL_$(ACCEL:%=Y)_$(shell uname -s)_$(ZARCH))
 
 QEMU_OPTS_NET1=192.168.1.0/24
 QEMU_OPTS_NET1_FIRST_IP=192.168.1.10
@@ -131,20 +147,22 @@ QEMU_OPTS_NET2_FIRST_IP=192.168.2.10
 
 QEMU_MEMORY:=4096
 
-PFLASH=y
+PFLASH_amd64=y
+PFLASH=$(PFLASH_$(ZARCH))
 QEMU_OPTS_BIOS_y=-drive if=pflash,format=raw,unit=0,readonly,file=$(DIST)/OVMF_CODE.fd -drive if=pflash,format=raw,unit=1,file=$(DIST)/OVMF_VARS.fd
 QEMU_OPTS_BIOS_=-bios $(DIST)/OVMF.fd
 QEMU_OPTS_BIOS=$(QEMU_OPTS_BIOS_$(PFLASH))
 
-QEMU_OPTS_arm64= -machine virt,gic_version=3 -machine virtualization=true -cpu cortex-a57 -machine type=virt -drive file=fat:rw:$(dir $(DEVICETREE_DTB)),label=QEMU_DTB,format=vvfat
-QEMU_OPTS_amd64= -cpu SandyBridge $(QEMU_ACCEL)
+QEMU_OPTS_arm64= -drive file=fat:rw:$(dir $(DEVICETREE_DTB)),label=QEMU_DTB,format=vvfat
 QEMU_OPTS_COMMON= -smbios type=1,serial=31415926 -m $(QEMU_MEMORY) -smp 4 -display none $(QEMU_OPTS_BIOS) \
         -serial mon:stdio      \
         -rtc base=utc,clock=rt \
-        -netdev user,id=eth0,net=$(QEMU_OPTS_NET1),dhcpstart=$(QEMU_OPTS_NET1_FIRST_IP),hostfwd=tcp::$(SSH_PORT)-:22 -device virtio-net-pci,netdev=eth0 \
-        -netdev user,id=eth1,net=$(QEMU_OPTS_NET2),dhcpstart=$(QEMU_OPTS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1
+        -netdev user,id=eth0,net=$(QEMU_OPTS_NET1),dhcpstart=$(QEMU_OPTS_NET1_FIRST_IP),hostfwd=tcp::$(SSH_PORT)-:22 -device virtio-net-pci,netdev=eth0,romfile="" \
+        -netdev user,id=eth1,net=$(QEMU_OPTS_NET2),dhcpstart=$(QEMU_OPTS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1,romfile=""
 QEMU_OPTS_CONF_PART=$(shell [ -d "$(CONF_PART)" ] && echo '-drive file=fat:rw:$(CONF_PART),format=raw')
-QEMU_OPTS=$(QEMU_OPTS_COMMON) $(QEMU_OPTS_$(ZARCH)) $(QEMU_OPTS_CONF_PART)
+QEMU_OPTS=$(QEMU_OPTS_COMMON) $(QEMU_ACCEL) $(QEMU_OPTS_$(ZARCH)) $(QEMU_OPTS_CONF_PART)
+# -device virtio-blk-device,drive=image -drive if=none,id=image,file=X
+# -device virtio-net-device,netdev=user0 -netdev user,id=user0,hostfwd=tcp::1234-:22
 
 GOOS=linux
 CGO_ENABLED=1
@@ -166,9 +184,13 @@ endif
 
 DOCKER_UNPACK= _() { C=`docker create $$1 fake` ; shift ; docker export $$C | tar -xf - "$$@" ; docker rm $$C ; } ; _
 DOCKER_GO = _() { mkdir -p $(CURDIR)/.go/src/$${3:-dummy} ; mkdir -p $(CURDIR)/.go/bin ; \
-    docker run $$DOCKER_GO_ARGS -i --rm -u $(USER) -w /go/src/$${3:-dummy} \
+    docker_go_line="docker run $$DOCKER_GO_ARGS -i --rm -u $(USER) -w /go/src/$${3:-dummy} \
     -v $(CURDIR)/.go:/go -v $$2:/go/src/$${3:-dummy} -v $${4:-$(CURDIR)/.go/bin}:/go/bin -v $(CURDIR)/:/eve -v $${HOME}:/home/$(USER) \
-    -e GOOS -e GOARCH -e CGO_ENABLED -e BUILD=local $(GOBUILDER) bash --noprofile --norc -c "$$1" ; } ; _
+    -e GOOS -e GOARCH -e CGO_ENABLED -e BUILD=local $(GOBUILDER) bash --noprofile --norc -c" ; \
+    verbose=$(V) ;\
+    verbose=$${verbose:-0} ;\
+    [ $$verbose -ge 1 ] && echo $$docker_go_line "\"$$1\""; \
+    $$docker_go_line "$$1" ; } ; _
 
 PARSE_PKGS=$(if $(strip $(EVE_HASH)),EVE_HASH=)$(EVE_HASH) DOCKER_ARCH_TAG=$(DOCKER_ARCH_TAG) ./tools/parse-pkgs.sh
 LINUXKIT=$(CURDIR)/build-tools/bin/linuxkit
@@ -179,7 +201,11 @@ FORCE_BUILD=--force
 
 ifeq ($(LINUXKIT_PKG_TARGET),push)
   EVE_REL:=$(REPO_TAG)
-  ifneq ($(EVE_REL),snapshot)
+  ifeq ($(EVE_REL),snapshot)
+    ifneq ($(REPO_BRANCH),master)
+      EVE_REL=$(REPO_BRANCH)
+    endif
+  else
     EVE_HASH:=$(EVE_REL)
     EVE_REL:=$(shell [ "`git tag | grep -E '[0-9]*\.[0-9]*\.[0-9]*' | sort -t. -n -k1,1 -k2,2 -k3,3 | tail -1`" = $(EVE_HASH) ] && echo latest)
   endif
@@ -192,6 +218,10 @@ PKGS=$(shell ls -d pkg/* | grep -Ev "eve|test-microsvcs")
 # Top-level targets
 
 all: help
+
+# just reports the version, without appending qualifies like HVM or such
+version:
+	@echo $(ROOTFS_VERSION)
 
 test: $(GOBUILDER) | $(DIST)
 	@echo Running tests on $(GOMODULE)
@@ -210,6 +240,24 @@ yetus:
 
 build-tools: $(LINUXKIT)
 	@echo Done building $<
+
+$(BUILD_VM_CLOUD_INIT): build-tools/src/scripts/cloud-init.in | $(DIST)
+	@if [ -z "$(BUILD_VM_SSH_PUB_KEY)" ] || [ -z "$(BUILD_VM_GH_TOKEN)" ]; then                  \
+	    echo "Must be run as: make BUILD_VM_SSH_PUB_KEY=XXX BUILD_VM_GH_TOKEN=YYY $@" && exit 1 ;\
+	fi
+	@sed -e 's#@ZARCH@#$(subst amd64,x64,$(ZARCH))#' -e 's#@SSH_PUB_KEY@#$(BUILD_VM_SSH_PUB_KEY)#g'  \
+	     -e 's#@GH_TOKEN@#$(BUILD_VM_GH_TOKEN)#g' < $< | docker run -i alpine:edge sh -c             \
+	          'apk add cloud-utils > /dev/null 2>&1 && cloud-localds --disk-format qcow2 _ - && cat _' > $@
+
+$(BUILD_VM).orig: | $(DIST)
+	@curl -L $(BUILD_VM_SRC) > $@
+
+$(BUILD_VM): $(BUILD_VM_CLOUD_INIT) $(BUILD_VM).orig $(DEVICETREE_DTB) $(BIOS_IMG) | $(DIST)
+	cp $@.orig $@.active
+	# currently a fulle EVE build *almost* fits into 40Gb -- we need twice as much in a VM
+	qemu-img resize $@.active 100G
+	$(QEMU_SYSTEM) $(QEMU_OPTS) -drive format=qcow2,file=$@.active -drive format=qcow2,file=$<
+	mv $@.active $@
 
 $(BIOS_IMG): $(LINUXKIT) | $(DIST)
 	cd $| ; $(DOCKER_UNPACK) $(shell $(LINUXKIT) pkg show-tag pkg/uefi)-$(DOCKER_ARCH_TAG) $(notdir $@)
@@ -262,6 +310,24 @@ run-compose: images/docker-compose.yml images/version.yml
 run-proxy:
 	ssh $(SSH_PROXY) -N -i $(SSH_KEY) -p $(SSH_PORT) -o StrictHostKeyChecking=no -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=/dev/null root@localhost &
 
+run-build-vm: $(BIOS_IMG) $(DEVICETREE_DTB)
+	$(QEMU_SYSTEM) $(QEMU_OPTS) -drive format=qcow2,file=$(BUILD_VM)
+
+run-live-parallels:
+	@[ -d "$(LIVE).parallels" ] || { echo "Please run: make live-parallels"; exit 1; }
+	@prlctl list -a | grep $(PARALLELS_VM_NAME) | grep "invalid" >/dev/null && prlctl unregister $(PARALLELS_VM_NAME) || echo "No invalid $(PARALLELS_VM_NAME) VM"
+	@if prlctl list --all | grep "$(PARALLELS_VM_NAME)"; then \
+		prlctl stop $(PARALLELS_VM_NAME) --kill; \
+		prlctl set $(PARALLELS_VM_NAME) --device-set hdd0 --image $(LIVE).parallels --nested-virt on --adaptive-hypervisor on --cpus $(PARALLELS_CPUS) --memsize $(PARALLELS_MEMORY); \
+	else \
+		prlctl create $(PARALLELS_VM_NAME) --distribution ubuntu --no-hdd --dst $(DIST)/ ; \
+		prlctl set $(PARALLELS_VM_NAME) --device-add hdd --image $(LIVE).parallels --nested-virt on --adaptive-hypervisor on --cpus $(PARALLELS_CPUS) --memsize $(PARALLELS_MEMORY); \
+		prlctl set $(PARALLELS_VM_NAME) --device-del net0 ; \
+		prlctl set $(PARALLELS_VM_NAME) --device-add net --type shared --adapter-type virtio --ipadd 192.168.1.0/24 --dhcp yes ; \
+		prlctl set $(PARALLELS_VM_NAME) --device-add net --type shared --adapter-type virtio --ipadd 192.168.2.0/24 --dhcp yes ; \
+		prlctl start $(PARALLELS_VM_NAME) ; \
+	fi
+
 # alternatively (and if you want greater control) you can replace the first command with
 #    gcloud auth activate-service-account --key-file=-
 #    gcloud compute images create $(CLOUD_IMG_NAME) --project=lf-edge-eve
@@ -286,6 +352,7 @@ $(DIST) $(INSTALLER):
 	mkdir -p $@
 
 # convenience targets - so you can do `make config` instead of `make dist/config.img`, and `make installer` instead of `make dist/amd64/installer.img
+build-vm: $(BUILD_VM)
 initrd: $(INITRD_IMG)
 config: $(CONFIG_IMG)
 ssh-key: $(SSH_KEY)
@@ -302,7 +369,12 @@ $(SSH_KEY):
 	mv $@.pub $(CONF_DIR)/authorized_keys
 
 $(CONFIG_IMG): $(CONF_FILES) | $(INSTALLER)
-	./tools/makeconfig.sh $@ $(CONF_FILES)
+	./tools/makeconfig.sh $@ "$(ROOTFS_VERSION)" $(CONF_FILES)
+
+$(PERSIST_IMG): | $(INSTALLER)
+	$(if $(findstring zfs,$(HV)),echo 'eve<3zfs' > $@)
+	# 1M of zeroes should be enough to trigger filesystem wipe on first boot
+	dd if=/dev/zero bs=1048576 count=1 >> $@
 
 $(ROOTFS)-%.img: $(ROOTFS_FULL_NAME)-%-$(ZARCH).$(ROOTFS_FORMAT)
 	@rm -f $@ && ln -s $(notdir $<) $@
@@ -310,14 +382,20 @@ $(ROOTFS)-%.img: $(ROOTFS_FULL_NAME)-%-$(ZARCH).$(ROOTFS_FORMAT)
 $(ROOTFS_IMG): $(ROOTFS)-$(HV).img
 	@rm -f $@ && ln -s $(notdir $<) $@
 
-$(LIVE).raw: $(BOOT_PART) $(EFI_PART) $(ROOTFS_IMG) $(CONFIG_IMG) | $(INSTALLER)
+$(LIVE).raw: $(BOOT_PART) $(EFI_PART) $(ROOTFS_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(INSTALLER)
 	./tools/makeflash.sh -C 350 $| $@ $(PART_SPEC)
 
-$(INSTALLER).raw: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(CONFIG_IMG) | $(INSTALLER)
+$(INSTALLER).raw: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(INSTALLER)
 	./tools/makeflash.sh -C 350 $| $@ "conf_win installer inventory_win"
 
-$(INSTALLER).iso: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(CONFIG_IMG) | $(INSTALLER)
+$(INSTALLER).iso: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(INSTALLER)
 	./tools/makeiso.sh $| $@
+
+$(LIVE).parallels: $(LIVE).raw
+	rm -rf $@; mkdir $@
+	qemu-img resize -f raw $< ${MEDIA_SIZE}M
+	qemu-img convert -O parallels $< $@/live.0.$(PARALLELS_UUID).hds
+	qemu-img info -f parallels --output json $(LIVE).parallels/live.0.$(PARALLELS_UUID).hds | jq --raw-output '.["virtual-size"]' | xargs ./tools/parallels_disk.sh $(LIVE) $(PARALLELS_UUID)
 
 # top-level linuxkit packages targets, note the one enforcing ordering between packages
 pkgs: RESCAN_DEPS=
@@ -336,7 +414,7 @@ pkg/qrexec-lib: pkg/xen-tools eve-qrexec-lib
 pkg/%: eve-% FORCE
 	@true
 
-eve: $(BIOS_IMG) $(EFI_PART) $(CONFIG_IMG) $(INITRD_IMG) $(ROOTFS_IMG) $(if $(findstring rpi,$(HV)),$(BOOT_PART)) | $(DIST)
+eve: $(BIOS_IMG) $(EFI_PART) $(CONFIG_IMG) $(PERSIST_IMG) $(INITRD_IMG) $(ROOTFS_IMG) $(if $(findstring arm64,$(ZARCH)),$(BOOT_PART)) | $(DIST)
 	cp pkg/eve/build.yml pkg/eve/runme.sh images/*.yml $|
 	$(PARSE_PKGS) pkg/eve/Dockerfile.in > $|/Dockerfile
 	$(LINUXKIT) pkg $(LINUXKIT_PKG_TARGET) --disable-content-trust --hash-path $(CURDIR) --hash $(ROOTFS_VERSION)-$(HV) $(if $(strip $(EVE_REL)),--release) $(EVE_REL) $(FORCE_BUILD) $|
@@ -347,12 +425,19 @@ proto-vendor:
 proto-diagram: $(GOBUILDER)
 	@$(DOCKER_GO) "/usr/local/bin/protodot -src ./api/proto/config/devconfig.proto -output devconfig && cp ~/protodot/generated/devconfig.* ./api/images && dot ./api/images/devconfig.dot -Tpng -o ./api/images/devconfig.png && echo generated ./api/images/devconfig.*" $(CURDIR) api
 
+.PHONY: proto-api-%
+
 proto: $(GOBUILDER) api/go api/python proto-diagram
 	@echo Done building protobuf, you may want to vendor it into pillar by running proto-vendor
 
-api/%: $(GOBUILDER)
-	rm -rf $@/*/; mkdir -p $@ # building $@
-	@$(DOCKER_GO) "protoc -I./proto --$(@F)_out=paths=source_relative:./$(@F) \
+api/go: PROTOC_OUT_OPTS=paths=source_relative:
+api/go: proto-api-go
+
+api/python: proto-api-python
+
+proto-api-%: $(GOBUILDER)
+	rm -rf api/$*/*/; mkdir -p api/$* # building $@
+	@$(DOCKER_GO) "protoc -I./proto --$(*)_out=$(PROTOC_OUT_OPTS)./$* \
 		proto/*/*.proto" $(CURDIR)/api api
 
 patch:
@@ -389,10 +474,10 @@ $(LINUXKIT): CGO_ENABLED=0
 $(LINUXKIT): GOOS=$(shell uname -s | tr '[A-Z]' '[a-z]')
 $(LINUXKIT): $(CURDIR)/build-tools/src/linuxkit/Gopkg.lock $(CURDIR)/build-tools/bin/manifest-tool | $(GOBUILDER)
 	@$(DOCKER_GO) "unset GOFLAGS ; unset GO111MODULE ; go build -ldflags '-X version.GitCommit=$(EVE_TREE_TAG)' -o /go/bin/linuxkit \
-                          vendor/github.com/linuxkit/linuxkit/src/cmd/linuxkit" $(dir $<) / $(dir $@)
+                          ./vendor/github.com/linuxkit/linuxkit/src/cmd/linuxkit" $(dir $<) /linuxkit $(dir $@)
 $(CURDIR)/build-tools/bin/manifest-tool: $(CURDIR)/build-tools/src/manifest-tool/Gopkg.lock | $(GOBUILDER)
 	@$(DOCKER_GO) "unset GOFLAGS ; unset GO111MODULE ; go build -ldflags '-X main.gitCommit=$(EVE_TREE_TAG)' -o /go/bin/manifest-tool \
-                          vendor/github.com/estesp/manifest-tool" $(dir $<) / $(dir $@)
+                          ./vendor/github.com/estesp/manifest-tool" $(dir $<) /manifest-tool $(dir $@)
 
 $(GOBUILDER):
 ifneq ($(BUILD),local)
@@ -471,6 +556,7 @@ help:
 	@echo "all the execution is done via qemu."
 	@echo
 	@echo "Commonly used maintenance and development targets:"
+	@echo "   build-vm       prepare a build VM for EVE in qcow2 format"
 	@echo "   test           run EVE tests"
 	@echo "   clean          clean build artifacts in a current directory (doesn't clean Docker)"
 	@echo "   release        prepare branch for a release (VERSION=x.y.z required)"
@@ -486,21 +572,23 @@ help:
 	@echo "   pkgs           builds all EVE packages"
 	@echo "   pkg/XXX        builds XXX EVE package"
 	@echo "   rootfs         builds default EVE rootfs image (upload it to the cloud as BaseImage)"
-	@echo "   rootfs-XXX     builds a particular kind of EVE rootfs image (xen, kvm, rpi)"
+	@echo "   rootfs-XXX     builds a particular kind of EVE rootfs image (xen, kvm)"
 	@echo "   live           builds a full disk image of EVE which can be function as a virtual device"
-	@echo "   live-XXX       builds a particular kind of EVE live image (raw, qcow2, gcp)"
+	@echo "   live-XXX       builds a particular kind of EVE live image (raw, qcow2, gcp, parallels)"
 	@echo "   installer      builds raw disk installer image (to be installed on bootable media)"
 	@echo "   installer-iso  builds an ISO installers image (to be installed on bootable media)"
 	@echo
 	@echo "Commonly used run targets (note they don't automatically rebuild images they run):"
-	@echo "   run-compose       runs all EVE microservices via docker-compose deployment"
-	@echo "   run-live          runs a full fledged virtual device on qemu (as close as it gets to actual h/w)"
-	@echo "   run-live-gcp      runs a full fledged virtual device on Google Compute Platform (provide your account details)"
-	@echo "   run-rootfs        runs a rootfs.img (limited usefulness e.g. quick test before cloud upload)"
-	@echo "   run-grub          runs our copy of GRUB bootloader and nothing else (very limited usefulness)"
-	@echo "   run-installer-iso runs installer.iso (via qemu) and 'installs' EVE into (initially blank) target.img"
-	@echo "   run-installer-raw runs installer.raw (via qemu) and 'installs' EVE into (initially blank) target.img"
-	@echo "   run-target        runs a full fledged virtual device on qemu from target.img (similar to run-live)"
+	@echo "   run-compose        runs all EVE microservices via docker-compose deployment"
+	@echo "   run-build-vm       runs a build VM image"
+	@echo "   run-live           runs a full fledged virtual device on qemu (as close as it gets to actual h/w)"
+	@echo "   run-live-gcp       runs a full fledged virtual device on Google Compute Platform (provide your account details)"
+	@echo "   run-live-parallels runs a full fledged virtual device on Parallels Desktop"
+	@echo "   run-rootfs         runs a rootfs.img (limited usefulness e.g. quick test before cloud upload)"
+	@echo "   run-grub           runs our copy of GRUB bootloader and nothing else (very limited usefulness)"
+	@echo "   run-installer-iso  runs installer.iso (via qemu) and 'installs' EVE into (initially blank) target.img"
+	@echo "   run-installer-raw  runs installer.raw (via qemu) and 'installs' EVE into (initially blank) target.img"
+	@echo "   run-target         runs a full fledged virtual device on qemu from target.img (similar to run-live)"
 	@echo
 	@echo "make run is currently an alias for make run-live"
 	@echo

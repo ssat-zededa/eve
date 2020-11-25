@@ -94,7 +94,7 @@ func (c *Command) CombinedOutputWithCustomTimeout(timeout uint) ([]byte, error) 
 
 func (c *Command) execCommand() ([]byte, error) {
 	if c.log != nil {
-		c.log.Debugf("execCommand(%v)", c.command.Args)
+		c.log.Tracef("execCommand(%v)", c.command.Args)
 	}
 	if err := c.command.Start(); err != nil {
 		return nil, fmt.Errorf("execCommand(%v): error while starting command: %s", c.command.Args, err.Error())
@@ -131,7 +131,7 @@ func Exec(log *LogObject, command string, arg ...string) *Command {
 	}
 }
 
-//updateAgentTouchFile updates agent's touch file under /var/run/
+//updateAgentTouchFile updates agent's touch file under /run/
 func updateAgentTouchFile(log *LogObject, agentName string) {
 	if agentName == "" {
 		if log != nil {
@@ -139,13 +139,13 @@ func updateAgentTouchFile(log *LogObject, agentName string) {
 		}
 		return
 	}
-	filename := fmt.Sprintf("/var/run/%s.touch", agentName)
+	filename := fmt.Sprintf("/run/%s.touch", agentName)
 	_, err := os.Stat(filename)
 	if err != nil {
 		file, err := os.Create(filename)
 		if err != nil {
 			if log != nil {
-				log.Infof("updateAgentTouchFile: %s\n", err)
+				log.Functionf("updateAgentTouchFile: %s\n", err)
 			}
 			return
 		}

@@ -67,6 +67,9 @@ var (
 	//location of the attestation quote certificate
 	quoteCertFile = types.PersistConfigDir + "/attest.cert.pem"
 
+	//EkCertFile is location of the endorsement key certificate
+	EkCertFile = types.PersistConfigDir + "/ek.cert.pem"
+
 	//location of private key for the quote certificate
 	//on devices without a TPM
 	quoteKeyFile = types.PersistConfigDir + "/attest.key.pem"
@@ -215,7 +218,7 @@ func createKey(keyHandle, ownerHandle tpmutil.Handle, template tpm2.Public, over
 		tpm2.HandleOwner,
 		keyHandle,
 		keyHandle); err != nil {
-		log.Debugf("EvictControl failed: %v", err)
+		log.Tracef("EvictControl failed: %v", err)
 	}
 	if err := tpm2.EvictControl(rw, etpm.EmptyPassword,
 		tpm2.HandleOwner, handle,
@@ -284,7 +287,7 @@ func writeDeviceCert() error {
 	if err := tpm2.NVUndefineSpace(rw, etpm.EmptyPassword,
 		tpm2.HandleOwner, etpm.TpmDeviceCertHdl,
 	); err != nil {
-		log.Debugf("NVUndefineSpace failed: %v", err)
+		log.Tracef("NVUndefineSpace failed: %v", err)
 	}
 
 	deviceCertBytes, err := ioutil.ReadFile(TpmDeviceCertFileName)
@@ -372,7 +375,7 @@ func writeCredentials() error {
 	if err := tpm2.NVUndefineSpace(rw, etpm.EmptyPassword,
 		tpm2.HandleOwner, etpm.TpmPasswdHdl,
 	); err != nil {
-		log.Debugf("NVUndefineSpace failed: %v", err)
+		log.Tracef("NVUndefineSpace failed: %v", err)
 	}
 
 	tpmCredentialBytes, err := ioutil.ReadFile(etpm.TpmCredentialsFileName)
@@ -633,6 +636,106 @@ func createQuoteCert() error {
 	}
 	// create soft certficate
 	return createQuoteCertSoft()
+}
+
+func createEkCert() error {
+	if etpm.FileExists(EkCertFile) {
+		// certificate is already created
+		return nil
+	}
+	if etpm.IsTpmEnabled() {
+		return createEkCertOnTpm()
+	}
+	return nil
+}
+
+func createEkCertOnTpm() error {
+	//Check if we already have the certificate
+	if !etpm.FileExists(EkCertFile) {
+		//Cert is not present, generate new one
+		rw, err := tpm2.OpenTPM(etpm.TpmDevicePath)
+		if err != nil {
+			return err
+		}
+		defer rw.Close()
+
+		deviceCertBytes, err := ioutil.ReadFile(types.DeviceCertName)
+		if err != nil {
+			return err
+		}
+
+		block, _ := pem.Decode(deviceCertBytes)
+		if block == nil {
+			return fmt.Errorf("Failed in PEM decoding of deviceCertBytes")
+		}
+
+		deviceCert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return err
+		}
+
+		EKey, _, _, err := tpm2.ReadPublic(rw, etpm.TpmEKHdl)
+		if err != nil {
+			return err
+		}
+
+		publicKey, err := EKey.Key()
+		if err != nil {
+			return err
+		}
+
+		tpmPrivKey := etpm.TpmPrivateKey{}
+		tpmPrivKey.PublicKey = tpmPrivKey.Public()
+		template := createEkTemplate(*deviceCert)
+
+		cert, err := x509.CreateCertificate(rand.Reader,
+			&template, deviceCert, publicKey, tpmPrivKey)
+		if err != nil {
+			return err
+		}
+
+		certBlock := &pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: cert,
+		}
+
+		certBytes := pem.EncodeToMemory(certBlock)
+		if certBytes == nil {
+			return fmt.Errorf("empty bytes after encoding to PEM")
+		}
+
+		err = ioutil.WriteFile(EkCertFile, certBytes, 0644)
+		if err != nil {
+			return err
+		}
+
+	}
+	return nil
+}
+
+// create Ek Template using the deviceCert for lifetimes
+// Use a CommonName to differentiate from the device cert itself
+func createEkTemplate(deviceCert x509.Certificate) x509.Certificate {
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Country:      []string{"US"},
+			Province:     []string{"CA"},
+			Locality:     []string{"San Francisco"},
+			Organization: []string{"The Linux Foundation"},
+			CommonName:   "Device Endorsement Key certificate",
+		},
+		NotBefore: deviceCert.NotBefore,
+		NotAfter:  deviceCert.NotAfter,
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	return template
 }
 
 func createQuoteCertOnTpm() error {
@@ -996,10 +1099,10 @@ func writeEcdhCertToFile(certBytes, keyBytes []byte) error {
 
 func publishEdgeNodeCert(ctx *tpmMgrContext, config types.EdgeNodeCert) {
 	key := config.Key()
-	log.Debugf("publishEdgeNodeCert %s", key)
+	log.Tracef("publishEdgeNodeCert %s", key)
 	pub := ctx.pubEdgeNodeCert
 	pub.Publish(key, config)
-	log.Debugf("publishEdgeNodeCert %s Done", key)
+	log.Tracef("publishEdgeNodeCert %s Done", key)
 }
 
 func readEdgeNodeCert(certPath string) ([]byte, error) {
@@ -1020,8 +1123,8 @@ func getCertHash(cert []byte, hashAlgo types.CertHashType) ([]byte, error) {
 	}
 }
 
-func publishEdgeNodeCertToController(ctx *tpmMgrContext, certFile string, certType types.CertType, isTpm bool) {
-	log.Infof("publishEdgeNodeCertToController started")
+func publishEdgeNodeCertToController(ctx *tpmMgrContext, certFile string, certType types.CertType, isTpm bool, metaDataItems []types.CertMetaData) {
+	log.Functionf("publishEdgeNodeCertToController started")
 	if !etpm.FileExists(certFile) {
 		log.Errorf("publishEdgeNodeCertToController failed: no cert file")
 		return
@@ -1045,10 +1148,57 @@ func publishEdgeNodeCertToController(ctx *tpmMgrContext, certFile string, certTy
 		Cert:     certBytes,
 		IsTpm:    isTpm,
 	}
+	if len(metaDataItems) > 0 {
+		cert.MetaDataItems = make([]types.CertMetaData, len(metaDataItems))
+		for i, metaData := range metaDataItems {
+			cert.MetaDataItems[i].Type = metaData.Type
+			cert.MetaDataItems[i].Data = metaData.Data
+		}
+	}
 	publishEdgeNodeCert(ctx, cert)
-	log.Infof("publishEdgeNodeCertToController Done")
+	log.Functionf("publishEdgeNodeCertToController Done")
 }
 
+func getEkCertMetaData() ([]types.CertMetaData, error) {
+	rw, err := tpm2.OpenTPM(etpm.TpmDevicePath)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to open TPM device: %v", err)
+	}
+	defer rw.Close()
+
+	pub, _, _, err := tpm2.ReadPublic(rw, etpm.TpmEKHdl)
+	if err != nil {
+		return nil, err
+	}
+	pubWireFormat, err := pub.Encode()
+	if err != nil {
+		return nil, err
+	}
+	//Wrap TPM2_PUBLIC in TPM2B_PUBLIC
+	packedPubKey, err := tpmutil.Pack(tpmutil.U16Bytes(pubWireFormat))
+	if err != nil {
+		return nil, err
+	}
+	//pubBase64 := base64.StdEncoding.EncodeToString(pubWireFormat)
+	EkCertMetaData := make([]types.CertMetaData, 1)
+	EkCertMetaData[0].Type = types.CertMetaDataTypeTpm2Public
+	//EkCertMetaData[0].Data = []byte(pubBase64)
+	EkCertMetaData[0].Data = packedPubKey
+	return EkCertMetaData, nil
+}
+
+// Write TPM vendor, firmware info to given file.
+func saveTpmInfo(filename string) error {
+	info, err := etpm.FetchTpmHwInfo()
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(filename, []byte(info), 0600)
+}
+
+// Run is the entry point for tpmmgr, from zedbox
+//nolint:funlen,gocognit,gocyclo
 func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) int {
 	logger = loggerArg
 	log = logArg
@@ -1120,8 +1270,19 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			log.Errorf("Error in generating credentials: %v", err)
 			return 1
 		}
+	case "saveTpmInfo":
+		//nolint:gomnd // very straightforward for anyone to understand why "2" is used here
+		if len(flag.Args()) != 2 {
+			log.Error("Insufficient arguments. Usage: tpmmgr saveTpmInfo filePath")
+
+			return 1
+		}
+
+		if err := saveTpmInfo(flag.Args()[1]); err != nil {
+			log.Errorf("saveTpmInfo failed: %v", err)
+		}
 	case "runAsService":
-		log.Infof("Starting %s", agentName)
+		log.Functionf("Starting %s", agentName)
 
 		if err := pidfile.CheckAndCreatePidfile(log, agentName); err != nil {
 			log.Fatal(err)
@@ -1136,12 +1297,13 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 
 		// Look for global config such as log levels
 		subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-			AgentName:     "",
+			AgentName:     "zedagent",
 			MyAgentName:   agentName,
 			TopicImpl:     types.ConfigItemValueMap{},
+			Persistent:    true,
 			Activate:      false,
 			Ctx:           &ctx,
-			CreateHandler: handleGlobalConfigModify,
+			CreateHandler: handleGlobalConfigCreate,
 			ModifyHandler: handleGlobalConfigModify,
 			DeleteHandler: handleGlobalConfigDelete,
 			WarningTime:   warningTime,
@@ -1159,6 +1321,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			TopicImpl:     types.NodeAgentStatus{},
 			Activate:      false,
 			Ctx:           &ctx,
+			CreateHandler: handleNodeAgentStatusCreate,
 			ModifyHandler: handleNodeAgentStatusModify,
 			DeleteHandler: handleNodeAgentStatusDelete,
 			WarningTime:   warningTime,
@@ -1185,7 +1348,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			TopicImpl:     types.AttestNonce{},
 			Activate:      false,
 			Ctx:           &ctx,
-			CreateHandler: handleAttestNonceModify,
+			CreateHandler: handleAttestNonceCreate,
 			ModifyHandler: handleAttestNonceModify,
 			DeleteHandler: handleAttestNonceDelete,
 			WarningTime:   warningTime,
@@ -1209,15 +1372,23 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 
 		//publish ECDH cert
 		publishEdgeNodeCertToController(&ctx, ecdhCertFile, types.CertTypeEcdhXchange,
-			etpm.IsTpmEnabled() && !etpm.FileExists(etpm.EcdhKeyFile))
+			etpm.IsTpmEnabled() && !etpm.FileExists(etpm.EcdhKeyFile), nil)
 
 		//publish attestation quote cert
 		publishEdgeNodeCertToController(&ctx, quoteCertFile, types.CertTypeRestrictSigning,
-			etpm.IsTpmEnabled() && !etpm.FileExists(quoteKeyFile))
+			etpm.IsTpmEnabled() && !etpm.FileExists(quoteKeyFile), nil)
+
+		ekCertMetaData, err := getEkCertMetaData()
+		if err == nil {
+			publishEdgeNodeCertToController(&ctx, EkCertFile, types.CertTypeEk, true,
+				ekCertMetaData)
+		} else {
+			log.Errorf("ekCertMetaData failed: %v", err)
+		}
 
 		// Pick up debug aka log level before we start real work
 		for !ctx.GCInitialized {
-			log.Infof("waiting for GCInitialized")
+			log.Functionf("waiting for GCInitialized")
 			select {
 			case change := <-subGlobalConfig.MsgChan():
 				subGlobalConfig.ProcessChange(change)
@@ -1227,7 +1398,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			}
 			ps.StillRunning(agentName, warningTime, errorTime)
 		}
-		log.Infof("processed GlobalConfig")
+		log.Functionf("processed GlobalConfig")
 
 		if etpm.IsTpmEnabled() && !etpm.FileExists(etpm.TpmCredentialsFileName) {
 			err := readCredentials()
@@ -1299,6 +1470,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			log.Errorf("Error in creating Quote Certificate: %v", err)
 			return 1
 		}
+		if err := createEkCert(); err != nil {
+			log.Errorf("Error in creating Endorsement Key Certificate: %v", err)
+			return 1
+		}
 	default:
 		//No need for Fatal, caller will take action based on return code.
 		log.Errorf("Unknown argument %s", flag.Args()[0])
@@ -1307,23 +1482,32 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	return 0
 }
 
-// Handles both create and modify events
+func handleGlobalConfigCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleGlobalConfigImpl(ctxArg, key, statusArg)
+}
+
 func handleGlobalConfigModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleGlobalConfigImpl(ctxArg, key, statusArg)
+}
+
+func handleGlobalConfigImpl(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	ctx := ctxArg.(*tpmMgrContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigModify: ignoring %s", key)
+		log.Functionf("handleGlobalConfigImpl: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigModify for %s", key)
+	log.Functionf("handleGlobalConfigImpl for %s", key)
 	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
 		debugOverride, logger)
 	if gcp != nil {
 		ctx.GCInitialized = true
 	}
-	log.Infof("handleGlobalConfigModify done for %s", key)
+	log.Functionf("handleGlobalConfigImpl done for %s", key)
 }
 
 func handleGlobalConfigDelete(ctxArg interface{}, key string,
@@ -1331,39 +1515,50 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*tpmMgrContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigDelete: ignoring %s", key)
+		log.Functionf("handleGlobalConfigDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigDelete for %s", key)
+	log.Functionf("handleGlobalConfigDelete for %s", key)
 	debug, _ = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
 		debugOverride, logger)
-	log.Infof("handleGlobalConfigDelete done for %s", key)
+	log.Functionf("handleGlobalConfigDelete done for %s", key)
 }
 
-// Handles both create and modify events
-func handleNodeAgentStatusModify(ctxArg interface{}, key string, statusArg interface{}) {
+func handleNodeAgentStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleNodeAgentStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleNodeAgentStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleNodeAgentStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleNodeAgentStatusImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
 	status := statusArg.(types.NodeAgentStatus)
 	ctx := ctxArg.(*tpmMgrContext)
 	if key != "nodeagent" {
-		log.Infof("handleNodeAgentStatusModify: ignoring %s", key)
+		log.Functionf("handleNodeAgentStatusImpl: ignoring %s", key)
 		return
 	}
 	ctx.DeviceReboot = status.DeviceReboot
-	log.Infof("handleNodeAgentStatusModify done for %s: %v", key, ctx.DeviceReboot)
+	log.Functionf("handleNodeAgentStatusImpl done for %s: %v", key, ctx.DeviceReboot)
 }
 
 func handleNodeAgentStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleNodeAgentStatusDelete for %s", key)
+	log.Functionf("handleNodeAgentStatusDelete for %s", key)
 	ctx := ctxArg.(*tpmMgrContext)
 
 	if key != "nodeagent" {
-		log.Infof("handleNodeAgentStatusDelete: ignoring %s", key)
+		log.Functionf("handleNodeAgentStatusDelete: ignoring %s", key)
 		return
 	}
 	ctx.DeviceReboot = false
-	log.Infof("handleNodeAgentStatusDelete done for %s: %v", key, ctx.DeviceReboot)
+	log.Functionf("handleNodeAgentStatusDelete done for %s: %v", key, ctx.DeviceReboot)
 }
 
 func readNodeAgentStatus(ctx *tpmMgrContext) (bool, error) {
@@ -1375,12 +1570,23 @@ func readNodeAgentStatus(ctx *tpmMgrContext) (bool, error) {
 	return status.DeviceReboot, nil
 }
 
-// Handles both create and modify events
-func handleAttestNonceModify(ctxArg interface{}, key string, statusArg interface{}) {
-	log.Infof("handleAttestNonceModify received")
+func handleAttestNonceCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleAttestNonceImpl(ctxArg, key, statusArg)
+}
+
+func handleAttestNonceModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleAttestNonceImpl(ctxArg, key, statusArg)
+}
+
+func handleAttestNonceImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	log.Functionf("handleAttestNonceImpl received")
 	ctx := ctxArg.(*tpmMgrContext)
 	nonceReq := statusArg.(types.AttestNonce)
-	log.Infof("Received quote request from %s", nonceReq.Requester)
+	log.Functionf("Received quote request from %s", nonceReq.Requester)
 	quote, signature, pcrs, err := getQuote(nonceReq.Nonce)
 	if err != nil {
 		log.Errorf("Error in fetching quote %v", err)
@@ -1393,21 +1599,21 @@ func handleAttestNonceModify(ctxArg interface{}, key string, statusArg interface
 		PCRs:      pcrs,
 	}
 	pubKey := attestQuote.Key()
-	log.Debugf("publishing quote for nonce %x", pubKey)
+	log.Tracef("publishing quote for nonce %x", pubKey)
 	pub := ctx.pubAttestQuote
 	pub.Publish(pubKey, attestQuote)
-	log.Debugf("handleAttestNonceModify done")
+	log.Tracef("handleAttestNonceImpl done")
 }
 
 func handleAttestNonceDelete(ctxArg interface{}, key string, statusArg interface{}) {
-	log.Infof("handleAttestNonceDelete received")
+	log.Functionf("handleAttestNonceDelete received")
 	ctx := ctxArg.(*tpmMgrContext)
 	pub := ctx.pubAttestQuote
 	st, _ := pub.Get(key)
 	if st != nil {
-		log.Infof("Unpublishing quote for nonce %x", key)
+		log.Functionf("Unpublishing quote for nonce %x", key)
 		pub := ctx.pubAttestQuote
 		pub.Unpublish(key)
 	}
-	log.Infof("handleAttestNonceModify done")
+	log.Functionf("handleAttestNonceDelete done")
 }

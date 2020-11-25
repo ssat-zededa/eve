@@ -8,16 +8,18 @@ package worker
 
 import (
 	"errors"
-	"github.com/stretchr/testify/assert"
 	"log"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/sirupsen/logrus"
 )
 
 var timestamp time.Time
+var logObject *base.LogObject
 
 func TestWork(t *testing.T) {
 	testMatrix := map[string]struct {
@@ -49,21 +51,34 @@ func TestWork(t *testing.T) {
 		},
 	}
 	ctx := dummyContext{contextName: "testContext"}
+
+	var res WorkResult
+	dummyResponse := func(ctx interface{}, r WorkResult) error {
+		res = r
+		return nil
+	}
+
+	logger := logrus.StandardLogger()
+	// logger.SetLevel(logrus.TraceLevel)
+	logObject = base.NewSourceLogObject(logger, "test", 1234)
 	worker := NewWorker(
-		base.NewSourceLogObject(logrus.StandardLogger(), "test", 1234),
-		dummyWorker, &ctx, 1)
+		logObject,
+		&ctx, 1, map[string]Handler{
+			"test": {Request: dummyWorker, Response: dummyResponse},
+		})
 	for testname, test := range testMatrix {
 		t.Logf("Running test case %s", testname)
 		t.Run(testname, func(t *testing.T) {
 			d := test.description
-			w := Work{Key: testname, Description: d}
+			w := Work{Kind: "test", Key: testname, Description: d}
 			timestamp = time.Now() // In case we ask for sleep
 			worker.Submit(w)
-			assert.Equal(t, worker.NumPending(), 1)
-			res := worker.Process(<-worker.MsgChan())
-			assert.Equal(t, worker.NumPending(), 0)
-			assert.Equal(t, res.Key, testname)
-			assert.Equal(t, res.Output, d.generateOutput)
+			assert.Equal(t, 1, worker.NumPending())
+			proc := <-worker.MsgChan()
+			proc.Process(ctx, true)
+			assert.Equal(t, 0, worker.NumPending())
+			assert.Equal(t, testname, res.Key)
+			assert.Equal(t, d.generateOutput, res.Output)
 			if d.sleepTime != 0 {
 				minDuration := time.Duration(d.sleepTime) * time.Second
 				maxDuration := minDuration + 100*time.Millisecond
@@ -73,14 +88,14 @@ func TestWork(t *testing.T) {
 			}
 			if d.generateError {
 				assert.NotNil(t, res.Error)
-				assert.Equal(t, res.ErrorTime, timestamp)
+				assert.Equal(t, timestamp, res.ErrorTime)
 			}
 			dout := res.Description.(dummyDescription)
-			assert.Equal(t, dout.generateOutput, d.generateOutput)
+			assert.Equal(t, d.generateOutput, dout.generateOutput)
 			assert.True(t, dout.done)
 		})
 	}
-	assert.Equal(t, worker.NumPending(), 0)
+	assert.Equal(t, 0, worker.NumPending())
 	worker.Done()
 	_, ok := <-worker.MsgChan()
 	done := !ok
@@ -103,17 +118,28 @@ var sleep3 = dummyDescription{
 // TestLength verifies that the channel length causes delay
 func TestLength(t *testing.T) {
 	ctx := dummyContext{contextName: "testContext"}
+	var res WorkResult
+	dummyResponse := func(ctx interface{}, r WorkResult) error {
+		res = r
+		return nil
+	}
+	logger := logrus.StandardLogger()
+	// logger.SetLevel(logrus.TraceLevel)
+	logObject = base.NewSourceLogObject(logger, "test", 1234)
 	worker := NewWorker(
-		base.NewSourceLogObject(logrus.StandardLogger(), "test", 1234),
-		dummyWorker, &ctx, 1)
+		logObject,
+		&ctx, 1, map[string]Handler{
+			"test": {Request: dummyWorker, Response: dummyResponse},
+		})
 	testname := "testlength"
 
 	t.Logf("Running test case %s", testname)
-	w1 := Work{Key: testname, Description: sleep1}
+	w1 := Work{Kind: "test", Key: testname + "1", Description: sleep1}
 	timestamp = time.Now() // In case we ask for sleep
 	submit1start := timestamp
-	worker.Submit(w1)
-	assert.Equal(t, worker.NumPending(), 1)
+	done, _ := worker.TrySubmit(w1)
+	assert.True(t, done)
+	assert.Equal(t, 1, worker.NumPending())
 	submit1time := time.Since(submit1start)
 	log.Printf("Submit1 took %v", submit1time)
 	minDuration := time.Duration(0)
@@ -121,19 +147,19 @@ func TestLength(t *testing.T) {
 	assert.GreaterOrEqual(t, int64(submit1time), int64(minDuration))
 	assert.Less(t, int64(submit1time), int64(maxDuration))
 
-	w2 := Work{Key: testname, Description: sleep2}
+	w2 := Work{Kind: "test", Key: testname + "2", Description: sleep2}
 	submit2start := time.Now()
 	worker.Submit(w2)
-	assert.Equal(t, worker.NumPending(), 2)
+	assert.Equal(t, 2, worker.NumPending())
 	submit2time := time.Since(submit2start)
 	log.Printf("Submit2 took %v", submit2time)
 	assert.GreaterOrEqual(t, int64(submit2time), int64(minDuration))
 	assert.Less(t, int64(submit2time), int64(maxDuration))
 
-	w3 := Work{Key: testname, Description: sleep3}
+	w3 := Work{Kind: "test", Key: testname + "3", Description: sleep3}
 	submit3start := time.Now()
 	worker.Submit(w3)
-	assert.Equal(t, worker.NumPending(), 3)
+	assert.Equal(t, 3, worker.NumPending())
 	submit3time := time.Since(submit3start)
 	log.Printf("Submit3 took %v", submit3time)
 	// With channel length 1 have to wait for w1 to complete
@@ -143,10 +169,15 @@ func TestLength(t *testing.T) {
 	assert.GreaterOrEqual(t, int64(submit3time), int64(minDuration))
 	assert.Less(t, int64(submit3time), int64(maxDuration))
 
-	res1 := worker.Process(<-worker.MsgChan())
-	assert.Equal(t, worker.NumPending(), 2)
-	assert.Equal(t, res1.Key, testname)
-	assert.Equal(t, res1.Output, sleep1.generateOutput)
+	w4 := Work{Kind: "test", Key: testname + "4", Description: sleep3}
+	done, _ = worker.TrySubmit(w4)
+	assert.False(t, done)
+
+	proc1 := <-worker.MsgChan()
+	proc1.Process(ctx, true)
+	assert.Equal(t, 2, worker.NumPending())
+	assert.Equal(t, testname+"1", res.Key)
+	assert.Equal(t, sleep1.generateOutput, res.Output)
 	if sleep1.sleepTime != 0 {
 		minDuration := time.Duration(sleep1.sleepTime)*time.Second + submit1time
 		maxDuration := minDuration + 100*time.Millisecond
@@ -154,10 +185,11 @@ func TestLength(t *testing.T) {
 		assert.GreaterOrEqual(t, int64(took), int64(minDuration))
 		assert.Less(t, int64(took), int64(maxDuration))
 	}
-	res2 := worker.Process(<-worker.MsgChan())
-	assert.Equal(t, worker.NumPending(), 1)
-	assert.Equal(t, res2.Key, testname)
-	assert.Equal(t, res2.Output, sleep2.generateOutput)
+	proc2 := <-worker.MsgChan()
+	proc2.Process(ctx, true)
+	assert.Equal(t, 1, worker.NumPending())
+	assert.Equal(t, testname+"2", res.Key)
+	assert.Equal(t, sleep2.generateOutput, res.Output)
 	if sleep2.sleepTime != 0 {
 		// Single worker processing serially
 		secs := sleep1.sleepTime + sleep2.sleepTime
@@ -169,10 +201,13 @@ func TestLength(t *testing.T) {
 		assert.Less(t, int64(took), int64(maxDuration))
 	}
 
-	res3 := worker.Process(<-worker.MsgChan())
-	assert.Equal(t, worker.NumPending(), 0)
-	assert.Equal(t, res3.Key, testname)
-	assert.Equal(t, res3.Output, sleep3.generateOutput)
+	proc3 := <-worker.MsgChan()
+	proc3.Process(ctx, true)
+	// this one uses the Pop, so we exercise it
+	res3 := worker.Pop(testname + "3")
+	assert.Equal(t, 0, worker.NumPending())
+	assert.Equal(t, testname+"3", res3.Key)
+	assert.Equal(t, sleep3.generateOutput, res3.Output)
 	if sleep3.sleepTime != 0 {
 		minDuration := time.Duration(sleep3.sleepTime)*time.Second + submit1time + submit2time + submit3time
 		maxDuration := minDuration + 100*time.Millisecond
@@ -181,10 +216,10 @@ func TestLength(t *testing.T) {
 		assert.Less(t, int64(took), int64(maxDuration))
 	}
 
-	assert.Equal(t, worker.NumPending(), 0)
+	assert.Equal(t, 0, worker.NumPending())
 	worker.Done()
 	_, ok := <-worker.MsgChan()
-	done := !ok
+	done = !ok
 	assert.True(t, done)
 }
 

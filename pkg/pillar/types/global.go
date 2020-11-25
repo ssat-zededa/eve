@@ -129,6 +129,8 @@ const (
 	VdiskGCTime GlobalSettingKey = "timer.gc.vdisk"
 	// DownloadRetryTime global setting key
 	DownloadRetryTime GlobalSettingKey = "timer.download.retry"
+	// DownloadStalledTime global setting key
+	DownloadStalledTime GlobalSettingKey = "timer.download.stalled"
 	// DomainBootRetryTime global setting key
 	DomainBootRetryTime GlobalSettingKey = "timer.boot.retry"
 	// NetworkGeoRedoTime global setting key
@@ -152,6 +154,8 @@ const (
 	Dom0DiskUsageMaxBytes GlobalSettingKey = "storage.dom0.disk.maxusagebytes"
 	// AppContainerStatsInterval - App Container Stats Collection
 	AppContainerStatsInterval GlobalSettingKey = "timer.appcontainer.stats.interval"
+	// VaultReadyCutOffTime global setting key
+	VaultReadyCutOffTime GlobalSettingKey = "timer.vault.ready.cutoff"
 
 	// Bool Items
 	// UsbAccess global setting key
@@ -698,6 +702,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddIntItem(StaleConfigTime, 7*24*3600, 0, 0xFFFFFFFF)
 	configItemSpecMap.AddIntItem(VdiskGCTime, 3600, 60, 0xFFFFFFFF)
 	configItemSpecMap.AddIntItem(DownloadRetryTime, 600, 60, 0xFFFFFFFF)
+	configItemSpecMap.AddIntItem(DownloadStalledTime, 600, 20, 0xFFFFFFFF)
 	configItemSpecMap.AddIntItem(DomainBootRetryTime, 600, 10, 0xFFFFFFFF)
 	configItemSpecMap.AddIntItem(NetworkGeoRedoTime, 3600, 60, 0xFFFFFFFF)
 	configItemSpecMap.AddIntItem(NetworkGeoRetryTime, 600, 5, 0xFFFFFFFF)
@@ -708,6 +713,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddIntItem(NetworkSendTimeout, 120, 0, 0xFFFFFFFF)
 	configItemSpecMap.AddIntItem(Dom0MinDiskUsagePercent, 20, 20, 80)
 	configItemSpecMap.AddIntItem(AppContainerStatsInterval, 300, 1, 0xFFFFFFFF)
+	configItemSpecMap.AddIntItem(VaultReadyCutOffTime, 300, 60, 0xFFFFFFFF)
 	// Dom0DiskUsageMaxBytes - Default is 2GB, min is 100MB
 	configItemSpecMap.AddIntItem(Dom0DiskUsageMaxBytes, 2*1024*1024*1024,
 		100*1024*1024, 0xFFFFFFFF)
@@ -763,6 +769,23 @@ func DefaultConfigItemValueMap() *ConfigItemValueMap {
 	}
 	// By default there are no per-agent settings.
 	return valueMapPtr
+}
+
+// UpdateItemValues brings in any of the source items into the ConfigItemValueMap
+func (configPtr *ConfigItemValueMap) UpdateItemValues(source *ConfigItemValueMap) {
+
+	for key, val := range source.GlobalSettings {
+		configPtr.GlobalSettings[key] = val
+	}
+
+	for agentName, agentSettingMap := range source.AgentSettings {
+		if _, ok := configPtr.AgentSettings[agentName]; !ok {
+			configPtr.AgentSettings[agentName] = make(map[AgentSettingKey]ConfigItemValue)
+		}
+		for setting, value := range agentSettingMap {
+			configPtr.AgentSettings[agentName][setting] = value
+		}
+	}
 }
 
 func agentSettingKeyFromLegacyKey(key string) string {

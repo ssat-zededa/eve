@@ -3,8 +3,6 @@
 
 package volumemgr
 
-// Interface to worker to run the create and destroy in separate goroutines
-
 import (
 	"github.com/stretchr/testify/assert"
 	"testing"
@@ -21,7 +19,7 @@ func TestIsErrorSourceOnPubSub(t *testing.T) {
 	status := &types.VolumeStatus{}
 	errStr := "test1"
 	status.SetErrorWithSource(errStr, types.ContentTreeStatus{}, time.Now())
-	log.Infof("set error %s", status.Error)
+	log.Functionf("set error %s", status.Error)
 	ctx := initStatusCtx(t)
 	publishVolumeStatus(&ctx, status)
 	status = lookupVolumeStatus(&ctx, status.Key())
@@ -32,7 +30,7 @@ func TestIsErrorSourceOnPubSub(t *testing.T) {
 		"Pubsub error source type: %T", status.ErrorSourceType)
 	assert.Equal(t, errStr, status.Error)
 	status.ClearErrorWithSource()
-	log.Infof("cleared error %s", status.Error)
+	log.Functionf("cleared error %s", status.Error)
 	assert.False(t, status.IsErrorSource(types.ContentTreeStatus{}),
 		"Pubsub error source type: %T", status.ErrorSourceType)
 	assert.Equal(t, "", status.Error)

@@ -7,7 +7,7 @@ help() {
   cat <<__EOT__
 Welcome to EVE!
   commands: enter [qube (assumed pillar)] [command (assumed sh)]
-  commands: enter-user-app <qube>
+            enter-user-app <qube>
             exec qube command
             list
             status
@@ -17,6 +17,8 @@ Welcome to EVE!
             destroy <qube>
             persist list
             persist attach <disk>
+            firewall drop
+            verbose on|off
 __EOT__
   exit 1
 }
@@ -48,10 +50,12 @@ create_new_p3_part() {
 }
 
 case "$1" in
-    exec) [ -z "$2" -o -z "$3" ] && help
-          CONT="$2"
-          shift 2
-          ${CTR_CMD} t exec --exec-id $(basename $(mktemp)) "$CONT" "$@"
+    exec) # shellcheck disable=SC2086
+          ID=$(${CTR_CMD} t ls | awk '/^'${2:-pillar}' /{print $2;}' 2>/dev/null)
+          CMD="${3:-sh}"
+          shift ; shift ; shift
+          for c in /sys/fs/cgroup/*/tasks; do echo "$$" >> "$c"; done
+          exec nsenter -F -a -t "${ID:-1}" "$CMD" "$@"
           ;;
    enter) # shellcheck disable=SC2086
           ${CTR_CMD} t exec -t --exec-id $(basename $(mktemp)) ${2:-pillar} ${3:-sh -l}
@@ -78,6 +82,41 @@ case "$1" in
           ;;
   resume) [ -z "$2" ] && help
           ${CTR_CMD} t resume $2
+          ;;
+firewall) if [ "$2" = drop ]; then
+             nsenter -a -t "$(${CTR_CMD} t ls | awk '/^pillar /{print $2;}' 2>/dev/null)" sh -x <<__EOT__
+               iptables -P INPUT ACCEPT
+               iptables -P FORWARD ACCEPT
+               iptables -P OUTPUT ACCEPT
+               iptables -F
+               iptables -X
+               iptables -Z
+               iptables -t nat -F
+               iptables -t nat -X
+               iptables -t mangle -F
+               iptables -t mangle -X
+               iptables -t raw -F
+               iptables -t raw -X
+__EOT__
+          else
+             help
+          fi
+          ;;
+ verbose) # first lets find our piping process
+          for PIPE in $(pgrep cat); do
+             [ "$(readlink /proc/"$PIPE"/fd/0)" = /run/diag.pipe ] && break
+          done
+          # now lets see what to do with it
+          case "$2" in
+             on) dmesg -n8
+                 kill -CONT "$PIPE"
+                 ;;
+            off) dmesg -n1
+                 kill -STOP "$PIPE"
+                 ;;
+              *) help
+                 ;;
+          esac
           ;;
  persist) case "$2" in
                list) list_partitions

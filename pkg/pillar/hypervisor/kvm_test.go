@@ -7,27 +7,41 @@ import (
 	"testing"
 
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	"github.com/lf-edge/eve/pkg/pillar/containerd"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	uuid "github.com/satori/go.uuid"
 )
 
 var kvmIntel, kvmArm kvmContext
+var ctrdClient *containerd.Client
 
-func init() {
-	// these ones are very much handcrafted just for the tests
+// these ones are very much handcrafted just for the tests
+func initTest(t *testing.T) {
+
+	if ctrdClient != nil {
+		return
+	}
+	var err error
+	ctrdClient, err = containerd.NewContainerdClient()
+	if err != nil {
+		t.Skipf("test must be run on a system with a functional containerd")
+	}
 	kvmIntel = kvmContext{
 		devicemodel: "pc-q35-3.1",
 		dmExec:      "",
 		dmArgs:      []string{},
 	}
+	kvmIntel.ctrdClient = ctrdClient
 	kvmArm = kvmContext{
 		devicemodel: "virt",
 		dmExec:      "",
 		dmArgs:      []string{},
 	}
+	kvmArm.ctrdClient = ctrdClient
 }
 
 func TestCreateDomConfigOnlyCom1(t *testing.T) {
+	initTest(t)
 	config := types.DomainConfig{
 		UUIDandVersion: types.UUIDandVersion{UUID: uuid.NewV4(), Version: "1.0"},
 		VmConfig: types.VmConfig{
@@ -130,7 +144,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
@@ -140,7 +154,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 
@@ -164,7 +178,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [chardev "charserial0"]
   backend = "socket"
   mux = "on"
-  path = "/var/run/hypervisor/kvm/test/cons"
+  path = "/run/hypervisor/kvm/test/cons"
   server = "on"
   wait = "off"
   logfile = "/dev/fd/1"
@@ -221,8 +235,8 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [drive "drive-virtio-disk0"]
   file = "/foo/bar.qcow2"
   format = "qcow2"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk0"]
@@ -255,8 +269,8 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [drive "drive-virtio-disk2"]
   file = "/foo/bar.raw"
   format = "raw"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk2"]
@@ -392,7 +406,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
@@ -402,7 +416,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 
@@ -426,7 +440,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [chardev "charserial0"]
   backend = "socket"
   mux = "on"
-  path = "/var/run/hypervisor/kvm/test/cons"
+  path = "/run/hypervisor/kvm/test/cons"
   server = "on"
   wait = "off"
   logfile = "/dev/fd/1"
@@ -483,8 +497,8 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [drive "drive-virtio-disk0"]
   file = "/foo/bar.qcow2"
   format = "qcow2"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk0"]
@@ -517,8 +531,8 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [drive "drive-virtio-disk2"]
   file = "/foo/bar.raw"
   format = "raw"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk2"]
@@ -629,7 +643,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
@@ -639,7 +653,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 
@@ -663,7 +677,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [chardev "charserial0"]
   backend = "socket"
   mux = "on"
-  path = "/var/run/hypervisor/kvm/test/cons"
+  path = "/run/hypervisor/kvm/test/cons"
   server = "on"
   wait = "off"
   logfile = "/dev/fd/1"
@@ -722,8 +736,8 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [drive "drive-virtio-disk0"]
   file = "/foo/bar.qcow2"
   format = "qcow2"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk0"]
@@ -756,8 +770,8 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 [drive "drive-virtio-disk2"]
   file = "/foo/bar.raw"
   format = "raw"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk2"]
@@ -837,6 +851,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
 	})
 }
 func TestCreateDomConfig(t *testing.T) {
+	initTest(t)
 	config := types.DomainConfig{
 		UUIDandVersion: types.UUIDandVersion{UUID: uuid.NewV4(), Version: "1.0"},
 		VmConfig: types.VmConfig{
@@ -956,7 +971,7 @@ func TestCreateDomConfig(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
@@ -966,7 +981,7 @@ func TestCreateDomConfig(t *testing.T) {
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 
@@ -990,7 +1005,7 @@ func TestCreateDomConfig(t *testing.T) {
 [chardev "charserial0"]
   backend = "socket"
   mux = "on"
-  path = "/var/run/hypervisor/kvm/test/cons"
+  path = "/run/hypervisor/kvm/test/cons"
   server = "on"
   wait = "off"
   logfile = "/dev/fd/1"
@@ -1047,8 +1062,8 @@ func TestCreateDomConfig(t *testing.T) {
 [drive "drive-virtio-disk0"]
   file = "/foo/bar.qcow2"
   format = "qcow2"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk0"]
@@ -1081,8 +1096,8 @@ func TestCreateDomConfig(t *testing.T) {
 [drive "drive-virtio-disk2"]
   file = "/foo/bar.raw"
   format = "raw"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk2"]
@@ -1226,7 +1241,7 @@ func TestCreateDomConfig(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
@@ -1236,7 +1251,7 @@ func TestCreateDomConfig(t *testing.T) {
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 
@@ -1260,7 +1275,7 @@ func TestCreateDomConfig(t *testing.T) {
 [chardev "charserial0"]
   backend = "socket"
   mux = "on"
-  path = "/var/run/hypervisor/kvm/test/cons"
+  path = "/run/hypervisor/kvm/test/cons"
   server = "on"
   wait = "off"
   logfile = "/dev/fd/1"
@@ -1317,8 +1332,8 @@ func TestCreateDomConfig(t *testing.T) {
 [drive "drive-virtio-disk0"]
   file = "/foo/bar.qcow2"
   format = "qcow2"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk0"]
@@ -1351,8 +1366,8 @@ func TestCreateDomConfig(t *testing.T) {
 [drive "drive-virtio-disk2"]
   file = "/foo/bar.raw"
   format = "raw"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk2"]
@@ -1471,7 +1486,7 @@ func TestCreateDomConfig(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
@@ -1481,7 +1496,7 @@ func TestCreateDomConfig(t *testing.T) {
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 
@@ -1505,7 +1520,7 @@ func TestCreateDomConfig(t *testing.T) {
 [chardev "charserial0"]
   backend = "socket"
   mux = "on"
-  path = "/var/run/hypervisor/kvm/test/cons"
+  path = "/run/hypervisor/kvm/test/cons"
   server = "on"
   wait = "off"
   logfile = "/dev/fd/1"
@@ -1564,8 +1579,8 @@ func TestCreateDomConfig(t *testing.T) {
 [drive "drive-virtio-disk0"]
   file = "/foo/bar.qcow2"
   format = "qcow2"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk0"]
@@ -1598,8 +1613,8 @@ func TestCreateDomConfig(t *testing.T) {
 [drive "drive-virtio-disk2"]
   file = "/foo/bar.raw"
   format = "raw"
-  aio = "native"
-  cache = "directsync"
+  aio = "io_uring"
+  cache = "writeback"
   if = "none"
 
 [device "virtio-disk2"]
@@ -1688,6 +1703,7 @@ func TestCreateDomConfig(t *testing.T) {
 }
 
 func TestCreateDom(t *testing.T) {
+	initTest(t)
 	if exec.Command("qemu-system-x86_64", "--version").Run() != nil {
 		// skipping this test since we're clearly not in a presence of qemu
 		return
@@ -1750,13 +1766,13 @@ func TestCreateDom(t *testing.T) {
 
 [chardev "charmonitor"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/qmp"
+  path = "/run/hypervisor/kvm/test/qmp"
   server = "on"
   wait = "off"
 
 [chardev "charlistener"]
   backend = "socket"
-  path = "/var/run/hypervisor/kvm/test/listener.qmp"
+  path = "/run/hypervisor/kvm/test/listener.qmp"
   server = "on"
   wait = "off"
 

@@ -13,7 +13,7 @@ To get its job done, EVE leverages a lot of great open source projects: [Xen Pro
 ## How to use
 
 You will need [QEMU 3.x+](https://www.qemu.org/), [Docker](https://www.docker.com), [Make](https://www.gnu.org/software/make/)
-and [go 1.12+](https://golang.org) installed in your system.
+and [go 1.13+](https://golang.org) installed in your system.
 
 ### Use pre-built release binaries
 
@@ -54,33 +54,29 @@ Make sure that Docker is up and running on your system. On MacOS just start a do
 docker version
 ```
 
-#### Get Make
+#### Get system dependencies (git, make, qemu, jq)
 
-##### Install On OSX (using [Brew](https://brew.sh/))
-
-```sh
-$ brew install make
-```
-
-##### Inatall On Ubuntu
+##### On OSX (using [Brew](https://brew.sh/))
 
 ```sh
-$ sudo apt-get install make
-```
-
-#### Get QEMU
-
-##### On OSX using [Brew](https://brew.sh/)
-
-```sh
-$ brew install qemu
+$ brew install git make jq qemu
 ```
 
 ##### On Ubuntu Linux
 
 ```sh
-$ sudo apt install qemu-utils # for make live
-$ sudo apt install qemu-system-x86 # for make run
+$ sudo apt-get install -y git make jq qemu binfmt-support qemu-user-static \
+    qemu-utils qemu-system-x86 qemu-system-aarch64
+```
+
+#### Setup Docker
+
+##### Enable execution of different multi-architecture containers
+
+This step is required on **Linux** and is required to create eve bootable images with a different architecture than the host architecture.
+
+```sh
+$ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 ```
 
 #### Get Project EVE

@@ -17,6 +17,7 @@ mkdir -p /mnt/rootfs/etc
 CFG="/mnt/rootfs/etc/udhcpc.${interface}.cfg"
 
 RESOLV_CONF='/mnt/rootfs/etc/resolv.conf'
+RESOLV_OPTIONS="rotate timeout:10 attempts:5"
 
 # interface for which DNS is to be configured
 PEERDNS_IF=eth0
@@ -84,10 +85,13 @@ case "$1" in
     [ -n "$router" ] && [ -n "$staticroutes" ] && install_classless_routes $staticroutes
     # setup dns
     if [ "$interface" == "$PEERDNS_IF" ] ; then
+      # remove previous dns
+      rm -f $RESOLV_CONF
       [ -n "$domain" ] && echo search $domain > $RESOLV_CONF
       for i in $dns ; do
         echo nameserver $i >> $RESOLV_CONF
       done
+      echo "options ${RESOLV_OPTIONS}" >> $RESOLV_CONF
     fi
     update_hosts
     ;;
@@ -112,12 +116,17 @@ case "$1" in
     done
     # shellcheck source=/dev/null
     old_ip="$(source "${CFG}"; echo "$ip")"
+    # shellcheck disable=SC1090
+    old_mask="$(source "${CFG}"; echo "$mask")"
     # save new config info:
     mv -f ${CFG}.new $CFG
     # make only necessary changes, as per config comparison:
     if [ -n "$REDO_NET" ] ; then
-      ip addr flush dev $interface
-      ip addr add ${ip}/${mask} dev $interface
+      # Do not touch if IP address and mask did not change
+      if [ "$old_ip" != "$ip" ] || [ "$old_mask" != "$mask" ] ; then
+        ip addr flush dev "$interface"
+        ip addr add "${ip}"/"${mask}" dev "$interface"
+      fi
       # shellcheck disable=SC2086
       [ -n "$router" ] && [ -n "$staticroutes" ] && install_classless_routes $staticroutes
       update_ip_hosts "$old_ip" $ip
@@ -129,6 +138,7 @@ case "$1" in
       for i in $dns ; do
         echo nameserver $i >> $RESOLV_CONF
       done
+      echo "options ${RESOLV_OPTIONS}" >> $RESOLV_CONF
     fi
     if [ -n "$REDO_HOSTNAME" ]; then
       update_hosts
